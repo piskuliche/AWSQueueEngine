@@ -9,6 +9,11 @@ from .job_control import submit_to_host, tail_remote_log, kill_managed_on_host
 from .staging import where_is_next_submit
 
 def main():
+
+    # Set unbuffered output for stdout and stderr
+    sys.stdout = open(sys.stdout.fileno(), mode='w', buffering=1, encoding=sys.stdout.encoding, closefd=False)
+    sys.stderr = open(sys.stderr.fileno(), mode='w', buffering=1, encoding=sys.stderr.encoding, closefd=False)
+
     parser = argparse.ArgumentParser(description="Simple Slurm-like manager for SSH GPU hosts.")
     sub = parser.add_subparsers(dest="cmd")
 
@@ -29,39 +34,39 @@ def main():
     p_stop.add_argument("host")
 
     args = parser.parse_args()
-    print("Starting the queue engine")
+    print("Starting the queue engine", flush=True)
 
     if args.cmd == "status":
         rows = status_all(HOSTS)
-        print(f"{'HOST':8}  {'REACH':8}  {'PID':8}  {'TAG':12}  INFO")
+        print(f"{'HOST':8}  {'REACH':8}  {'PID':8}  {'TAG':12}  INFO", flush=True)
         for r in rows:
             reach = "yes" if r["reachable"] else "no"
             pid = r["pid"] or "-"
             tag = r["tag"] or "-"
             info = (r["raw"][:60] + "...") if r["raw"] else ""
-            print(f"{r['host']:8}  {reach:8}  {pid:8}  {tag:12}  {info}")
+            print(f"{r['host']:8}  {reach:8}  {pid:8}  {tag:12}  {info}", flush=True)
     elif args.cmd == "submit":
         if not args.command:
-            print("No command provided.")
+            print("No command provided.", flush=True)
             sys.exit(1)
         command = " ".join(args.command).strip()
         item = {"cmd": command, "payload": args.payload}
         enqueue_item(item)
-        print("Enqueued:", item)
+        print("Enqueued:", item, flush=True)
     elif args.cmd == "list":
         q = load_queue()
         if not q:
-            print("(queue empty)")
+            print("(queue empty)", flush=True)
         else:
             for i,cmd in enumerate(q,1):
-                print(f"{i:3d}. {cmd}")
+                print(f"{i:3d}. {cmd}", flush=True)
     elif args.cmd == "clear":
         save_queue([])
-        print("Queue cleared.")
+        print("Queue cleared.", flush=True)
     elif args.cmd == "start":
         fd, holder = acquire_monitor_lock()
         if fd is None:
-            print(f"Monitor already running (holder={holder})")
+            print(f"Monitor already running (holder={holder})", flush=True)
             sys.exit(1)
         try:
             monitor_loop(HOSTS)
@@ -70,18 +75,18 @@ def main():
     elif args.cmd == "tail":
         r = tail_remote_log(args.host)
         if not r["ok"]:
-            print("Error:", r.get("reason") or r.get("err"))
+            print("Error:", r.get("reason") or r.get("err"), flush=True)
         else:
             header = f"Host: {r['host']}  tag: {r.get('tag') or '(none)'}"
-            print(header)
-            print("-"*len(header))
-            print(r.get("out") or "(no log output)")
+            print(header, flush=True)
+            print("-"*len(header), flush=True)
+            print(r.get("out") or "(no log output)", flush=True)
     elif args.cmd == "stop":
         res = kill_managed_on_host(args.host)
         if res["rc"] == 0:
-            print(f"Sent kill to managed job(s) on {args.host}.")
+            print(f"Sent kill to managed job(s) on {args.host}.", flush=True)
         else:
-            print("Kill error:", res.get("err") or res.get("out"))
+            print("Kill error:", res.get("err") or res.get("out"), flush=True)
     elif args.cmd == "where":
         where_is_next_submit()
     else:
