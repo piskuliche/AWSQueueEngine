@@ -6,6 +6,7 @@ from .queue import enqueue_item, load_queue, save_queue
 from .host_status import status_all
 from .monitor import acquire_monitor_lock, release_monitor_lock, monitor_loop
 from .job_control import submit_to_host, tail_remote_log, kill_managed_on_host
+from .staging import where_is_next_submit
 
 def main():
     parser = argparse.ArgumentParser(description="Simple Slurm-like manager for SSH GPU hosts.")
@@ -19,6 +20,7 @@ def main():
     sub.add_parser("list", help="Show queued jobs")
     sub.add_parser("clear", help="Clear the queue")
     sub.add_parser("start", help="Start monitor loop (runs until Ctrl-C)")
+    sub.add_parser("where", help="Show where the next job will be submitted")
 
     p_tail = sub.add_parser("tail", help="Tail remote log on a host")
     p_tail.add_argument("host")
@@ -80,6 +82,8 @@ def main():
             print(f"Sent kill to managed job(s) on {args.host}.")
         else:
             print("Kill error:", res.get("err") or res.get("out"))
+    elif args.cmd == "where":
+        where_is_next_submit()
     else:
         parser.print_help()
 
