@@ -2,16 +2,20 @@
 import time
 import fcntl
 import os
+import threading
 from pathlib import Path
 from .config import CHECK_INTERVAL, HOSTS
 from .host_status import status_all
 from .queue import dequeue, load_queue, save_queue
 from .job_control import submit_to_host, write_run_info
 
-def monitor_loop(hosts, poll_interval=CHECK_INTERVAL):
+def monitor_loop(hosts, poll_interval=CHECK_INTERVAL, stop_event: threading.Event | None = None):
     print("Starting monitor loop. Press Ctrl-C to stop.", flush=True)
+
+    if stop_event is None:
+        stop_event = threading.Event()
     try:
-        while True:
+        while not stop_event.is_set():
             status = status_all(hosts)
             free_hosts = [s["host"] for s in status if s["reachable"] and s["pid"] is None]
             unreachable_hosts = [s["host"] for s in status if not s["reachable"]]
@@ -48,7 +52,7 @@ def monitor_loop(hosts, poll_interval=CHECK_INTERVAL):
                             host=host,
                             remote_payload_path=remote_payload
                         )
-            time.sleep(poll_interval)
+            stop_event.wait(poll_interval)
     except KeyboardInterrupt:
         print("\nMonitor stopped by user.", flush=True)
     except Exception as e:

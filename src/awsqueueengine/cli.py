@@ -1,12 +1,50 @@
 # CLI interface for AWSQueueManager
-import sys
+import sys, os
 import argparse
+import signal, threading
+from pathlib import Path
 from .config import HOSTS
 from .queue import enqueue_item, load_queue, save_queue
 from .host_status import status_all
 from .monitor import acquire_monitor_lock, release_monitor_lock, monitor_loop
 from .job_control import submit_to_host, tail_remote_log, kill_managed_on_host
 from .staging import where_is_next_submit
+
+
+PIDFILE = Path.home() / "awsqueueengine.pid"
+
+def write_pidfile():
+    PIDFILE.write_text(str(os.getpid()))
+
+def read_pidfile():
+    if not PIDFILE.exists():
+        return None
+    try:
+        return int(PIDFILE.read_text().strip())
+    except Exception:
+        return None
+    
+def remove_pidfile():
+    try:
+        PIDFILE.unlink()
+    except Exception:
+        pass
+
+def pid_is_running(pid:int) -> bool:
+    try:
+        os.kill(pid, 0)  # does not kill; just checks
+        return True
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+
+stop_event = threading.Event()
+
+def _handle_stop(signum, frame):
+    print("Stopping monitor loop...")
+    stop_event.set()
+
 
 def main():
 
@@ -26,6 +64,9 @@ def main():
     sub.add_parser("clear", help="Clear the queue")
     sub.add_parser("start", help="Start monitor loop (runs until Ctrl-C)")
     sub.add_parser("where", help="Show where the next job will be submitted")
+    sub.add_parser("start-monitor", help="Start the monitor loop (daemon mode)")
+    sub.add_parser("stop-monitor", help="Stop the running monitor loop")
+    sub.add_parser("status-monitor", help="Show monitor status")
 
     p_tail = sub.add_parser("tail", help="Tail remote log on a host")
     p_tail.add_argument("host")
@@ -63,15 +104,55 @@ def main():
     elif args.cmd == "clear":
         save_queue([])
         print("Queue cleared.", flush=True)
-    elif args.cmd == "start":
+    elif args.cmd == "start-monitor":
+        # Prevent double-start
+        pid = read_pidfile()
+        if pid and pid_is_running(pid):
+            print(f"Monitor already running (pid={pid})", flush=True)
+            sys.exit(1)
+        else:
+            remove_pidfile()
+
+        signal.signal(signal.SIGTERM, _handle_stop)
+        signal.signal(signal.SIGINT, _handle_stop)
+
         fd, holder = acquire_monitor_lock()
         if fd is None:
             print(f"Monitor already running (holder={holder})", flush=True)
             sys.exit(1)
+
+        write_pidfile()
+        print(f"Monitor started (pid={os.getpid()})", flush=True)
+
         try:
-            monitor_loop(HOSTS)
+            monitor_loop(HOSTS, stop_event=stop_event)
+            print("Monitor exited cleanly.", flush=True)
         finally:
+            remove_pidfile()
             release_monitor_lock(fd)
+    elif args.cmd == "stop-monitor":
+        pid = read_pidfile()
+        if not pid:
+            print("Monitor not running (no pidfile).", flush=True)
+            sys.exit(1)
+
+        if not pid_is_running(pid):
+            print(f"Stale pidfile found (pid={pid}); cleaning up.", flush=True)
+            remove_pidfile()
+            sys.exit(1)
+
+        print(f"Stopping monitor (pid={pid})...", flush=True)
+        os.kill(pid, signal.SIGTERM)
+    elif args.cmd == "status-monitor":
+        pid = read_pidfile()
+        if not pid:
+            print("Monitor not running.", flush=True)
+            return
+
+        if pid_is_running(pid):
+            print(f"Monitor running (pid={pid})", flush=True)
+        else:
+            print(f"Monitor NOT running (stale pidfile pid={pid})", flush=True)
     elif args.cmd == "tail":
         r = tail_remote_log(args.host)
         if not r["ok"]:
