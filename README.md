@@ -18,10 +18,19 @@ After installation, use the CLI:
 awsqueueengine status
 awsqueueengine submit --payload ./my_payload "cd $PAYLOAD_DIR && bash run.sh"
 awsqueueengine list
-awsqueueengine start
+awsqueueengine start-monitor
+awsqueeuengine status-monitor
+awsqueueengine stop-monitor
 awsqueueengine tail eci3
 awsqueueengine stop eci3
 awsqueueengine clear
+```
+
+
+Suggested to run with:
+
+```bash
+ nohup awsqueueengine start-monitor >> ~/aws_queue_manager.log 2>&1 &
 ```
 
 Or, for development, run directly:
@@ -29,6 +38,8 @@ Or, for development, run directly:
 ```bash
 python -m cli list
 ```
+
+
 
 ## Project Structure
 
