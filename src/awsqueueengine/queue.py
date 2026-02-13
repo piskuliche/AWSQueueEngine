@@ -21,11 +21,25 @@ def enqueue_item(item):
     save_queue(q)
 
 def dequeue():
+    """ Dequeue the next job item from the queue.
+
+    This function removes and returns the next job item from the queue, prioritizing high-priority jobs.
+    """
     q = load_queue()
     if not q:
         return None
-    item = q.pop(0)
+    high_idx = None
+    for i, queued_item in enumerate(q):
+        if isinstance(queued_item, dict) and queued_item.get("priority") == "high":
+            high_idx = i
+            break
+    if high_idx is None:
+        item = q.pop(0)
+    else:
+        item = q.pop(high_idx)
     save_queue(q)
     if isinstance(item, str):
-        return {"cmd": item, "payload": None}
+        return {"cmd": item, "payload": None, "priority": "normal"}
+    if isinstance(item, dict) and "priority" not in item:
+        item["priority"] = "normal"
     return item

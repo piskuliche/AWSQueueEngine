@@ -58,6 +58,7 @@ def main():
     sub.add_parser("status", help="Show status for all hosts")
     p_submit = sub.add_parser("submit", help="Enqueue a job (command string)")
     p_submit.add_argument("--payload", "-p", help="Local folder to copy to remote scratch before running", default=None)
+    p_submit.add_argument("--high-priority", action="store_true", help="Mark this job as high priority in the queue")
     p_submit.add_argument("command", nargs=argparse.REMAINDER, help="Command to run remotely (quoted)")
 
     sub.add_parser("list", help="Show queued jobs")
@@ -91,7 +92,11 @@ def main():
             print("No command provided.", flush=True)
             sys.exit(1)
         command = " ".join(args.command).strip()
-        item = {"cmd": command, "payload": args.payload}
+        item = {
+            "cmd": command,
+            "payload": args.payload,
+            "priority": "high" if args.high_priority else "normal",
+        }
         enqueue_item(item)
         print("Enqueued:", item, flush=True)
     elif args.cmd == "list":
@@ -99,8 +104,12 @@ def main():
         if not q:
             print("(queue empty)", flush=True)
         else:
-            for i,cmd in enumerate(q,1):
-                print(f"{i:3d}. {cmd}", flush=True)
+            for i, cmd in enumerate(q, 1):
+                if isinstance(cmd, dict):
+                    marker = "HIGH" if cmd.get("priority") == "high" else "normal"
+                    print(f"{i:3d}. [{marker}] {cmd}", flush=True)
+                else:
+                    print(f"{i:3d}. [normal] {cmd}", flush=True)
     elif args.cmd == "clear":
         save_queue([])
         print("Queue cleared.", flush=True)

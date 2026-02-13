@@ -32,7 +32,12 @@ def monitor_loop(hosts, poll_interval=CHECK_INTERVAL, stop_event: threading.Even
                     else:
                         job_cmd = job_item.get("cmd")
                         payload = job_item.get("payload")
-                    print(f"[{time.strftime('%H:%M:%S')}] Launching on {host}: {job_cmd[:120]}{'...' if len(job_cmd)>120 else ''}", flush=True)
+                    priority = job_item.get("priority", "normal") if isinstance(job_item, dict) else "normal"
+                    print(
+                        f"[{time.strftime('%H:%M:%S')}] Launching ({priority}) on {host}: "
+                        f"{job_cmd[:120]}{'...' if len(job_cmd)>120 else ''}",
+                        flush=True
+                    )
                     res = submit_to_host(host, job_cmd, payload_local_path=payload)
                     if not res.get("ok"):
                         print(f"  Failed to start on {host}: {res.get('err')}", flush=True)
