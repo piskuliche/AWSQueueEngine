@@ -4,7 +4,7 @@ import argparse
 import signal, threading
 from pathlib import Path
 from .config import HOSTS
-from .queue import enqueue_item, load_queue, save_queue
+from .queue import enqueue_item, load_queue, normalize_job_item, save_queue
 from .host_status import status_all
 from .monitor import acquire_monitor_lock, release_monitor_lock, monitor_loop
 from .job_control import submit_to_host, tail_remote_log, kill_managed_on_host
@@ -58,10 +58,20 @@ def main():
     sub.add_parser("status", help="Show status for all hosts")
     p_submit = sub.add_parser("submit", help="Enqueue a job (command string)")
     p_submit.add_argument("--payload", "-p", help="Local folder to copy to remote scratch before running", default=None)
+    p_submit.add_argument(
+        "--hosts",
+        action="append",
+        metavar="HOST",
+        help="Only run this job on listed host(s). Repeat flag or use comma-separated values.",
+        default=None,
+    )
+    p_submit.add_argument("--priority", type=int, default=None, help="Integer priority (higher runs first)")
     p_submit.add_argument("--high-priority", action="store_true", help="Mark this job as high priority in the queue")
     p_submit.add_argument("command", nargs=argparse.REMAINDER, help="Command to run remotely (quoted)")
 
     sub.add_parser("list", help="Show queued jobs")
+    p_qdel = sub.add_parser("qdel", help="Delete queued job(s) by list index")
+    p_qdel.add_argument("job_ids", nargs="+", type=int, help="1-based queue index(es) from `list` output")
     sub.add_parser("clear", help="Clear the queue")
     sub.add_parser("start", help="Start monitor loop (runs until Ctrl-C)")
     sub.add_parser("where", help="Show where the next job will be submitted")
@@ -91,11 +101,37 @@ def main():
         if not args.command:
             print("No command provided.", flush=True)
             sys.exit(1)
+
+        valid_hosts = set(HOSTS)
+        hosts = None
+        if args.hosts:
+            requested_hosts = []
+            for host_value in args.hosts:
+                if not host_value:
+                    continue
+                requested_hosts.extend(h.strip() for h in host_value.split(",") if h and h.strip())
+            invalid_hosts = sorted({h for h in requested_hosts if h not in valid_hosts})
+            if invalid_hosts:
+                print(f"Invalid host(s): {', '.join(invalid_hosts)}. Valid hosts: {', '.join(HOSTS)}", flush=True)
+                sys.exit(1)
+            hosts = list(dict.fromkeys(requested_hosts))
+
+        if args.priority is not None:
+            priority = args.priority
+        elif args.high_priority:
+            priority = 100
+        else:
+            priority = 0
+
         command = " ".join(args.command).strip()
+        if not command:
+            print("No command provided.", flush=True)
+            sys.exit(1)
         item = {
             "cmd": command,
             "payload": args.payload,
-            "priority": "high" if args.high_priority else "normal",
+            "priority": priority,
+            "hosts": hosts,
         }
         enqueue_item(item)
         print("Enqueued:", item, flush=True)
@@ -104,12 +140,45 @@ def main():
         if not q:
             print("(queue empty)", flush=True)
         else:
-            for i, cmd in enumerate(q, 1):
-                if isinstance(cmd, dict):
-                    marker = "HIGH" if cmd.get("priority") == "high" else "normal"
-                    print(f"{i:3d}. [{marker}] {cmd}", flush=True)
-                else:
-                    print(f"{i:3d}. [normal] {cmd}", flush=True)
+            for i, raw_item in enumerate(q, 1):
+                item = normalize_job_item(raw_item)
+                hosts_text = ",".join(item["hosts"]) if item["hosts"] else "any"
+                print(
+                    f"{i:3d}. [priority={item['priority']}] [hosts={hosts_text}] "
+                    f"cmd={item['cmd']!r} payload={item['payload']!r}",
+                    flush=True
+                )
+    elif args.cmd == "qdel":
+        q = load_queue()
+        if not q:
+            print("(queue empty)", flush=True)
+            sys.exit(1)
+
+        queue_size = len(q)
+        unique_ids = sorted(set(args.job_ids))
+        invalid_ids = [idx for idx in unique_ids if idx < 1 or idx > queue_size]
+        if invalid_ids:
+            print(
+                f"Invalid queue index(es): {', '.join(str(i) for i in invalid_ids)}. "
+                f"Queue size: {queue_size}",
+                flush=True,
+            )
+            sys.exit(1)
+
+        removed_jobs = []
+        for idx in sorted(unique_ids, reverse=True):
+            removed = normalize_job_item(q.pop(idx - 1))
+            removed_jobs.append((idx, removed))
+        save_queue(q)
+
+        print(f"Removed {len(removed_jobs)} job(s).", flush=True)
+        for idx, item in sorted(removed_jobs, key=lambda pair: pair[0]):
+            hosts_text = ",".join(item["hosts"]) if item["hosts"] else "any"
+            print(
+                f"  {idx:3d}. [priority={item['priority']}] [hosts={hosts_text}] "
+                f"cmd={item['cmd']!r} payload={item['payload']!r}",
+                flush=True,
+            )
     elif args.cmd == "clear":
         save_queue([])
         print("Queue cleared.", flush=True)

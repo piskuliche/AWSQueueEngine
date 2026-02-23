@@ -17,14 +17,24 @@ After installation, use the CLI:
 ```bash
 awsqueueengine status
 awsqueueengine submit --payload ./my_payload "cd $PAYLOAD_DIR && bash run.sh"
+awsqueueengine submit --priority 25 "python train.py --epochs 10"
+awsqueueengine submit --hosts eci17 --priority 100 "bash pinned-job.sh"
+awsqueueengine submit --hosts eci16 --hosts eci18 "bash host-allowlist-job.sh"
 awsqueueengine list
+awsqueueengine qdel 2
+awsqueueengine qdel 1 3
 awsqueueengine start-monitor
-awsqueeuengine status-monitor
+awsqueueengine status-monitor
 awsqueueengine stop-monitor
 awsqueueengine tail eci3
 awsqueueengine stop eci3
 awsqueueengine clear
 ```
+
+`submit --high-priority` is still supported for backward compatibility and maps to
+priority `100`. If both `--priority` and `--high-priority` are supplied, `--priority`
+takes precedence.
+Use `--hosts` multiple times (or comma-separated values) to target multiple hosts.
 
 
 Suggested to run with:

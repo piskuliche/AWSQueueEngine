@@ -4,9 +4,9 @@ import fcntl
 import os
 import threading
 from pathlib import Path
-from .config import CHECK_INTERVAL, HOSTS
+from .config import CHECK_INTERVAL
 from .host_status import status_all
-from .queue import dequeue, load_queue, save_queue
+from .queue import dequeue_for_host, load_queue, save_queue
 from .job_control import submit_to_host, write_run_info
 
 def monitor_loop(hosts, poll_interval=CHECK_INTERVAL, stop_event: threading.Event | None = None):
@@ -23,18 +23,21 @@ def monitor_loop(hosts, poll_interval=CHECK_INTERVAL, stop_event: threading.Even
                 print(f"[WARN] unreachable hosts: {', '.join(unreachable_hosts)}", flush=True)
             if free_hosts:
                 for host in free_hosts:
-                    job_item = dequeue()
+                    job_item = dequeue_for_host(host)
                     if not job_item:
-                        break
+                        continue
                     if isinstance(job_item, str):
                         job_cmd = job_item
                         payload = None
+                        target_hosts = None
                     else:
-                        job_cmd = job_item.get("cmd")
+                        job_cmd = str(job_item.get("cmd") or "")
                         payload = job_item.get("payload")
-                    priority = job_item.get("priority", "normal") if isinstance(job_item, dict) else "normal"
+                        target_hosts = job_item.get("hosts")
+                    priority = job_item.get("priority", 0) if isinstance(job_item, dict) else 0
+                    hosts_text = ",".join(target_hosts) if target_hosts else "any"
                     print(
-                        f"[{time.strftime('%H:%M:%S')}] Launching ({priority}) on {host}: "
+                        f"[{time.strftime('%H:%M:%S')}] Launching (priority={priority}, hosts={hosts_text}) on {host}: "
                         f"{job_cmd[:120]}{'...' if len(job_cmd)>120 else ''}",
                         flush=True
                     )
