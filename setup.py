@@ -7,7 +7,7 @@ setup(
     author='piskuliche',
     packages=find_packages(where='src'),
     package_dir={'': 'src'},
-    install_requires=[],
+    install_requires=["mailtrap"],
     entry_points={
         'console_scripts': [
             'awsqueueengine=awsqueueengine.cli:main',

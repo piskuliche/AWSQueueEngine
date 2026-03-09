@@ -3,6 +3,7 @@ import sys, os
 import argparse
 import signal, threading
 import time
+from datetime import datetime
 from pathlib import Path
 from .config import HOSTS
 from .queue import enqueue_item, load_queue, normalize_job_item, save_queue
@@ -11,6 +12,7 @@ from .monitor import acquire_monitor_lock, release_monitor_lock, monitor_loop
 from .job_control import submit_to_host, tail_remote_log, kill_managed_on_host
 from .staging import where_is_next_submit
 from .running_state import load_running_jobs
+from .notifications import parse_email_recipients, send_email
 
 
 PIDFILE = Path.home() / "awsqueueengine.pid"
@@ -64,6 +66,11 @@ def main():
     sys.stderr = open(sys.stderr.fileno(), mode='w', buffering=1, encoding=sys.stderr.encoding, closefd=False)
 
     parser = argparse.ArgumentParser(description="Simple Slurm-like manager for SSH GPU hosts.")
+    parser.add_argument(
+        "--test-email-connection",
+        action="store_true",
+        help="Send a test notification email through Mailtrap and exit.",
+    )
     sub = parser.add_subparsers(dest="cmd")
 
     sub.add_parser("status", help="Show status for all hosts")
@@ -100,6 +107,23 @@ def main():
 
     args = parser.parse_args()
     print("Starting the queue engine", flush=True)
+
+    if args.test_email_connection:
+        recipients = parse_email_recipients()
+        now_text = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        result = send_email(
+            subject=f"[AWSQueueEngine] Test email ({now_text})",
+            body=f"This is a test email from AWSQueueEngine.\nGenerated at: {now_text}",
+            recipients=recipients,
+        )
+        if result.get("skipped"):
+            print("Email test skipped (Mailtrap not configured or no recipients).", flush=True)
+            return
+        if result.get("ok"):
+            print("Test email sent.", flush=True)
+            return
+        print(f"Email test failed: {result.get('err')}", flush=True)
+        sys.exit(1)
 
     if args.cmd == "status":
         rows = status_all(HOSTS)

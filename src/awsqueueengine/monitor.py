@@ -1,14 +1,22 @@
 # Monitor loop and locking
+import json
 import time
 import fcntl
 import os
 import threading
+from datetime import datetime
 from pathlib import Path
-from .config import CHECK_INTERVAL
+from .config import (
+    ALERT_DAILY_EMAIL_LIMIT,
+    CHECK_INTERVAL,
+    JOB_FAIL_ALERT_COOLDOWN_SECONDS,
+    MONITOR_STATE_FILE,
+)
 from .host_status import status_all
 from .queue import dequeue_for_host, load_queue, save_queue, normalize_job_item
 from .job_control import submit_to_host, write_run_info, kill_managed_on_host
 from .running_state import load_running_jobs, save_running_jobs
+from .notifications import parse_email_recipients, send_email
 
 
 def _host_is_eligible(job_item, host):
@@ -20,6 +28,157 @@ def _requeue_front(job_item):
     q = load_queue()
     q.insert(0, normalize_job_item(job_item))
     save_queue(q)
+
+
+def _build_status_text(status_rows, running_jobs, queue_items):
+    now_text = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    total_hosts = len(status_rows)
+    reachable = sum(1 for row in status_rows if row.get("reachable"))
+    unreachable = total_hosts - reachable
+    running = sum(1 for row in status_rows if row.get("reachable") and row.get("pid") is not None)
+    free = sum(1 for row in status_rows if row.get("reachable") and row.get("pid") is None)
+    lines = [
+        f"Generated at: {now_text}",
+        f"Queue depth: {len(queue_items)}",
+        f"Running jobs tracked: {len(running_jobs)}",
+        f"Hosts: total={total_hosts} reachable={reachable} free={free} running={running} unreachable={unreachable}",
+    ]
+    if queue_items:
+        next_item = normalize_job_item(queue_items[0])
+        lines.append(f"Next queued command: {str(next_item.get('cmd') or '')[:180]}")
+    return "\n".join(lines)
+
+
+def _should_send_low_queue_alert(queue_len, already_sent):
+    return 0 < queue_len < 10 and not already_sent
+
+
+def _should_send_empty_queue_alert(queue_len, already_sent):
+    return queue_len == 0 and not already_sent
+
+
+def _should_send_daily_summary(last_summary_date, now_dt):
+    return last_summary_date != now_dt.date()
+
+
+def _reset_queue_alert_state(queue_len, low_queue_alert_sent, empty_queue_alert_sent):
+    # Reset both queue alert latches only after queue recovers to healthy depth.
+    if queue_len >= 10:
+        return False, False
+    return low_queue_alert_sent, empty_queue_alert_sent
+
+
+def _send_alert_email(recipients, subject, body):
+    result = send_email(subject, body, recipients)
+    if result.get("skipped"):
+        return True
+    if result.get("ok"):
+        print(f"[EMAIL] {subject}", flush=True)
+        return True
+    print(f"[EMAIL-ERROR] {subject}: {result.get('err')}", flush=True)
+    return False
+
+
+def _load_monitor_state():
+    if not MONITOR_STATE_FILE.exists():
+        return {}
+    try:
+        data = json.loads(MONITOR_STATE_FILE.read_text())
+        return data if isinstance(data, dict) else {}
+    except Exception:
+        return {}
+
+
+def _save_monitor_state(state):
+    try:
+        MONITOR_STATE_FILE.write_text(json.dumps(state, indent=2))
+    except Exception as exc:
+        print(f"[WARN] Could not save monitor state: {exc}", flush=True)
+
+
+def _load_last_daily_summary_date():
+    state = _load_monitor_state()
+    text = state.get("last_daily_summary_date")
+    if not isinstance(text, str) or not text.strip():
+        return None
+    try:
+        return datetime.strptime(text.strip(), "%Y-%m-%d").date()
+    except Exception:
+        return None
+
+
+def _save_last_daily_summary_date(summary_date):
+    state = _load_monitor_state()
+    state["last_daily_summary_date"] = summary_date.strftime("%Y-%m-%d")
+    _save_monitor_state(state)
+
+
+def _initial_alert_runtime_state():
+    return {
+        "day": datetime.now().date(),
+        "sent_today": 0,
+        "daily_limit_warned": False,
+        "job_fail_cooldown_until": 0.0,
+        "job_fail_suppressed_count": 0,
+    }
+
+
+def _reset_daily_alert_state_if_needed(alert_state, now_dt):
+    if alert_state.get("day") == now_dt.date():
+        return
+    alert_state["day"] = now_dt.date()
+    alert_state["sent_today"] = 0
+    alert_state["daily_limit_warned"] = False
+    alert_state["job_fail_suppressed_count"] = 0
+    alert_state["job_fail_cooldown_until"] = 0.0
+
+
+def _should_send_alert(alert_state, alert_type, now_dt, now_ts):
+    _reset_daily_alert_state_if_needed(alert_state, now_dt)
+    if alert_state["sent_today"] >= ALERT_DAILY_EMAIL_LIMIT:
+        if not alert_state["daily_limit_warned"]:
+            print(
+                f"[EMAIL-WARN] Daily email limit reached ({ALERT_DAILY_EMAIL_LIMIT}); suppressing alerts until tomorrow.",
+                flush=True,
+            )
+            alert_state["daily_limit_warned"] = True
+        if alert_type == "job_fail":
+            alert_state["job_fail_suppressed_count"] += 1
+        return False
+    if alert_type == "job_fail" and now_ts < alert_state["job_fail_cooldown_until"]:
+        alert_state["job_fail_suppressed_count"] += 1
+        return False
+    return True
+
+
+def _build_job_fail_alert_body(base_body, alert_state):
+    suppressed_count = int(alert_state.get("job_fail_suppressed_count") or 0)
+    if suppressed_count <= 0:
+        return base_body
+    alert_state["job_fail_suppressed_count"] = 0
+    return (
+        f"{base_body}\n\n"
+        f"Suppressed {suppressed_count} additional job start-failure email(s) during cooldown."
+    )
+
+
+def _mark_alert_sent(alert_state, alert_type, now_ts):
+    alert_state["sent_today"] += 1
+    if alert_type == "job_fail":
+        alert_state["job_fail_cooldown_until"] = now_ts + JOB_FAIL_ALERT_COOLDOWN_SECONDS
+
+
+def _send_alert_email_with_limits(recipients, subject, body, alert_state, alert_type):
+    now_dt = datetime.now()
+    now_ts = time.time()
+    if not _should_send_alert(alert_state, alert_type, now_dt, now_ts):
+        return True
+    if alert_type == "job_fail":
+        body = _build_job_fail_alert_body(body, alert_state)
+    sent = _send_alert_email(recipients, subject, body)
+    if sent:
+        _mark_alert_sent(alert_state, alert_type, now_ts)
+    return sent
 
 
 def _launch_job_on_host(host, job_item, running_jobs):
@@ -130,6 +289,14 @@ def monitor_loop(hosts, poll_interval=CHECK_INTERVAL, stop_event: threading.Even
     if stop_event is None:
         stop_event = threading.Event()
     running_jobs = load_running_jobs()
+    alert_recipients = parse_email_recipients()
+    alert_state = _initial_alert_runtime_state()
+    low_queue_alert_sent = False
+    empty_queue_alert_sent = False
+    last_daily_summary_date = _load_last_daily_summary_date()
+    if last_daily_summary_date is None:
+        last_daily_summary_date = datetime.now().date()
+        _save_last_daily_summary_date(last_daily_summary_date)
     if running_jobs:
         print(f"Recovered {len(running_jobs)} running job record(s) from disk.", flush=True)
     try:
@@ -148,9 +315,66 @@ def monitor_loop(hosts, poll_interval=CHECK_INTERVAL, stop_event: threading.Even
                     job_item = dequeue_for_host(host)
                     if not job_item:
                         continue
-                    _launch_job_on_host(host, job_item, running_jobs)
+                    launched = _launch_job_on_host(host, job_item, running_jobs)
+                    if not launched:
+                        item = normalize_job_item(job_item)
+                        alert_body = (
+                            f"Failed to start queued job on host {host}.\n\n"
+                            f"Command: {item.get('cmd')}\n"
+                            f"Priority: {item.get('priority')}\n"
+                            f"Hosts restriction: {item.get('hosts') or 'any'}\n"
+                            f"Generated at: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n"
+                        )
+                        _send_alert_email_with_limits(
+                            alert_recipients,
+                            f"[AWSQueueEngine] Job failed to start on {host}",
+                            alert_body,
+                            alert_state,
+                            "job_fail",
+                        )
 
             queue_items = load_queue()
+            queue_len = len(queue_items)
+            low_queue_alert_sent, empty_queue_alert_sent = _reset_queue_alert_state(
+                queue_len,
+                low_queue_alert_sent,
+                empty_queue_alert_sent,
+            )
+            if _should_send_low_queue_alert(queue_len, low_queue_alert_sent):
+                summary = _build_status_text(status, running_jobs, queue_items)
+                if _send_alert_email_with_limits(
+                    alert_recipients,
+                    "[AWSQueueEngine] Queue running low (<10 jobs remaining)",
+                    summary,
+                    alert_state,
+                    "queue_low",
+                ):
+                    low_queue_alert_sent = True
+            if _should_send_empty_queue_alert(queue_len, empty_queue_alert_sent):
+                summary = _build_status_text(status, running_jobs, queue_items)
+                if _send_alert_email_with_limits(
+                    alert_recipients,
+                    "[AWSQueueEngine] Queue is empty",
+                    summary,
+                    alert_state,
+                    "queue_empty",
+                ):
+                    empty_queue_alert_sent = True
+                    low_queue_alert_sent = True
+
+            now_dt = datetime.now()
+            if _should_send_daily_summary(last_daily_summary_date, now_dt):
+                summary = _build_status_text(status, running_jobs, queue_items)
+                if _send_alert_email_with_limits(
+                    alert_recipients,
+                    f"[AWSQueueEngine] Daily summary ({now_dt.strftime('%Y-%m-%d')})",
+                    summary,
+                    alert_state,
+                    "daily_summary",
+                ):
+                    last_daily_summary_date = now_dt.date()
+                    _save_last_daily_summary_date(last_daily_summary_date)
+
             preempt_queue_idx, preempt_item, victim_host = _select_preempt_target(
                 queue_items,
                 running_hosts,

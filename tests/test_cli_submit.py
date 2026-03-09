@@ -148,6 +148,12 @@ class CliSubmitTests(unittest.TestCase):
         self.assertIn("bash run.sh --epochs 5", res.stdout)
         self.assertRegex(res.stdout, r"\d{2}:\d{2}:\d{2}")
 
+    def test_test_email_connection_skips_when_not_configured(self):
+        res = self._run_cli("--test-email-connection")
+
+        self.assertEqual(res.returncode, 0)
+        self.assertIn("Email test skipped", res.stdout)
+
 
 if __name__ == "__main__":
     unittest.main()

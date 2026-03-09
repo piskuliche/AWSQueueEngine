@@ -31,6 +31,7 @@ awsqueueengine stop-monitor
 awsqueueengine tail eci3
 awsqueueengine stop eci3
 awsqueueengine clear
+awsqueueengine --test-email-connection
 ```
 
 `submit --high-priority` is still supported for backward compatibility and maps to
@@ -53,6 +54,31 @@ Or, for development, run directly:
 ```bash
 python -m cli list
 ```
+
+## Email Alerts (Mailtrap API)
+
+Set these environment variables before starting the monitor:
+
+```bash
+export AWSQUEUEENGINE_MAILTRAP_TOKEN="<your-mailtrap-token>"
+export AWSQUEUEENGINE_MAILTRAP_SENDER_EMAIL="hello@piskulich.com"
+export AWSQUEUEENGINE_MAILTRAP_SENDER_NAME="Queue Monitor"
+export AWSQUEUEENGINE_MAILTRAP_CATEGORY="Integration Test"
+export AWSQUEUEENGINE_ALERT_TO="you@example.com,team@example.com"
+export AWSQUEUEENGINE_ALERT_DAILY_EMAIL_LIMIT="150"
+export AWSQUEUEENGINE_JOB_FAIL_ALERT_COOLDOWN_SECONDS="900"
+```
+
+When configured, the monitor sends email:
+
+1. When a queued job fails to start on a host.
+2. Once when queue depth drops below 10 (fires on transition into low-queue state).
+3. Once when queue depth reaches 0 (fires on transition into empty state).
+4. Once per calendar day when the monitor detects a new date, with a status summary.
+
+Email protection:
+- Total outgoing emails are capped per day (`AWSQUEUEENGINE_ALERT_DAILY_EMAIL_LIMIT`, default `150`).
+- Job-failure emails are rate-limited with a cooldown (`AWSQUEUEENGINE_JOB_FAIL_ALERT_COOLDOWN_SECONDS`, default `900` seconds).
 
 
 
