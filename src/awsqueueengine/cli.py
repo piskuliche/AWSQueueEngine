@@ -146,8 +146,6 @@ def main():
                 payload_text = item.get("payload_remote_path") or item.get("payload") or "-"
                 cmd_text = str(item.get("cmd") or "")
                 dur_text = _format_elapsed(item.get("started_at"))
-                if len(payload_text) > 24:
-                    payload_text = payload_text[:21] + "..."
                 print(
                     f"{host:8}  {dur_text:8}  {item['priority']:5d}  {str(item['preempt']):7}  {hosts_text[:15]:15}  {payload_text:24}  "
                     f"{cmd_text}",

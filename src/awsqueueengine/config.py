@@ -10,6 +10,7 @@ CHECK_INTERVAL = 60  # seconds between monitor checks
 SSH_TIMEOUT = 60  # seconds for each ssh call
 QUEUE_FILE = Path.home() / ".aws_slurm_like_queue.json"
 RUNNING_FILE = Path.home() / ".aws_slurm_like_running.json"
+COMPLETED_FILE = Path.home() / ".aws_slurm_like_completed.json"
 MONITOR_STATE_FILE = Path.home() / ".aws_slurm_like_monitor_state.json"
 REMOTE_SCRATCH_ROOTS = ["/home/ubuntu/1scratch", "/home/ubuntu/2scratch"]  # order = preference
 

@@ -41,6 +41,9 @@ Use `--hosts` multiple times (or comma-separated values) to target multiple host
 Use `--preempt` to allow a queued job to interrupt a currently running managed job
 when no free eligible host is available. The interrupted job is requeued and restarted.
 `qstat` lists monitor-tracked running jobs and elapsed runtime (`HH:MM:SS`).
+When jobs finish, the monitor appends completion records to
+`~/.aws_slurm_like_completed.json` with the `qstat` fields plus final duration
+and timestamps (`started_at`, `finished_at`).
 
 
 Suggested to run with:

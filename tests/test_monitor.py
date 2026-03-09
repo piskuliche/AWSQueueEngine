@@ -1,8 +1,10 @@
 import unittest
 from datetime import date
+from unittest.mock import patch
 
 from awsqueueengine.monitor import (
     _build_job_fail_alert_body,
+    _build_completed_job_record,
     _initial_alert_runtime_state,
     _prune_running_jobs_for_status,
     _reset_queue_alert_state,
@@ -24,14 +26,15 @@ class MonitorRunningStatePruneTests(unittest.TestCase):
             {"host": "eci6", "reachable": True, "pid": "123"},
         ]
 
-        changed = _prune_running_jobs_for_status(running_jobs, status_rows)
+        changed, completed_records = _prune_running_jobs_for_status(running_jobs, status_rows)
 
         self.assertFalse(changed)
+        self.assertEqual(completed_records, [])
         self.assertEqual(set(running_jobs), {"eci5", "eci6"})
 
     def test_reachable_idle_host_is_pruned(self):
         running_jobs = {
-            "eci5": {"cmd": "run-a"},
+            "eci5": {"cmd": "run-a", "priority": 10, "preempt": False, "hosts": None, "started_at": 100.0},
             "eci6": {"cmd": "run-b"},
         }
         status_rows = [
@@ -39,10 +42,38 @@ class MonitorRunningStatePruneTests(unittest.TestCase):
             {"host": "eci6", "reachable": True, "pid": "123"},
         ]
 
-        changed = _prune_running_jobs_for_status(running_jobs, status_rows)
+        with patch("awsqueueengine.monitor.time.time", return_value=160.0):
+            changed, completed_records = _prune_running_jobs_for_status(running_jobs, status_rows)
 
         self.assertTrue(changed)
         self.assertEqual(set(running_jobs), {"eci6"})
+        self.assertEqual(len(completed_records), 1)
+        self.assertEqual(completed_records[0]["host"], "eci5")
+        self.assertEqual(completed_records[0]["dur"], "00:01:00")
+        self.assertEqual(completed_records[0]["duration_seconds"], 60)
+        self.assertEqual(completed_records[0]["cmd"], "run-a")
+
+    def test_build_completed_job_record_uses_qstat_payload_selection(self):
+        record = _build_completed_job_record(
+            "eci8",
+            {
+                "cmd": "python run.py",
+                "priority": 7,
+                "preempt": True,
+                "hosts": ["eci8"],
+                "payload": "/tmp/local",
+                "payload_remote_path": "/remote/payload",
+                "started_at": 10.0,
+            },
+            finished_at=40.0,
+        )
+        self.assertEqual(record["host"], "eci8")
+        self.assertEqual(record["dur"], "00:00:30")
+        self.assertEqual(record["payload"], "/remote/payload")
+        self.assertEqual(record["priority"], 7)
+        self.assertTrue(record["preempt"])
+        self.assertEqual(record["hosts"], ["eci8"])
+        self.assertEqual(record["cmd"], "python run.py")
 
 
 class MonitorAlertDecisionTests(unittest.TestCase):

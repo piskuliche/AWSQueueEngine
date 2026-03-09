@@ -23,6 +23,16 @@ class CliSubmitTests(unittest.TestCase):
 
     def _run_cli(self, *args):
         env = os.environ.copy()
+        for key in (
+            "AWSQUEUEENGINE_MAILTRAP_TOKEN",
+            "AWSQUEUEENGINE_MAILTRAP_SENDER_EMAIL",
+            "AWSQUEUEENGINE_MAILTRAP_SENDER_NAME",
+            "AWSQUEUEENGINE_MAILTRAP_CATEGORY",
+            "AWSQUEUEENGINE_ALERT_TO",
+            "AWSQUEUEENGINE_ALERT_DAILY_EMAIL_LIMIT",
+            "AWSQUEUEENGINE_JOB_FAIL_ALERT_COOLDOWN_SECONDS",
+        ):
+            env.pop(key, None)
         env["HOME"] = str(self.home_path)
         src_path = str(REPO_ROOT / "src")
         existing_pythonpath = env.get("PYTHONPATH")

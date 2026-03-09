@@ -16,6 +16,7 @@ from .host_status import status_all
 from .queue import dequeue_for_host, load_queue, save_queue, normalize_job_item
 from .job_control import submit_to_host, write_run_info, kill_managed_on_host
 from .running_state import load_running_jobs, save_running_jobs
+from .completion_state import append_completed_records
 from .notifications import parse_email_recipients, send_email
 
 
@@ -47,6 +48,36 @@ def _build_status_text(status_rows, running_jobs, queue_items):
         next_item = normalize_job_item(queue_items[0])
         lines.append(f"Next queued command: {str(next_item.get('cmd') or '')[:180]}")
     return "\n".join(lines)
+
+
+def _format_duration_seconds(duration_seconds):
+    duration_int = max(0, int(duration_seconds))
+    hours, rem = divmod(duration_int, 3600)
+    minutes, seconds = divmod(rem, 60)
+    return f"{hours:02d}:{minutes:02d}:{seconds:02d}"
+
+
+def _build_completed_job_record(host, running_item, finished_at):
+    item = normalize_job_item(running_item)
+    started_at = running_item.get("started_at") if isinstance(running_item, dict) else None
+    if isinstance(started_at, (int, float)):
+        duration_seconds = max(0, int(finished_at - float(started_at)))
+    else:
+        duration_seconds = 0
+        started_at = None
+    payload_text = item.get("payload_remote_path") or item.get("payload") or "-"
+    return {
+        "host": host,
+        "dur": _format_duration_seconds(duration_seconds),
+        "duration_seconds": duration_seconds,
+        "priority": item.get("priority", 0),
+        "preempt": item.get("preempt", False),
+        "hosts": item.get("hosts"),
+        "payload": payload_text,
+        "cmd": str(item.get("cmd") or ""),
+        "started_at": started_at,
+        "finished_at": float(finished_at),
+    }
 
 
 def _should_send_low_queue_alert(queue_len, already_sent):
@@ -275,12 +306,16 @@ def _prune_running_jobs_for_status(running_jobs, status_rows):
         if row.get("reachable") and row.get("pid") is not None
     }
     changed = False
+    completed_records = []
+    finished_at = time.time()
     for host in list(running_jobs):
         # Only drop metadata when the host is reachable and confirmed idle.
         if host in reachable_hosts and host not in active_hosts:
-            running_jobs.pop(host, None)
+            finished_item = running_jobs.pop(host, None)
+            if isinstance(finished_item, dict):
+                completed_records.append(_build_completed_job_record(host, finished_item, finished_at))
             changed = True
-    return changed
+    return changed, completed_records
 
 
 def monitor_loop(hosts, poll_interval=CHECK_INTERVAL, stop_event: threading.Event | None = None):
@@ -305,9 +340,11 @@ def monitor_loop(hosts, poll_interval=CHECK_INTERVAL, stop_event: threading.Even
             free_hosts = [s["host"] for s in status if s["reachable"] and s["pid"] is None]
             running_hosts = [s["host"] for s in status if s["reachable"] and s["pid"] is not None]
             unreachable_hosts = [s["host"] for s in status if not s["reachable"]]
-            state_changed = _prune_running_jobs_for_status(running_jobs, status)
+            state_changed, completed_records = _prune_running_jobs_for_status(running_jobs, status)
             if state_changed:
                 save_running_jobs(running_jobs)
+            if completed_records:
+                append_completed_records(completed_records)
             if unreachable_hosts:
                 print(f"[WARN] unreachable hosts: {', '.join(unreachable_hosts)}", flush=True)
             if free_hosts:
@@ -323,6 +360,8 @@ def monitor_loop(hosts, poll_interval=CHECK_INTERVAL, stop_event: threading.Even
                             f"Command: {item.get('cmd')}\n"
                             f"Priority: {item.get('priority')}\n"
                             f"Hosts restriction: {item.get('hosts') or 'any'}\n"
+                            f"Payload dir: {item.get('payload') or '-'}\n"
+                            f"Payload remote path: {item.get('payload_remote_path') or '-'}\n"
                             f"Generated at: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n"
                         )
                         _send_alert_email_with_limits(
