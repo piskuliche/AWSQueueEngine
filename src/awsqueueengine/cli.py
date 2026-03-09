@@ -2,6 +2,7 @@
 import sys, os
 import argparse
 import signal, threading
+import time
 from pathlib import Path
 from .config import HOSTS
 from .queue import enqueue_item, load_queue, normalize_job_item, save_queue
@@ -9,6 +10,7 @@ from .host_status import status_all
 from .monitor import acquire_monitor_lock, release_monitor_lock, monitor_loop
 from .job_control import submit_to_host, tail_remote_log, kill_managed_on_host
 from .staging import where_is_next_submit
+from .running_state import load_running_jobs
 
 
 PIDFILE = Path.home() / "awsqueueengine.pid"
@@ -46,6 +48,15 @@ def _handle_stop(signum, frame):
     stop_event.set()
 
 
+def _format_elapsed(started_at):
+    if not isinstance(started_at, (int, float)):
+        return "?"
+    elapsed_seconds = max(0, int(time.time() - float(started_at)))
+    hours, rem = divmod(elapsed_seconds, 3600)
+    minutes, seconds = divmod(rem, 60)
+    return f"{hours:02d}:{minutes:02d}:{seconds:02d}"
+
+
 def main():
 
     # Set unbuffered output for stdout and stderr
@@ -56,6 +67,7 @@ def main():
     sub = parser.add_subparsers(dest="cmd")
 
     sub.add_parser("status", help="Show status for all hosts")
+    sub.add_parser("qstat", help="Show running jobs tracked by monitor")
     p_submit = sub.add_parser("submit", help="Enqueue a job (command string)")
     p_submit.add_argument("--payload", "-p", help="Local folder to copy to remote scratch before running", default=None)
     p_submit.add_argument(
@@ -67,6 +79,7 @@ def main():
     )
     p_submit.add_argument("--priority", type=int, default=None, help="Integer priority (higher runs first)")
     p_submit.add_argument("--high-priority", action="store_true", help="Mark this job as high priority in the queue")
+    p_submit.add_argument("--preempt", action="store_true", help="Allow this job to preempt a running managed job if needed")
     p_submit.add_argument("command", nargs=argparse.REMAINDER, help="Command to run remotely (quoted)")
 
     sub.add_parser("list", help="Show queued jobs")
@@ -97,6 +110,25 @@ def main():
             tag = r["tag"] or "-"
             info = (r["raw"][:60] + "...") if r["raw"] else ""
             print(f"{r['host']:8}  {reach:8}  {pid:8}  {tag:12}  {info}", flush=True)
+    elif args.cmd == "qstat":
+        running_jobs = load_running_jobs()
+        if not running_jobs:
+            print("(no running jobs tracked)", flush=True)
+        else:
+            print(f"{'HOST':8}  {'DUR':8}  {'PRI':5}  {'PREEMPT':7}  {'HOSTS':15}  {'PAYLOAD':24}  CMD", flush=True)
+            for host in sorted(running_jobs):
+                item = running_jobs[host]
+                hosts_text = ",".join(item["hosts"]) if item["hosts"] else "any"
+                payload_text = item.get("payload_remote_path") or item.get("payload") or "-"
+                cmd_text = str(item.get("cmd") or "")
+                dur_text = _format_elapsed(item.get("started_at"))
+                if len(payload_text) > 24:
+                    payload_text = payload_text[:21] + "..."
+                print(
+                    f"{host:8}  {dur_text:8}  {item['priority']:5d}  {str(item['preempt']):7}  {hosts_text[:15]:15}  {payload_text:24}  "
+                    f"{cmd_text}",
+                    flush=True,
+                )
     elif args.cmd == "submit":
         if not args.command:
             print("No command provided.", flush=True)
@@ -132,6 +164,7 @@ def main():
             "payload": args.payload,
             "priority": priority,
             "hosts": hosts,
+            "preempt": args.preempt,
         }
         enqueue_item(item)
         print("Enqueued:", item, flush=True)
@@ -144,7 +177,7 @@ def main():
                 item = normalize_job_item(raw_item)
                 hosts_text = ",".join(item["hosts"]) if item["hosts"] else "any"
                 print(
-                    f"{i:3d}. [priority={item['priority']}] [hosts={hosts_text}] "
+                    f"{i:3d}. [priority={item['priority']}] [hosts={hosts_text}] [preempt={item['preempt']}] "
                     f"cmd={item['cmd']!r} payload={item['payload']!r}",
                     flush=True
                 )
@@ -175,7 +208,7 @@ def main():
         for idx, item in sorted(removed_jobs, key=lambda pair: pair[0]):
             hosts_text = ",".join(item["hosts"]) if item["hosts"] else "any"
             print(
-                f"  {idx:3d}. [priority={item['priority']}] [hosts={hosts_text}] "
+                f"  {idx:3d}. [priority={item['priority']}] [hosts={hosts_text}] [preempt={item['preempt']}] "
                 f"cmd={item['cmd']!r} payload={item['payload']!r}",
                 flush=True,
             )

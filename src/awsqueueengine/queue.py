@@ -3,6 +3,8 @@ import json
 from .config import QUEUE_FILE
 
 DEFAULT_PRIORITY = 0
+DEFAULT_PREEMPT = False
+DEFAULT_RESUME_FIRST = False
 LEGACY_PRIORITY_MAP = {
     "high": 100,
     "normal": 0,
@@ -62,6 +64,40 @@ def _normalize_hosts(hosts):
     return normalized_hosts or None
 
 
+def _normalize_preempt(value):
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, int):
+        return value != 0
+    if isinstance(value, str):
+        return value.strip().lower() in {"1", "true", "yes", "y", "on"}
+    return DEFAULT_PREEMPT
+
+
+def _normalize_payload_remote_path(value):
+    if not isinstance(value, str):
+        return None
+    clean_value = value.strip()
+    return clean_value or None
+
+
+def _normalize_resume_first(value):
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, int):
+        return value != 0
+    if isinstance(value, str):
+        return value.strip().lower() in {"1", "true", "yes", "y", "on"}
+    return DEFAULT_RESUME_FIRST
+
+
+def _normalize_resume_host(value):
+    if not isinstance(value, str):
+        return None
+    clean_value = value.strip()
+    return clean_value or None
+
+
 def normalize_job_item(item):
     if isinstance(item, str):
         return {
@@ -69,6 +105,10 @@ def normalize_job_item(item):
             "payload": None,
             "priority": DEFAULT_PRIORITY,
             "hosts": None,
+            "preempt": DEFAULT_PREEMPT,
+            "payload_remote_path": None,
+            "resume_first": DEFAULT_RESUME_FIRST,
+            "resume_host": None,
         }
 
     if not isinstance(item, dict):
@@ -77,6 +117,10 @@ def normalize_job_item(item):
             "payload": None,
             "priority": DEFAULT_PRIORITY,
             "hosts": None,
+            "preempt": DEFAULT_PREEMPT,
+            "payload_remote_path": None,
+            "resume_first": DEFAULT_RESUME_FIRST,
+            "resume_host": None,
         }
 
     return {
@@ -84,6 +128,10 @@ def normalize_job_item(item):
         "payload": item.get("payload"),
         "priority": _normalize_priority(item.get("priority", DEFAULT_PRIORITY)),
         "hosts": _normalize_hosts(item.get("hosts")),
+        "preempt": _normalize_preempt(item.get("preempt", DEFAULT_PREEMPT)),
+        "payload_remote_path": _normalize_payload_remote_path(item.get("payload_remote_path")),
+        "resume_first": _normalize_resume_first(item.get("resume_first", DEFAULT_RESUME_FIRST)),
+        "resume_host": _normalize_resume_host(item.get("resume_host")),
     }
 
 
@@ -99,6 +147,14 @@ def _is_host_eligible(item, host):
 
 
 def _select_best_index(q, host=None):
+    if host is not None:
+        for idx, queued_item in enumerate(q):
+            normalized_item = normalize_job_item(queued_item)
+            if not _is_host_eligible(normalized_item, host):
+                continue
+            if normalized_item.get("resume_first") and normalized_item.get("resume_host") == host:
+                return idx
+
     best_idx = None
     best_priority = None
 

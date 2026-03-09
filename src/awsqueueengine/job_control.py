@@ -8,9 +8,12 @@ from .ssh_utils import ssh_run
 from .staging import sizeof_local_path_bytes, choose_scratch_on_host, rsync_to_host_with_fallback
 from .queue import load_queue, save_queue, dequeue
 
-def submit_to_host(host, job_command, payload_local_path=None):
+def submit_to_host(host, job_command, payload_local_path=None, payload_remote_path=None):
     tag = uuid.uuid4().hex[:12]
-    if not payload_local_path:
+    remote_payload_dir = None
+    if payload_remote_path:
+        remote_payload_dir = str(payload_remote_path).strip() or None
+    if not payload_local_path and not remote_payload_dir:
         remote_cmd = (
             rf"mkdir -p {REMOTE_LOG_DIR} && cd $HOME || true && "
             rf"nohup env MANAGER_TAG={tag} bash -lc {shlex.quote(job_command)} > {REMOTE_LOG_DIR}/{tag}.log 2>&1 < /dev/null & echo $! > {REMOTE_LOG_DIR}/{tag}.pid"
@@ -22,21 +25,22 @@ def submit_to_host(host, job_command, payload_local_path=None):
             return {"host": host, "tag": tag, "pid": pid, "ok": True}
         else:
             return {"host": host, "tag": tag, "pid": None, "ok": False, "err": err or out}
-    local_path = Path(payload_local_path).expanduser()
-    if not local_path.exists():
-        return {"host": host, "ok": False, "err": f"local payload not found: {local_path}"}
-    needed_bytes = sizeof_local_path_bytes(local_path)
-    remote_root, info = choose_scratch_on_host(host, needed_bytes)
-    if not remote_root:
-        return {"host": host, "ok": False, "err": f"no suitable scratch: {info}"}
-    jobname = Path(payload_local_path).name
-    remote_payload_dir = f"{remote_root}/{jobname}-{tag}"
-    rc, out, err = ssh_run(host, f"mkdir -p {remote_root} && chmod 700 {remote_root}", timeout=30)
-    if rc != 0:
-        return {"host": host, "ok": False, "err": f"mkdir failed: {err or out}"}
-    ok, method, sout, serr = rsync_to_host_with_fallback(str(local_path), host, remote_payload_dir)
-    if not ok:
-        return {"host": host, "ok": False, "err": f"rsync failed: {serr or sout}"}
+    if not remote_payload_dir:
+        local_path = Path(payload_local_path).expanduser()
+        if not local_path.exists():
+            return {"host": host, "ok": False, "err": f"local payload not found: {local_path}"}
+        needed_bytes = sizeof_local_path_bytes(local_path)
+        remote_root, info = choose_scratch_on_host(host, needed_bytes)
+        if not remote_root:
+            return {"host": host, "ok": False, "err": f"no suitable scratch: {info}"}
+        jobname = Path(payload_local_path).name
+        remote_payload_dir = f"{remote_root}/{jobname}-{tag}"
+        rc, out, err = ssh_run(host, f"mkdir -p {remote_root} && chmod 700 {remote_root}", timeout=30)
+        if rc != 0:
+            return {"host": host, "ok": False, "err": f"mkdir failed: {err or out}"}
+        ok, method, sout, serr = rsync_to_host_with_fallback(str(local_path), host, remote_payload_dir)
+        if not ok:
+            return {"host": host, "ok": False, "err": f"rsync failed: {serr or sout}"}
     remote_cmd = (
         rf"mkdir -p {REMOTE_LOG_DIR} && cd $HOME || true && "
         rf"nohup env MANAGER_TAG={tag} PAYLOAD_DIR={remote_payload_dir} bash -lc {shlex.quote(job_command)} "

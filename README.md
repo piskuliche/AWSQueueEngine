@@ -20,7 +20,9 @@ awsqueueengine submit --payload ./my_payload "cd $PAYLOAD_DIR && bash run.sh"
 awsqueueengine submit --priority 25 "python train.py --epochs 10"
 awsqueueengine submit --hosts eci17 --priority 100 "bash pinned-job.sh"
 awsqueueengine submit --hosts eci16 --hosts eci18 "bash host-allowlist-job.sh"
+awsqueueengine submit --preempt --priority 999 "bash urgent-job.sh"
 awsqueueengine list
+awsqueueengine qstat
 awsqueueengine qdel 2
 awsqueueengine qdel 1 3
 awsqueueengine start-monitor
@@ -35,6 +37,9 @@ awsqueueengine clear
 priority `100`. If both `--priority` and `--high-priority` are supplied, `--priority`
 takes precedence.
 Use `--hosts` multiple times (or comma-separated values) to target multiple hosts.
+Use `--preempt` to allow a queued job to interrupt a currently running managed job
+when no free eligible host is available. The interrupted job is requeued and restarted.
+`qstat` lists monitor-tracked running jobs and elapsed runtime (`HH:MM:SS`).
 
 
 Suggested to run with:
