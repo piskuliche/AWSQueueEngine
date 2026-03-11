@@ -1,5 +1,7 @@
 import unittest
 from datetime import date
+from pathlib import Path
+import tempfile
 from unittest.mock import patch
 
 from awsqueueengine.monitor import (
@@ -12,6 +14,8 @@ from awsqueueengine.monitor import (
     _should_send_daily_summary,
     _should_send_empty_queue_alert,
     _should_send_low_queue_alert,
+    load_hosts_from_file,
+    monitor_loop,
 )
 
 
@@ -52,6 +56,16 @@ class MonitorRunningStatePruneTests(unittest.TestCase):
         self.assertEqual(completed_records[0]["dur"], "00:01:00")
         self.assertEqual(completed_records[0]["duration_seconds"], 60)
         self.assertEqual(completed_records[0]["cmd"], "run-a")
+
+    def test_missing_host_in_status_keeps_running_metadata(self):
+        running_jobs = {"eci9": {"cmd": "run-z"}}
+        status_rows = [{"host": "eci8", "reachable": True, "pid": None}]
+
+        changed, completed_records = _prune_running_jobs_for_status(running_jobs, status_rows)
+
+        self.assertFalse(changed)
+        self.assertEqual(completed_records, [])
+        self.assertEqual(set(running_jobs), {"eci9"})
 
     def test_build_completed_job_record_uses_qstat_payload_selection(self):
         record = _build_completed_job_record(
@@ -119,7 +133,13 @@ class MonitorAlertDecisionTests(unittest.TestCase):
 
         state = _initial_alert_runtime_state()
         state["sent_today"] = 150
-        allowed = _should_send_alert(state, "queue_low", FakeDateTime(2026, 3, 9), now_ts=1000.0)
+        today = state["day"]
+        allowed = _should_send_alert(
+            state,
+            "queue_low",
+            FakeDateTime(today.year, today.month, today.day),
+            now_ts=1000.0,
+        )
         self.assertFalse(allowed)
 
     def test_job_fail_alert_cooldown_suppresses_and_tracks_count(self):
@@ -136,7 +156,13 @@ class MonitorAlertDecisionTests(unittest.TestCase):
 
         state = _initial_alert_runtime_state()
         state["job_fail_cooldown_until"] = 500.0
-        allowed = _should_send_alert(state, "job_fail", FakeDateTime(2026, 3, 9), now_ts=100.0)
+        today = state["day"]
+        allowed = _should_send_alert(
+            state,
+            "job_fail",
+            FakeDateTime(today.year, today.month, today.day),
+            now_ts=100.0,
+        )
         self.assertFalse(allowed)
         self.assertEqual(state["job_fail_suppressed_count"], 1)
 
@@ -146,6 +172,98 @@ class MonitorAlertDecisionTests(unittest.TestCase):
         body = _build_job_fail_alert_body("Failure details", state)
         self.assertIn("Suppressed 3 additional job start-failure email(s) during cooldown.", body)
         self.assertEqual(state["job_fail_suppressed_count"], 0)
+
+
+class MonitorHostSourceTests(unittest.TestCase):
+    def test_load_hosts_from_file_supports_comments_and_commas(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            hosts_file = Path(tmpdir) / "hosts.txt"
+            hosts_file.write_text(
+                "eci1, eci2\n"
+                "eci2 eci3\n"
+                "  # comment line\n"
+                "eci4 # inline comment\n"
+            )
+
+            hosts = load_hosts_from_file(hosts_file)
+
+        self.assertEqual(hosts, ["eci1", "eci2", "eci3", "eci4"])
+
+    def test_monitor_loop_reloads_hosts_file_and_stops_launching_removed_hosts(self):
+        class FakeStopEvent:
+            def __init__(self, loops):
+                self.loops = loops
+
+            def is_set(self):
+                return self.loops <= 0
+
+            def wait(self, _timeout):
+                self.loops -= 1
+                return self.is_set()
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            hosts_file = Path(tmpdir) / "hosts.txt"
+            hosts_file.write_text("eci1\neci2\n")
+            status_calls = []
+            launched_hosts = []
+            dequeue_calls = []
+
+            def fake_status_all(hosts):
+                status_calls.append(list(hosts))
+                if len(status_calls) == 1:
+                    hosts_file.write_text("eci1\n")
+                    return [
+                        {"host": "eci1", "reachable": True, "pid": None},
+                        {"host": "eci2", "reachable": True, "pid": None},
+                    ]
+                return [{"host": "eci1", "reachable": True, "pid": None}]
+
+            def fake_dequeue_for_host(host):
+                dequeue_calls.append(host)
+                if host == "eci2" and dequeue_calls.count("eci2") == 1:
+                    return {"cmd": "echo run-once", "priority": 0, "hosts": None, "preempt": False}
+                return None
+
+            def fake_launch_job_on_host(host, _job_item, running_jobs):
+                running_jobs[host] = {"cmd": "echo run-once"}
+                launched_hosts.append(host)
+                return True
+
+            with patch("awsqueueengine.monitor.load_running_jobs", return_value={}), patch(
+                "awsqueueengine.monitor.parse_email_recipients", return_value=[]
+            ), patch("awsqueueengine.monitor._load_last_daily_summary_date", return_value=date(2026, 3, 10)), patch(
+                "awsqueueengine.monitor.status_all", side_effect=fake_status_all
+            ), patch(
+                "awsqueueengine.monitor.dequeue_for_host", side_effect=fake_dequeue_for_host
+            ), patch(
+                "awsqueueengine.monitor._launch_job_on_host", side_effect=fake_launch_job_on_host
+            ), patch(
+                "awsqueueengine.monitor._prune_running_jobs_for_status", return_value=(False, [])
+            ), patch(
+                "awsqueueengine.monitor._select_preempt_target", return_value=(None, None, None)
+            ), patch(
+                "awsqueueengine.monitor.load_queue", return_value=[]
+            ), patch(
+                "awsqueueengine.monitor.save_queue"
+            ), patch(
+                "awsqueueengine.monitor.save_running_jobs"
+            ), patch(
+                "awsqueueengine.monitor.append_completed_records"
+            ), patch(
+                "awsqueueengine.monitor._send_alert_email_with_limits", return_value=True
+            ), patch(
+                "awsqueueengine.monitor._save_last_daily_summary_date"
+            ):
+                monitor_loop(
+                    ["eci1", "eci2"],
+                    poll_interval=0,
+                    stop_event=FakeStopEvent(2),
+                    hosts_file=hosts_file,
+                )
+
+        self.assertEqual(status_calls, [["eci1", "eci2"], ["eci1"]])
+        self.assertEqual(launched_hosts, ["eci2"])
+        self.assertEqual(dequeue_calls.count("eci2"), 1)
 
 
 if __name__ == "__main__":

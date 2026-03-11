@@ -54,6 +54,11 @@ class CliSubmitTests(unittest.TestCase):
         running_file = self.home_path / RUNNING_FILE_NAME
         running_file.write_text(json.dumps(payload, indent=2))
 
+    def _write_hosts_file(self, content):
+        hosts_file = self.home_path / "hosts.txt"
+        hosts_file.write_text(content)
+        return hosts_file
+
     def test_submit_with_hosts_persists_allowlist(self):
         res = self._run_cli("submit", "--hosts", "eci16", "--hosts", "eci18", "echo", "hello")
 
@@ -69,6 +74,41 @@ class CliSubmitTests(unittest.TestCase):
 
         self.assertEqual(res.returncode, 1)
         self.assertIn("Invalid host(s): typo-host", res.stdout)
+        self.assertEqual(self._read_queue(), [])
+
+    def test_submit_uses_hosts_file_for_host_validation(self):
+        hosts_file = self._write_hosts_file("eci16\neci18\n")
+
+        res = self._run_cli(
+            "submit",
+            "--hosts-file",
+            str(hosts_file),
+            "--hosts",
+            "eci16",
+            "echo",
+            "hello",
+        )
+
+        self.assertEqual(res.returncode, 0)
+        items = self._read_queue()
+        self.assertEqual(items[0]["hosts"], ["eci16"])
+
+    def test_submit_rejects_host_not_present_in_hosts_file(self):
+        hosts_file = self._write_hosts_file("eci16\neci18\n")
+
+        res = self._run_cli(
+            "submit",
+            "--hosts-file",
+            str(hosts_file),
+            "--hosts",
+            "eci17",
+            "echo",
+            "hello",
+        )
+
+        self.assertEqual(res.returncode, 1)
+        self.assertIn("Invalid host(s): eci17", res.stdout)
+        self.assertIn("Valid hosts: eci16, eci18", res.stdout)
         self.assertEqual(self._read_queue(), [])
 
     def test_submit_priority_argument_sets_integer_priority(self):

@@ -20,6 +20,102 @@ from .completion_state import append_completed_records
 from .notifications import parse_email_recipients, send_email
 
 
+def _normalize_hosts(host_values):
+    normalized_hosts = []
+    seen = set()
+    for host in host_values or []:
+        if not isinstance(host, str):
+            continue
+        clean_host = host.strip()
+        if not clean_host or clean_host in seen:
+            continue
+        normalized_hosts.append(clean_host)
+        seen.add(clean_host)
+    return normalized_hosts
+
+
+def load_hosts_from_file(hosts_file):
+    hosts_path = Path(hosts_file).expanduser()
+    raw_text = hosts_path.read_text()
+    parsed_hosts = []
+    for raw_line in raw_text.splitlines():
+        # Strip inline comments and support both comma/whitespace separators.
+        line = raw_line.split("#", 1)[0].replace(",", " ")
+        parsed_hosts.extend(line.split())
+    return _normalize_hosts(parsed_hosts)
+
+
+class _MonitorHostSource:
+    def __init__(self, hosts, hosts_file=None):
+        self._hosts = _normalize_hosts(hosts)
+        self._hosts_file = Path(hosts_file).expanduser() if hosts_file else None
+        self._last_file_stamp = None
+        self._missing_file_warned = False
+        if self._hosts_file:
+            self.refresh(force=True)
+
+    @property
+    def hosts_file(self):
+        return self._hosts_file
+
+    def _compute_file_stamp(self):
+        if not self._hosts_file:
+            return None
+        try:
+            stat_result = self._hosts_file.stat()
+        except FileNotFoundError:
+            return None
+        return (stat_result.st_mtime_ns, stat_result.st_size)
+
+    def refresh(self, force=False):
+        if not self._hosts_file:
+            return list(self._hosts)
+
+        file_stamp = self._compute_file_stamp()
+        if file_stamp is None:
+            if not self._missing_file_warned:
+                print(
+                    f"[WARN] Hosts file not found: {self._hosts_file}. "
+                    f"Keeping previous host list ({len(self._hosts)} host(s)).",
+                    flush=True,
+                )
+                self._missing_file_warned = True
+            self._last_file_stamp = None
+            return list(self._hosts)
+
+        if not force and self._last_file_stamp == file_stamp:
+            return list(self._hosts)
+
+        try:
+            next_hosts = load_hosts_from_file(self._hosts_file)
+        except OSError as exc:
+            print(
+                f"[WARN] Failed to read hosts file {self._hosts_file}: {exc}. "
+                f"Keeping previous host list ({len(self._hosts)} host(s)).",
+                flush=True,
+            )
+            self._last_file_stamp = file_stamp
+            return list(self._hosts)
+
+        self._missing_file_warned = False
+        if next_hosts != self._hosts:
+            previous_hosts = set(self._hosts)
+            next_host_set = set(next_hosts)
+            added = [host for host in next_hosts if host not in previous_hosts]
+            removed = [host for host in self._hosts if host not in next_host_set]
+            added_text = ", ".join(added) if added else "-"
+            removed_text = ", ".join(removed) if removed else "-"
+            print(
+                f"[INFO] Hosts updated from {self._hosts_file}: {len(next_hosts)} host(s) "
+                f"(added: {added_text}; removed: {removed_text})",
+                flush=True,
+            )
+            self._hosts = next_hosts
+
+        self._last_file_stamp = file_stamp
+        return list(self._hosts)
+
+
 def _host_is_eligible(job_item, host):
     hosts = job_item.get("hosts")
     return not hosts or host in hosts
@@ -318,11 +414,15 @@ def _prune_running_jobs_for_status(running_jobs, status_rows):
     return changed, completed_records
 
 
-def monitor_loop(hosts, poll_interval=CHECK_INTERVAL, stop_event: threading.Event | None = None):
+def monitor_loop(hosts, poll_interval=CHECK_INTERVAL, stop_event: threading.Event | None = None, hosts_file=None):
     print("Starting monitor loop. Press Ctrl-C to stop.", flush=True)
 
     if stop_event is None:
         stop_event = threading.Event()
+    host_source = _MonitorHostSource(hosts, hosts_file=hosts_file)
+    if host_source.hosts_file:
+        print(f"Monitoring hosts from file: {host_source.hosts_file}", flush=True)
+
     running_jobs = load_running_jobs()
     alert_recipients = parse_email_recipients()
     alert_state = _initial_alert_runtime_state()
@@ -335,8 +435,17 @@ def monitor_loop(hosts, poll_interval=CHECK_INTERVAL, stop_event: threading.Even
     if running_jobs:
         print(f"Recovered {len(running_jobs)} running job record(s) from disk.", flush=True)
     try:
+        no_hosts_warned = False
         while not stop_event.is_set():
-            status = status_all(hosts)
+            current_hosts = host_source.refresh()
+            if not current_hosts:
+                if not no_hosts_warned:
+                    print("[WARN] No eligible hosts configured; monitor will wait for hosts.", flush=True)
+                    no_hosts_warned = True
+            else:
+                no_hosts_warned = False
+
+            status = status_all(current_hosts)
             free_hosts = [s["host"] for s in status if s["reachable"] and s["pid"] is None]
             running_hosts = [s["host"] for s in status if s["reachable"] and s["pid"] is not None]
             unreachable_hosts = [s["host"] for s in status if not s["reachable"]]

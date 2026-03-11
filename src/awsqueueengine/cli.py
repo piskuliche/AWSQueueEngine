@@ -8,7 +8,7 @@ from pathlib import Path
 from .config import HOSTS
 from .queue import enqueue_item, load_queue, normalize_job_item, save_queue
 from .host_status import status_all
-from .monitor import acquire_monitor_lock, release_monitor_lock, monitor_loop
+from .monitor import acquire_monitor_lock, load_hosts_from_file, release_monitor_lock, monitor_loop
 from .job_control import submit_to_host, tail_remote_log, kill_managed_on_host
 from .staging import where_is_next_submit
 from .running_state import load_running_jobs
@@ -59,6 +59,16 @@ def _format_elapsed(started_at):
     return f"{hours:02d}:{minutes:02d}:{seconds:02d}"
 
 
+def _resolve_hosts_for_cli(hosts_file):
+    if not hosts_file:
+        return list(HOSTS)
+    try:
+        return load_hosts_from_file(hosts_file)
+    except OSError as exc:
+        print(f"Failed to read hosts file {hosts_file}: {exc}", flush=True)
+        sys.exit(1)
+
+
 def main():
 
     # Set unbuffered output for stdout and stderr
@@ -73,9 +83,19 @@ def main():
     )
     sub = parser.add_subparsers(dest="cmd")
 
-    sub.add_parser("status", help="Show status for all hosts")
+    p_status = sub.add_parser("status", help="Show status for all hosts")
+    p_status.add_argument(
+        "--hosts-file",
+        help="Optional file with hostnames (comma or whitespace separated).",
+        default=None,
+    )
     sub.add_parser("qstat", help="Show running jobs tracked by monitor")
     p_submit = sub.add_parser("submit", help="Enqueue a job (command string)")
+    p_submit.add_argument(
+        "--hosts-file",
+        help="Optional file with valid hostnames (comma or whitespace separated).",
+        default=None,
+    )
     p_submit.add_argument("--payload", "-p", help="Local folder to copy to remote scratch before running", default=None)
     p_submit.add_argument(
         "--hosts",
@@ -95,7 +115,12 @@ def main():
     sub.add_parser("clear", help="Clear the queue")
     sub.add_parser("start", help="Start monitor loop (runs until Ctrl-C)")
     sub.add_parser("where", help="Show where the next job will be submitted")
-    sub.add_parser("start-monitor", help="Start the monitor loop (daemon mode)")
+    p_start_monitor = sub.add_parser("start-monitor", help="Start the monitor loop (daemon mode)")
+    p_start_monitor.add_argument(
+        "--hosts-file",
+        help="Optional file with hostnames to monitor (reloaded while running).",
+        default=None,
+    )
     sub.add_parser("stop-monitor", help="Stop the running monitor loop")
     sub.add_parser("status-monitor", help="Show monitor status")
 
@@ -126,7 +151,8 @@ def main():
         sys.exit(1)
 
     if args.cmd == "status":
-        rows = status_all(HOSTS)
+        monitor_hosts = _resolve_hosts_for_cli(args.hosts_file)
+        rows = status_all(monitor_hosts)
         print(f"{'HOST':8}  {'REACH':8}  {'PID':8}  {'TAG':12}  INFO", flush=True)
         for r in rows:
             reach = "yes" if r["reachable"] else "no"
@@ -156,7 +182,7 @@ def main():
             print("No command provided.", flush=True)
             sys.exit(1)
 
-        valid_hosts = set(HOSTS)
+        valid_hosts = set(_resolve_hosts_for_cli(args.hosts_file))
         hosts = None
         if args.hosts:
             requested_hosts = []
@@ -166,7 +192,8 @@ def main():
                 requested_hosts.extend(h.strip() for h in host_value.split(",") if h and h.strip())
             invalid_hosts = sorted({h for h in requested_hosts if h not in valid_hosts})
             if invalid_hosts:
-                print(f"Invalid host(s): {', '.join(invalid_hosts)}. Valid hosts: {', '.join(HOSTS)}", flush=True)
+                valid_hosts_text = ", ".join(sorted(valid_hosts)) if valid_hosts else "(none)"
+                print(f"Invalid host(s): {', '.join(invalid_hosts)}. Valid hosts: {valid_hosts_text}", flush=True)
                 sys.exit(1)
             hosts = list(dict.fromkeys(requested_hosts))
 
@@ -257,8 +284,9 @@ def main():
         write_pidfile()
         print(f"Monitor started (pid={os.getpid()})", flush=True)
 
+        monitor_hosts = _resolve_hosts_for_cli(args.hosts_file)
         try:
-            monitor_loop(HOSTS, stop_event=stop_event)
+            monitor_loop(monitor_hosts, stop_event=stop_event, hosts_file=args.hosts_file)
             print("Monitor exited cleanly.", flush=True)
         finally:
             remove_pidfile()

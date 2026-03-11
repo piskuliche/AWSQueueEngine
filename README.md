@@ -16,7 +16,9 @@ After installation, use the CLI:
 
 ```bash
 awsqueueengine status
+awsqueueengine status --hosts-file ~/queue_hosts.txt
 awsqueueengine submit --payload ./my_payload "cd $PAYLOAD_DIR && bash run.sh"
+awsqueueengine submit --hosts-file ~/queue_hosts.txt --hosts eci17 "bash pinned-job.sh"
 awsqueueengine submit --priority 25 "python train.py --epochs 10"
 awsqueueengine submit --hosts eci17 --priority 100 "bash pinned-job.sh"
 awsqueueengine submit --hosts eci16 --hosts eci18 "bash host-allowlist-job.sh"
@@ -26,6 +28,7 @@ awsqueueengine qstat
 awsqueueengine qdel 2
 awsqueueengine qdel 1 3
 awsqueueengine start-monitor
+awsqueueengine start-monitor --hosts-file ~/queue_hosts.txt
 awsqueueengine status-monitor
 awsqueueengine stop-monitor
 awsqueueengine tail eci3
@@ -38,6 +41,8 @@ awsqueueengine --test-email-connection
 priority `100`. If both `--priority` and `--high-priority` are supplied, `--priority`
 takes precedence.
 Use `--hosts` multiple times (or comma-separated values) to target multiple hosts.
+Use `start-monitor --hosts-file <path>` to source monitor hosts from a file and reload
+changes automatically while the monitor is running.
 Use `--preempt` to allow a queued job to interrupt a currently running managed job
 when no free eligible host is available. The interrupted job is requeued and restarted.
 `qstat` lists monitor-tracked running jobs and elapsed runtime (`HH:MM:SS`).
