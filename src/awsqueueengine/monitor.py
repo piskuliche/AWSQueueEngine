@@ -10,6 +10,7 @@ from .config import (
     ALERT_DAILY_EMAIL_LIMIT,
     CHECK_INTERVAL,
     JOB_FAIL_ALERT_COOLDOWN_SECONDS,
+    MAX_SUBMIT_FAILURES,
     MONITOR_STATE_FILE,
 )
 from .host_status import status_all
@@ -331,7 +332,17 @@ def _launch_job_on_host(host, job_item, running_jobs):
     if not res.get("ok"):
         print(f"  Failed to start on {host}: {res.get('err')}", flush=True)
         if res.get("err") != "pidfile present but process not running":
-            _requeue_front(item)
+            failures = item.get("submit_failures", 0) + 1
+            item["submit_failures"] = failures
+            if failures >= MAX_SUBMIT_FAILURES:
+                print(
+                    f"  Job exceeded max submit failures ({MAX_SUBMIT_FAILURES}); dropping from queue: "
+                    f"{str(item.get('cmd') or '')[:120]}",
+                    flush=True,
+                )
+            else:
+                print(f"  Requeuing job (failure {failures}/{MAX_SUBMIT_FAILURES}).", flush=True)
+                _requeue_front(item)
         else:
             print(f"    Job Failed on {host}; but had pid file. Job maybe had error.", flush=True)
         return False
@@ -480,6 +491,7 @@ def monitor_loop(hosts, poll_interval=CHECK_INTERVAL, stop_event: threading.Even
                             alert_state,
                             "job_fail",
                         )
+                        break  # avoid retrying the same requeued job on other free hosts this cycle
 
             queue_items = load_queue()
             queue_len = len(queue_items)

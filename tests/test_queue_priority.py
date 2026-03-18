@@ -143,6 +143,7 @@ class QueuePriorityTests(unittest.TestCase):
                 "payload_remote_path": None,
                 "resume_first": False,
                 "resume_host": None,
+                "submit_failures": 0,
             },
         )
 

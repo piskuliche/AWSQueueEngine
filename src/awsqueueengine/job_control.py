@@ -66,16 +66,31 @@ def submit_to_host(host, job_command, payload_local_path=None, payload_remote_pa
 
 def kill_managed_on_host(host, ssh_run=ssh_run, grace_seconds=3):
     cmd = r"""
-pids=$(pgrep -f 'MANAGER_TAG=' || true)
-if [ -n "$pids" ]; then
+pidfiles=$(ls -1 {remote_log_dir}/*.pid 2>/dev/null || true)
+roots=""
+tracked_pidfiles=""
+for pidfile in $pidfiles; do
+  pid=$(cat "$pidfile" 2>/dev/null | tr -d '[:space:]')
+  if [ -z "$pid" ]; then
+    continue
+  fi
+  if ps -p "$pid" -o pid= >/dev/null 2>&1; then
+    roots="$roots $pid"
+    tracked_pidfiles="$tracked_pidfiles $pidfile"
+  fi
+done
+if [ -z "$roots" ]; then
+  roots=$(pgrep -f '[M]ANAGER_TAG=' || true)
+fi
+if [ -n "$roots" ]; then
   all=""
-  for root in $pids; do
+  for root in $roots; do
     queue="$root"
     descendants="$root"
     while [ -n "$queue" ]; do
       next=""
       for q in $queue; do
-        kids=$(pgrep -P "$q" -d ' ' 2>/dev/null || true)
+        kids=$(pgrep -P "$q" 2>/dev/null || true)
         if [ -n "$kids" ]; then
           next="$next $kids"
         fi
@@ -94,9 +109,13 @@ if [ -n "$pids" ]; then
     kill -KILL $final 2>/dev/null || true
   fi
 fi
-pkill -f 'pmemd.cuda' || true
-pkill -f 'pmemd.cuda.MPI' || true
-""".format(grace=int(grace_seconds))
+for pidfile in $tracked_pidfiles; do
+  rm -f "$pidfile" 2>/dev/null || true
+done
+pkill -f '[p]memd.cuda' || true
+pkill -f '[p]memd.cuda.MPI' || true
+exit 0
+""".format(grace=int(grace_seconds), remote_log_dir=REMOTE_LOG_DIR)
     rc, out, err = ssh_run(host, cmd)
     return {"host": host, "rc": rc, "out": out, "err": err}
 

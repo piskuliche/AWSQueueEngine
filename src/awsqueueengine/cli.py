@@ -328,7 +328,8 @@ def main():
         if res["rc"] == 0:
             print(f"Sent kill to managed job(s) on {args.host}.", flush=True)
         else:
-            print("Kill error:", res.get("err") or res.get("out"), flush=True)
+            detail = res.get("err") or res.get("out") or "(no stderr/stdout returned)"
+            print(f"Kill error (rc={res['rc']}): {detail}", flush=True)
     elif args.cmd == "where":
         where_is_next_submit()
     else:

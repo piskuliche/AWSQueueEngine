@@ -123,6 +123,9 @@ def normalize_job_item(item):
             "resume_host": None,
         }
 
+    submit_failures = item.get("submit_failures", 0)
+    if not isinstance(submit_failures, int) or submit_failures < 0:
+        submit_failures = 0
     return {
         "cmd": item.get("cmd"),
         "payload": item.get("payload"),
@@ -132,6 +135,7 @@ def normalize_job_item(item):
         "payload_remote_path": _normalize_payload_remote_path(item.get("payload_remote_path")),
         "resume_first": _normalize_resume_first(item.get("resume_first", DEFAULT_RESUME_FIRST)),
         "resume_host": _normalize_resume_host(item.get("resume_host")),
+        "submit_failures": submit_failures,
     }
 
 
