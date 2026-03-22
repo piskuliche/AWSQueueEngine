@@ -44,6 +44,30 @@ class CliSubmitTests(unittest.TestCase):
         cmd = [sys.executable, "-m", "awsqueueengine.cli", *args]
         return subprocess.run(cmd, cwd=str(REPO_ROOT), env=env, capture_output=True, text=True)
 
+    def _run_cli_with_path_prefix(self, path_prefix, *args):
+        env = os.environ.copy()
+        for key in (
+            "AWSQUEUEENGINE_MAILTRAP_TOKEN",
+            "AWSQUEUEENGINE_MAILTRAP_SENDER_EMAIL",
+            "AWSQUEUEENGINE_MAILTRAP_SENDER_NAME",
+            "AWSQUEUEENGINE_MAILTRAP_CATEGORY",
+            "AWSQUEUEENGINE_ALERT_TO",
+            "AWSQUEUEENGINE_ALERT_DAILY_EMAIL_LIMIT",
+            "AWSQUEUEENGINE_JOB_FAIL_ALERT_COOLDOWN_SECONDS",
+        ):
+            env.pop(key, None)
+        env["HOME"] = str(self.home_path)
+        src_path = str(REPO_ROOT / "src")
+        existing_pythonpath = env.get("PYTHONPATH")
+        if existing_pythonpath:
+            env["PYTHONPATH"] = src_path + os.pathsep + existing_pythonpath
+        else:
+            env["PYTHONPATH"] = src_path
+        env["PATH"] = str(path_prefix) + os.pathsep + env["PATH"]
+
+        cmd = [sys.executable, "-m", "awsqueueengine.cli", *args]
+        return subprocess.run(cmd, cwd=str(REPO_ROOT), env=env, capture_output=True, text=True)
+
     def _read_queue(self):
         queue_file = self.home_path / QUEUE_FILE_NAME
         if not queue_file.exists():
@@ -53,6 +77,14 @@ class CliSubmitTests(unittest.TestCase):
     def _write_running(self, payload):
         running_file = self.home_path / RUNNING_FILE_NAME
         running_file.write_text(json.dumps(payload, indent=2))
+
+    def _make_fake_ssh(self, exit_code=0):
+        bin_dir = self.home_path / "bin"
+        bin_dir.mkdir(exist_ok=True)
+        ssh_path = bin_dir / "ssh"
+        ssh_path.write_text(f"#!/bin/sh\nexit {exit_code}\n")
+        ssh_path.chmod(0o755)
+        return bin_dir
 
     def _write_hosts_file(self, content):
         hosts_file = self.home_path / "hosts.txt"
@@ -138,6 +170,70 @@ class CliSubmitTests(unittest.TestCase):
         self.assertEqual(res.returncode, 0)
         items = self._read_queue()
         self.assertTrue(items[0]["preempt"])
+
+    def test_requeue_running_requeues_even_when_kill_fails(self):
+        fake_ssh_dir = self._make_fake_ssh(exit_code=1)
+        self._write_running(
+            {
+                "eci5": {
+                    "cmd": "bash run.sh",
+                    "payload": "/tmp/local",
+                    "payload_remote_path": "/remote/payload",
+                    "priority": 7,
+                    "hosts": ["eci1", "eci5"],
+                    "preempt": False,
+                    "started_at": 1,
+                }
+            }
+        )
+
+        res = self._run_cli_with_path_prefix(fake_ssh_dir, "requeue-running", "--hosts", "eci5")
+
+        self.assertEqual(res.returncode, 0)
+        self.assertIn("Requeued running job for eci5 at priority 100", res.stdout)
+        self.assertIn("Kill error on eci5", res.stdout)
+        items = self._read_queue()
+        self.assertEqual(len(items), 1)
+        self.assertEqual(items[0]["cmd"], "bash run.sh")
+        self.assertEqual(items[0]["priority"], 100)
+        self.assertEqual(items[0]["hosts"], ["eci5"])
+        self.assertEqual(items[0]["payload_remote_path"], "/remote/payload")
+        self.assertTrue(items[0]["resume_first"])
+        self.assertEqual(items[0]["resume_host"], "eci5")
+
+    def test_requeue_running_all_targets_all_tracked_running_hosts(self):
+        fake_ssh_dir = self._make_fake_ssh(exit_code=0)
+        self._write_running(
+            {
+                "eci5": {
+                    "cmd": "echo one",
+                    "payload_remote_path": "/remote/one",
+                    "priority": 1,
+                    "hosts": ["eci5"],
+                    "started_at": 1,
+                },
+                "eci7": {
+                    "cmd": "echo two",
+                    "payload_remote_path": "/remote/two",
+                    "priority": 2,
+                    "hosts": ["eci7"],
+                    "started_at": 2,
+                },
+            }
+        )
+
+        res = self._run_cli_with_path_prefix(fake_ssh_dir, "requeue-running", "--all")
+
+        self.assertEqual(res.returncode, 0)
+        self.assertIn("Requeued running job for eci5 at priority 100", res.stdout)
+        self.assertIn("Requeued running job for eci7 at priority 100", res.stdout)
+        items = self._read_queue()
+        self.assertEqual(len(items), 2)
+        by_host = {tuple(item["hosts"]): item for item in items}
+        self.assertEqual(by_host[("eci5",)]["payload_remote_path"], "/remote/one")
+        self.assertEqual(by_host[("eci7",)]["payload_remote_path"], "/remote/two")
+        self.assertEqual(by_host[("eci5",)]["priority"], 100)
+        self.assertEqual(by_host[("eci7",)]["priority"], 100)
 
     def test_qdel_removes_single_job_by_index(self):
         self._run_cli("submit", "echo", "one")

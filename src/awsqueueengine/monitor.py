@@ -14,7 +14,7 @@ from .config import (
     MONITOR_STATE_FILE,
 )
 from .host_status import status_all
-from .queue import dequeue_for_host, load_queue, save_queue, normalize_job_item
+from .queue import build_resume_item, dequeue_for_host, load_queue, save_queue, normalize_job_item
 from .job_control import submit_to_host, write_run_info, kill_managed_on_host
 from .running_state import load_running_jobs, save_running_jobs
 from .completion_state import append_completed_records
@@ -560,10 +560,7 @@ def monitor_loop(hosts, poll_interval=CHECK_INTERVAL, stop_event: threading.Even
                     running_jobs.pop(victim_host, None)
                     save_running_jobs(running_jobs)
                     if interrupted_job:
-                        resume_item = normalize_job_item(interrupted_job)
-                        resume_item["hosts"] = [victim_host]
-                        resume_item["resume_first"] = True
-                        resume_item["resume_host"] = victim_host
+                        resume_item = build_resume_item(interrupted_job, victim_host)
                         _requeue_front(resume_item)
                         print(
                             f"  Requeued interrupted job for {victim_host}: "

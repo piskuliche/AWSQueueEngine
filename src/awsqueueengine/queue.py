@@ -139,6 +139,17 @@ def normalize_job_item(item):
     }
 
 
+def build_resume_item(job_item, host, priority=None):
+    item = normalize_job_item(job_item)
+    item["hosts"] = [host]
+    item["resume_first"] = True
+    item["resume_host"] = host
+    item["submit_failures"] = 0
+    if priority is not None:
+        item["priority"] = _normalize_priority(priority)
+    return item
+
+
 def enqueue_item(item):
     q = load_queue()
     q.append(normalize_job_item(item))

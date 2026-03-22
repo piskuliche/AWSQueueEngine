@@ -23,6 +23,8 @@ awsqueueengine submit --priority 25 "python train.py --epochs 10"
 awsqueueengine submit --hosts eci17 --priority 100 "bash pinned-job.sh"
 awsqueueengine submit --hosts eci16 --hosts eci18 "bash host-allowlist-job.sh"
 awsqueueengine submit --preempt --priority 999 "bash urgent-job.sh"
+awsqueueengine requeue-running --hosts eci17
+awsqueueengine requeue-running --all
 awsqueueengine list
 awsqueueengine qstat
 awsqueueengine qdel 2
@@ -45,6 +47,8 @@ Use `start-monitor --hosts-file <path>` to source monitor hosts from a file and 
 changes automatically while the monitor is running.
 Use `--preempt` to allow a queued job to interrupt a currently running managed job
 when no free eligible host is available. The interrupted job is requeued and restarted.
+Use `requeue-running` to kill monitor-tracked running job(s) and requeue them back to
+their original host with priority `100`, preserving the remote payload path.
 `qstat` lists monitor-tracked running jobs and elapsed runtime (`HH:MM:SS`).
 When jobs finish, the monitor appends completion records to
 `~/.aws_slurm_like_completed.json` with the `qstat` fields plus final duration

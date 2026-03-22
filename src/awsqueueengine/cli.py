@@ -6,7 +6,7 @@ import time
 from datetime import datetime
 from pathlib import Path
 from .config import HOSTS
-from .queue import enqueue_item, load_queue, normalize_job_item, save_queue
+from .queue import build_resume_item, enqueue_item, load_queue, normalize_job_item, save_queue
 from .host_status import status_all
 from .monitor import acquire_monitor_lock, load_hosts_from_file, release_monitor_lock, monitor_loop
 from .job_control import submit_to_host, tail_remote_log, kill_managed_on_host
@@ -69,6 +69,15 @@ def _resolve_hosts_for_cli(hosts_file):
         sys.exit(1)
 
 
+def _parse_cli_host_values(host_values):
+    hosts = []
+    for host_value in host_values or []:
+        if not host_value:
+            continue
+        hosts.extend(h.strip() for h in host_value.split(",") if h and h.strip())
+    return list(dict.fromkeys(hosts))
+
+
 def main():
 
     # Set unbuffered output for stdout and stderr
@@ -108,6 +117,29 @@ def main():
     p_submit.add_argument("--high-priority", action="store_true", help="Mark this job as high priority in the queue")
     p_submit.add_argument("--preempt", action="store_true", help="Allow this job to preempt a running managed job if needed")
     p_submit.add_argument("command", nargs=argparse.REMAINDER, help="Command to run remotely (quoted)")
+    p_requeue = sub.add_parser(
+        "requeue-running",
+        help="Kill running managed job(s) and requeue them to the same host at priority 100",
+    )
+    p_requeue.add_argument(
+        "--hosts-file",
+        help="Optional file with valid hostnames (comma or whitespace separated).",
+        default=None,
+    )
+    p_requeue_target = p_requeue.add_mutually_exclusive_group(required=True)
+    p_requeue_target.add_argument(
+        "--hosts",
+        action="append",
+        metavar="HOST",
+        help="Requeue running job(s) only on listed host(s). Repeat flag or use comma-separated values.",
+        default=None,
+    )
+    p_requeue_target.add_argument(
+        "--all",
+        "-all",
+        action="store_true",
+        help="Requeue running job(s) on all hosts with tracked running jobs.",
+    )
 
     sub.add_parser("list", help="Show queued jobs")
     p_qdel = sub.add_parser("qdel", help="Delete queued job(s) by list index")
@@ -185,11 +217,7 @@ def main():
         valid_hosts = set(_resolve_hosts_for_cli(args.hosts_file))
         hosts = None
         if args.hosts:
-            requested_hosts = []
-            for host_value in args.hosts:
-                if not host_value:
-                    continue
-                requested_hosts.extend(h.strip() for h in host_value.split(",") if h and h.strip())
+            requested_hosts = _parse_cli_host_values(args.hosts)
             invalid_hosts = sorted({h for h in requested_hosts if h not in valid_hosts})
             if invalid_hosts:
                 valid_hosts_text = ", ".join(sorted(valid_hosts)) if valid_hosts else "(none)"
@@ -217,6 +245,51 @@ def main():
         }
         enqueue_item(item)
         print("Enqueued:", item, flush=True)
+    elif args.cmd == "requeue-running":
+        running_jobs = load_running_jobs()
+        valid_hosts = set(_resolve_hosts_for_cli(args.hosts_file))
+        if args.all:
+            target_hosts = [host for host in sorted(running_jobs) if host in valid_hosts]
+        else:
+            requested_hosts = _parse_cli_host_values(args.hosts)
+            invalid_hosts = sorted({h for h in requested_hosts if h not in valid_hosts})
+            if invalid_hosts:
+                valid_hosts_text = ", ".join(sorted(valid_hosts)) if valid_hosts else "(none)"
+                print(f"Invalid host(s): {', '.join(invalid_hosts)}. Valid hosts: {valid_hosts_text}", flush=True)
+                sys.exit(1)
+            target_hosts = requested_hosts
+
+        if not target_hosts:
+            print("No target hosts found for requeue-running.", flush=True)
+            return
+
+        requeued_count = 0
+        for host in target_hosts:
+            running_item = running_jobs.get(host)
+            if not running_item:
+                print(f"No tracked running job on {host}; skipping requeue.", flush=True)
+                continue
+
+            resume_item = build_resume_item(running_item, host, priority=100)
+            q = load_queue()
+            q.insert(0, resume_item)
+            save_queue(q)
+            requeued_count += 1
+            print(
+                f"Requeued running job for {host} at priority 100: "
+                f"{str(resume_item.get('cmd') or '')[:120]}",
+                flush=True,
+            )
+
+            res = kill_managed_on_host(host)
+            if res["rc"] == 0:
+                print(f"Sent kill to managed job(s) on {host}.", flush=True)
+            else:
+                detail = res.get("err") or res.get("out") or "(no stderr/stdout returned)"
+                print(f"Kill error on {host} (rc={res['rc']}): {detail}", flush=True)
+
+        if requeued_count == 0:
+            print("No running jobs were requeued.", flush=True)
     elif args.cmd == "list":
         q = load_queue()
         if not q:

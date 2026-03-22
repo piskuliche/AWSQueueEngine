@@ -147,6 +147,31 @@ class QueuePriorityTests(unittest.TestCase):
             },
         )
 
+    def test_build_resume_item_pins_host_and_can_override_priority(self):
+        resume_item = queue.build_resume_item(
+            {
+                "cmd": "python train.py",
+                "payload": "/tmp/local",
+                "payload_remote_path": "/remote/payload",
+                "priority": 3,
+                "hosts": ["eci2", "eci3"],
+                "preempt": True,
+                "submit_failures": 2,
+            },
+            "eci7",
+            priority=100,
+        )
+
+        self.assertEqual(resume_item["cmd"], "python train.py")
+        self.assertEqual(resume_item["payload"], "/tmp/local")
+        self.assertEqual(resume_item["payload_remote_path"], "/remote/payload")
+        self.assertEqual(resume_item["priority"], 100)
+        self.assertEqual(resume_item["hosts"], ["eci7"])
+        self.assertTrue(resume_item["preempt"])
+        self.assertTrue(resume_item["resume_first"])
+        self.assertEqual(resume_item["resume_host"], "eci7")
+        self.assertEqual(resume_item["submit_failures"], 0)
+
 
 if __name__ == "__main__":
     unittest.main()
