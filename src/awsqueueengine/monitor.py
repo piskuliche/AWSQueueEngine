@@ -162,7 +162,9 @@ def _build_completed_job_record(host, running_item, finished_at):
     else:
         duration_seconds = 0
         started_at = None
-    payload_text = item.get("payload_remote_path") or item.get("payload") or "-"
+    payload_local_path = item.get("payload")
+    payload_remote_path = item.get("payload_remote_path")
+    payload_text = payload_remote_path or payload_local_path or "-"
     return {
         "host": host,
         "dur": _format_duration_seconds(duration_seconds),
@@ -171,6 +173,8 @@ def _build_completed_job_record(host, running_item, finished_at):
         "preempt": item.get("preempt", False),
         "hosts": item.get("hosts"),
         "payload": payload_text,
+        "payload_local_path": payload_local_path,
+        "payload_remote_path": payload_remote_path,
         "cmd": str(item.get("cmd") or ""),
         "started_at": started_at,
         "finished_at": float(finished_at),

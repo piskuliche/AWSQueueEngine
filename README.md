@@ -97,7 +97,19 @@ Email protection:
 ## Project Structure
 
 - `src/` - Main package modules
+- `docs/` - Sphinx documentation source and build helpers
 - `setup.py` - Packaging script
 - `README.md` - This file
+
+## Documentation
+
+Build the Sphinx HTML documentation from the project root with:
+
+```bash
+pip install -r docs/requirements.txt
+sphinx-build -b html docs docs/_build/html
+```
+
+The generated site will be written to `docs/_build/html/index.html`.
 # AWSQueueEngine
 A simple queue engine for AWS Resources.

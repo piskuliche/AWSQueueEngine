@@ -1,0 +1,7 @@
+usage: awsqueueengine start-monitor [-h] [--hosts-file HOSTS_FILE]
+
+options:
+  -h, --help            show this help message and exit
+  --hosts-file HOSTS_FILE
+                        Optional file with hostnames to monitor (reloaded
+                        while running).

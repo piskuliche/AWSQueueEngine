@@ -84,6 +84,8 @@ class MonitorRunningStatePruneTests(unittest.TestCase):
         self.assertEqual(record["host"], "eci8")
         self.assertEqual(record["dur"], "00:00:30")
         self.assertEqual(record["payload"], "/remote/payload")
+        self.assertEqual(record["payload_local_path"], "/tmp/local")
+        self.assertEqual(record["payload_remote_path"], "/remote/payload")
         self.assertEqual(record["priority"], 7)
         self.assertTrue(record["preempt"])
         self.assertEqual(record["hosts"], ["eci8"])
