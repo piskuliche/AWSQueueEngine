@@ -40,6 +40,8 @@ class RunningStateTests(unittest.TestCase):
         self.assertEqual(loaded["eci1"]["priority"], 100)
         self.assertTrue(loaded["eci1"]["preempt"])
         self.assertIn("payload_remote_path", loaded["eci1"])
+        self.assertIn("payload_s3_uri", loaded["eci1"])
+        self.assertIn("payload_size_bytes", loaded["eci1"])
         self.assertIn("resume_first", loaded["eci1"])
         self.assertIn("resume_host", loaded["eci1"])
         self.assertIn("started_at", loaded["eci1"])

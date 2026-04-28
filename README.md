@@ -4,10 +4,62 @@ A Slurm-like SSH job manager for AWS GPU hosts, with payload staging and monitor
 
 ## Installation
 
-From the project root:
+Install the package anywhere you will run the CLI:
 
 ```bash
 pip install .
+```
+
+### Local submitter setup
+
+Install AWSQueueEngine locally and make sure you can SSH to the queue host:
+
+```bash
+pip install .
+ssh queue-manager 'awsqueueengine status-monitor'
+```
+
+For S3-backed payload submit, configure AWS credentials locally with write access
+to the payload bucket, then set:
+
+```bash
+export AWSQUEUEENGINE_S3_BUCKET="my-queue-payload-bucket"
+export AWSQUEUEENGINE_S3_PREFIX="awsqueueengine/payloads"  # optional
+```
+
+Submit through the remote queue host:
+
+```bash
+awsqueueengine submit --queue-host queue-manager --payload ./my_payload "cd $PAYLOAD_DIR && bash run.sh"
+```
+
+### Remote queue host setup
+
+Install AWSQueueEngine on the queue host. This machine owns the queue files and
+should be the only place running the monitor:
+
+```bash
+pip install .
+export AWSQUEUEENGINE_HOSTS_FILE="/home/ubuntu/queue_hosts.txt"
+nohup awsqueueengine start-monitor >> ~/aws_queue_manager.log 2>&1 &
+```
+
+The hosts file should list every worker the monitor can use. You can also define
+named host sets on the queue host:
+
+```bash
+export AWSQUEUEENGINE_HOST_SET_FAST_GPUS="eci1 eci2 eci3"
+export AWSQUEUEENGINE_HOSTS_FILE_LARGE_MEM="/home/ubuntu/large_mem_hosts.txt"
+```
+
+### Worker host setup
+
+Each worker host must be reachable by SSH from the queue host and have scratch
+space under the configured scratch roots. For S3-backed payloads, workers also
+need the AWS CLI and IAM permissions to read the payload bucket/prefix:
+
+```bash
+aws s3 ls s3://my-queue-payload-bucket/awsqueueengine/payloads/
 ```
 
 ## Usage
@@ -18,6 +70,8 @@ After installation, use the CLI:
 awsqueueengine status
 awsqueueengine status --hosts-file ~/queue_hosts.txt
 awsqueueengine submit --payload ./my_payload "cd $PAYLOAD_DIR && bash run.sh"
+awsqueueengine submit --queue-host queue-manager --payload ./my_payload "cd $PAYLOAD_DIR && bash run.sh"
+awsqueueengine submit --queue-host queue-manager --host-set fast-gpus "python train.py"
 awsqueueengine submit --hosts-file ~/queue_hosts.txt --hosts eci17 "bash pinned-job.sh"
 awsqueueengine submit --priority 25 "python train.py --epochs 10"
 awsqueueengine submit --hosts eci17 --priority 100 "bash pinned-job.sh"
@@ -53,6 +107,48 @@ their original host with priority `100`, preserving the remote payload path.
 When jobs finish, the monitor appends completion records to
 `~/.aws_slurm_like_completed.json` with the `qstat` fields plus final duration
 and timestamps (`started_at`, `finished_at`).
+
+## Remote submit with S3 payloads
+
+`submit --queue-host <host>` lets you run the CLI locally while enqueueing on a
+remote queue-manager machine. With `--payload`, the local CLI archives the payload
+directory, uploads it to S3, then SSHes to the queue host to enqueue a job that
+contains the S3 payload URI. The monitor on the queue host later asks the selected
+worker to download and extract that archive before running the job.
+
+Local submitter requirements:
+
+```bash
+export AWSQUEUEENGINE_S3_BUCKET="my-queue-payload-bucket"
+export AWSQUEUEENGINE_S3_PREFIX="awsqueueengine/payloads"  # optional
+awsqueueengine submit --queue-host queue-manager --payload ./my_payload "cd $PAYLOAD_DIR && bash run.sh"
+```
+
+The local submitter needs AWS credentials with write access to the bucket/prefix.
+Worker hosts need the AWS CLI and read access to the same bucket/prefix. The queue
+host should run the monitor and own the queue files. If you use host restrictions
+with remote submit, validation happens on the queue host; set
+`AWSQUEUEENGINE_HOSTS_FILE=/path/to/queue_hosts.txt` there if you do not want to
+use the built-in host list. Configure an S3 lifecycle rule for the payload prefix
+to clean up uploaded archives.
+
+### Named host sets
+
+Named host sets let users submit to predetermined host pools while still using the
+same queue and the same monitor. Define them on the queue host, then submit with
+`--host-set <name>`:
+
+```bash
+export AWSQUEUEENGINE_HOST_SET_FAST_GPUS="eci1 eci2 eci3"
+export AWSQUEUEENGINE_HOSTS_FILE_LARGE_MEM="/home/ubuntu/large_mem_hosts.txt"
+
+awsqueueengine submit --queue-host queue-manager --host-set fast-gpus "python train.py"
+```
+
+Host set names are normalized for environment variables: `fast-gpus` maps to
+`AWSQUEUEENGINE_HOST_SET_FAST_GPUS` or `AWSQUEUEENGINE_HOSTS_FILE_FAST_GPUS`.
+The monitor should still run once over the full host pool; a named host set is
+stored as that job's host allowlist.
 
 
 Suggested to run with:

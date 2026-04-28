@@ -3,17 +3,34 @@ import uuid
 import shlex
 import time
 from pathlib import Path
+from urllib.parse import urlparse
 from .config import REMOTE_LOG_DIR, SSH_TIMEOUT, HOSTS
 from .ssh_utils import ssh_run
 from .staging import sizeof_local_path_bytes, choose_scratch_on_host, rsync_to_host_with_fallback
 from .queue import load_queue, save_queue, dequeue
 
-def submit_to_host(host, job_command, payload_local_path=None, payload_remote_path=None):
+
+def _payload_name_from_s3_uri(payload_s3_uri):
+    parsed = urlparse(payload_s3_uri)
+    name = Path(parsed.path).name
+    if name.endswith(".tar.gz"):
+        name = name[:-7]
+    return name or "payload"
+
+
+def submit_to_host(
+    host,
+    job_command,
+    payload_local_path=None,
+    payload_remote_path=None,
+    payload_s3_uri=None,
+    payload_size_bytes=None,
+):
     tag = uuid.uuid4().hex[:12]
     remote_payload_dir = None
     if payload_remote_path:
         remote_payload_dir = str(payload_remote_path).strip() or None
-    if not payload_local_path and not remote_payload_dir:
+    if not payload_local_path and not remote_payload_dir and not payload_s3_uri:
         remote_cmd = (
             rf"mkdir -p {REMOTE_LOG_DIR} && cd $HOME || true && "
             rf"nohup env MANAGER_TAG={tag} bash -lc {shlex.quote(job_command)} > {REMOTE_LOG_DIR}/{tag}.log 2>&1 < /dev/null & echo $! > {REMOTE_LOG_DIR}/{tag}.pid"
@@ -25,6 +42,36 @@ def submit_to_host(host, job_command, payload_local_path=None, payload_remote_pa
             return {"host": host, "tag": tag, "pid": pid, "ok": True}
         else:
             return {"host": host, "tag": tag, "pid": None, "ok": False, "err": err or out}
+    if payload_s3_uri and not remote_payload_dir:
+        try:
+            needed_bytes = int(payload_size_bytes or 0)
+        except (TypeError, ValueError):
+            needed_bytes = 0
+        remote_root, info = choose_scratch_on_host(host, needed_bytes)
+        if not remote_root:
+            return {"host": host, "ok": False, "err": f"no suitable scratch: {info}"}
+        jobname = _payload_name_from_s3_uri(payload_s3_uri)
+        remote_payload_dir = f"{remote_root}/{jobname}-{tag}"
+        archive_path = f"{remote_payload_dir}/payload.tar.gz"
+        download_cmd = "\n".join(
+            [
+                "set -euo pipefail",
+                f"mkdir -p {shlex.quote(remote_payload_dir)}",
+                f"chmod 700 {shlex.quote(remote_payload_dir)}",
+                f"aws s3 cp {shlex.quote(payload_s3_uri)} {shlex.quote(archive_path)}",
+                f"tar xzf {shlex.quote(archive_path)} -C {shlex.quote(remote_payload_dir)}",
+                f"rm -f {shlex.quote(archive_path)}",
+            ]
+        )
+        rc, out, err = ssh_run(host, f"bash -lc {shlex.quote(download_cmd)}", timeout=900)
+        if rc != 0:
+            return {
+                "host": host,
+                "tag": tag,
+                "ok": False,
+                "err": f"s3 payload download failed: {err or out}",
+                "payload": remote_payload_dir,
+            }
     if not remote_payload_dir:
         local_path = Path(payload_local_path).expanduser()
         if not local_path.exists():
@@ -37,7 +84,7 @@ def submit_to_host(host, job_command, payload_local_path=None, payload_remote_pa
         remote_payload_dir = f"{remote_root}/{jobname}-{tag}"
         rc, out, err = ssh_run(host, f"mkdir -p {remote_root} && chmod 700 {remote_root}", timeout=30)
         if rc != 0:
-            return {"host": host, "ok": False, "err": f"mkdir failed: {err or out}"}
+            return {"host": host, "ok": False, "err": f"mkdir failed: {err or out}", "payload": remote_payload_dir}
         ok, method, sout, serr = rsync_to_host_with_fallback(str(local_path), host, remote_payload_dir)
         if not ok:
             return {"host": host, "ok": False, "err": f"rsync failed: {serr or sout}"}

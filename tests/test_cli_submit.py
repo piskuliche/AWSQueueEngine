@@ -6,6 +6,7 @@ import sys
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
@@ -21,7 +22,7 @@ class CliSubmitTests(unittest.TestCase):
     def tearDown(self):
         self.tmpdir.cleanup()
 
-    def _run_cli(self, *args):
+    def _run_cli(self, *args, env_extra=None):
         env = os.environ.copy()
         for key in (
             "AWSQUEUEENGINE_MAILTRAP_TOKEN",
@@ -31,8 +32,15 @@ class CliSubmitTests(unittest.TestCase):
             "AWSQUEUEENGINE_ALERT_TO",
             "AWSQUEUEENGINE_ALERT_DAILY_EMAIL_LIMIT",
             "AWSQUEUEENGINE_JOB_FAIL_ALERT_COOLDOWN_SECONDS",
+            "AWSQUEUEENGINE_HOSTS_FILE",
+            "AWSQUEUEENGINE_S3_BUCKET",
+            "AWSQUEUEENGINE_S3_PREFIX",
+            "AWSQUEUEENGINE_HOST_SET_FAST",
+            "AWSQUEUEENGINE_HOSTS_FILE_FAST",
         ):
             env.pop(key, None)
+        if env_extra:
+            env.update(env_extra)
         env["HOME"] = str(self.home_path)
         src_path = str(REPO_ROOT / "src")
         existing_pythonpath = env.get("PYTHONPATH")
@@ -54,6 +62,11 @@ class CliSubmitTests(unittest.TestCase):
             "AWSQUEUEENGINE_ALERT_TO",
             "AWSQUEUEENGINE_ALERT_DAILY_EMAIL_LIMIT",
             "AWSQUEUEENGINE_JOB_FAIL_ALERT_COOLDOWN_SECONDS",
+            "AWSQUEUEENGINE_HOSTS_FILE",
+            "AWSQUEUEENGINE_S3_BUCKET",
+            "AWSQUEUEENGINE_S3_PREFIX",
+            "AWSQUEUEENGINE_HOST_SET_FAST",
+            "AWSQUEUEENGINE_HOSTS_FILE_FAST",
         ):
             env.pop(key, None)
         env["HOME"] = str(self.home_path)
@@ -83,6 +96,19 @@ class CliSubmitTests(unittest.TestCase):
         bin_dir.mkdir(exist_ok=True)
         ssh_path = bin_dir / "ssh"
         ssh_path.write_text(f"#!/bin/sh\nexit {exit_code}\n")
+        ssh_path.chmod(0o755)
+        return bin_dir
+
+    def _make_fake_ssh_capture(self, capture_path, exit_code=0, stdout="remote ok"):
+        bin_dir = self.home_path / "bin"
+        bin_dir.mkdir(exist_ok=True)
+        ssh_path = bin_dir / "ssh"
+        ssh_path.write_text(
+            "#!/bin/sh\n"
+            f"printf '%s\\n' \"$@\" > {str(capture_path)!r}\n"
+            f"printf '%s\\n' {stdout!r}\n"
+            f"exit {exit_code}\n"
+        )
         ssh_path.chmod(0o755)
         return bin_dir
 
@@ -170,6 +196,168 @@ class CliSubmitTests(unittest.TestCase):
         self.assertEqual(res.returncode, 0)
         items = self._read_queue()
         self.assertTrue(items[0]["preempt"])
+
+    def test_submit_host_set_expands_to_hosts_allowlist(self):
+        res = self._run_cli(
+            "submit",
+            "--host-set",
+            "fast",
+            "echo",
+            "hello",
+            env_extra={"AWSQUEUEENGINE_HOST_SET_FAST": "eci16, eci18"},
+        )
+
+        self.assertEqual(res.returncode, 0)
+        items = self._read_queue()
+        self.assertEqual(items[0]["hosts"], ["eci16", "eci18"])
+
+    def test_submit_rejects_unknown_host_set(self):
+        res = self._run_cli("submit", "--host-set", "fast", "echo", "hello")
+
+        self.assertEqual(res.returncode, 1)
+        self.assertIn("Unknown host set 'fast'", res.stdout)
+        self.assertEqual(self._read_queue(), [])
+
+    def test_submit_internal_s3_payload_fields_persist(self):
+        res = self._run_cli(
+            "submit",
+            "--payload-s3-uri",
+            "s3://bucket/payload.tar.gz",
+            "--payload-size-bytes",
+            "55",
+            "echo",
+            "hello",
+        )
+
+        self.assertEqual(res.returncode, 0)
+        items = self._read_queue()
+        self.assertEqual(len(items), 1)
+        self.assertIsNone(items[0]["payload"])
+        self.assertEqual(items[0]["payload_s3_uri"], "s3://bucket/payload.tar.gz")
+        self.assertEqual(items[0]["payload_size_bytes"], 55)
+
+    def test_remote_submit_without_payload_forwards_over_ssh_and_does_not_write_local_queue(self):
+        capture_path = self.home_path / "ssh_args.txt"
+        fake_ssh_dir = self._make_fake_ssh_capture(capture_path)
+
+        res = self._run_cli_with_path_prefix(
+            fake_ssh_dir,
+            "submit",
+            "--queue-host",
+            "queuebox",
+            "--hosts",
+            "eci17",
+            "--priority",
+            "5",
+            "echo",
+            "hello world",
+        )
+
+        self.assertEqual(res.returncode, 0)
+        self.assertIn("remote ok", res.stdout)
+        self.assertEqual(self._read_queue(), [])
+        captured = capture_path.read_text().splitlines()
+        self.assertEqual(captured[0], "queuebox")
+        self.assertIn("awsqueueengine submit", captured[1])
+        self.assertIn("--hosts eci17", captured[1])
+        self.assertIn("--priority 5", captured[1])
+        self.assertIn("'echo hello world'", captured[1])
+
+    def test_remote_submit_rejects_host_set_with_hosts(self):
+        res = self._run_cli(
+            "submit",
+            "--queue-host",
+            "queuebox",
+            "--host-set",
+            "fast",
+            "--hosts",
+            "eci17",
+            "echo",
+            "hello",
+        )
+
+        self.assertEqual(res.returncode, 1)
+        self.assertIn("--host-set and --hosts cannot be used together", res.stdout)
+        self.assertEqual(self._read_queue(), [])
+
+    def test_remote_submit_with_host_set_forwards_name_to_queue_host(self):
+        capture_path = self.home_path / "ssh_args.txt"
+        fake_ssh_dir = self._make_fake_ssh_capture(capture_path)
+
+        res = self._run_cli_with_path_prefix(
+            fake_ssh_dir,
+            "submit",
+            "--queue-host",
+            "queuebox",
+            "--host-set",
+            "fast",
+            "--priority",
+            "5",
+            "echo",
+            "hello world",
+        )
+
+        self.assertEqual(res.returncode, 0)
+        self.assertIn("remote ok", res.stdout)
+        self.assertEqual(self._read_queue(), [])
+        captured = capture_path.read_text().splitlines()
+        self.assertEqual(captured[0], "queuebox")
+        self.assertIn("awsqueueengine submit", captured[1])
+        self.assertIn("--host-set fast", captured[1])
+        self.assertIn("--priority 5", captured[1])
+        self.assertIn("'echo hello world'", captured[1])
+
+    def test_remote_submit_rejects_local_hosts_file(self):
+        hosts_file = self._write_hosts_file("eci1\n")
+
+        res = self._run_cli("submit", "--queue-host", "queuebox", "--hosts-file", str(hosts_file), "echo", "hello")
+
+        self.assertEqual(res.returncode, 1)
+        self.assertIn("--hosts-file is not supported with --queue-host", res.stdout)
+        self.assertEqual(self._read_queue(), [])
+
+    def test_remote_submit_with_payload_uploads_s3_and_forwards_internal_fields(self):
+        payload_dir = self.home_path / "payload"
+        payload_dir.mkdir()
+        (payload_dir / "run.sh").write_text("echo hi\n")
+
+        class Args:
+            queue_host = "queuebox"
+            hosts_file = None
+            payload = str(payload_dir)
+            host_set = None
+            hosts = ["eci17"]
+            priority = None
+            high_priority = True
+            preempt = True
+
+        captured = {}
+
+        def fake_run_remote_submit(queue_host, remote_argv):
+            captured["queue_host"] = queue_host
+            captured["remote_argv"] = remote_argv
+
+            class Result:
+                returncode = 0
+                stdout = "remote enqueued\n"
+                stderr = ""
+
+            return Result()
+
+        from awsqueueengine import cli
+
+        with patch("awsqueueengine.cli._upload_payload_archive_to_s3", return_value="s3://bucket/key.tar.gz") as upload, patch(
+            "awsqueueengine.cli._run_remote_submit", side_effect=fake_run_remote_submit
+        ):
+            cli._handle_remote_submit(Args(), "bash run.sh")
+
+        upload.assert_called_once()
+        self.assertEqual(captured["queue_host"], "queuebox")
+        self.assertIn("--payload-s3-uri", captured["remote_argv"])
+        self.assertIn("s3://bucket/key.tar.gz", captured["remote_argv"])
+        self.assertIn("--payload-size-bytes", captured["remote_argv"])
+        self.assertIn("--high-priority", captured["remote_argv"])
+        self.assertIn("--preempt", captured["remote_argv"])
 
     def test_requeue_running_requeues_even_when_kill_fails(self):
         fake_ssh_dir = self._make_fake_ssh(exit_code=1)

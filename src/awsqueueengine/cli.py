@@ -1,16 +1,21 @@
 # CLI interface for AWSQueueManager
 import sys, os
 import argparse
+import shlex
 import signal, threading
+import subprocess
+import tarfile
+import tempfile
 import time
+import uuid
 from datetime import datetime
 from pathlib import Path
-from .config import HOSTS
+from .config import HOSTS, HOSTS_FILE, S3_BUCKET, S3_PREFIX, SSH_BIN
 from .queue import build_resume_item, enqueue_item, load_queue, normalize_job_item, save_queue
 from .host_status import status_all
 from .monitor import acquire_monitor_lock, load_hosts_from_file, release_monitor_lock, monitor_loop
 from .job_control import submit_to_host, tail_remote_log, kill_managed_on_host
-from .staging import where_is_next_submit
+from .staging import sizeof_local_path_bytes, where_is_next_submit
 from .running_state import load_running_jobs
 from .notifications import parse_email_recipients, send_email
 
@@ -60,12 +65,13 @@ def _format_elapsed(started_at):
 
 
 def _resolve_hosts_for_cli(hosts_file):
-    if not hosts_file:
+    selected_hosts_file = hosts_file or HOSTS_FILE
+    if not selected_hosts_file:
         return list(HOSTS)
     try:
-        return load_hosts_from_file(hosts_file)
+        return load_hosts_from_file(selected_hosts_file)
     except OSError as exc:
-        print(f"Failed to read hosts file {hosts_file}: {exc}", flush=True)
+        print(f"Failed to read hosts file {selected_hosts_file}: {exc}", flush=True)
         sys.exit(1)
 
 
@@ -76,6 +82,164 @@ def _parse_cli_host_values(host_values):
             continue
         hosts.extend(h.strip() for h in host_value.split(",") if h and h.strip())
     return list(dict.fromkeys(hosts))
+
+
+def _normalize_host_set_name(host_set):
+    if not isinstance(host_set, str):
+        return None
+    clean = host_set.strip()
+    if not clean:
+        return None
+    return "".join(ch if ch.isalnum() or ch in "._-" else "_" for ch in clean).strip("._-") or None
+
+
+def _host_set_env_suffix(host_set):
+    return _normalize_host_set_name(host_set).upper().replace("-", "_").replace(".", "_")
+
+
+def _parse_hosts_text(hosts_text):
+    return list(dict.fromkeys(h.strip() for h in hosts_text.replace(",", " ").split() if h.strip()))
+
+
+def _resolve_host_set(host_set):
+    clean_name = _normalize_host_set_name(host_set)
+    if not clean_name:
+        print("Host set name cannot be empty.", flush=True)
+        sys.exit(1)
+    suffix = _host_set_env_suffix(clean_name)
+    inline_hosts = os.getenv(f"AWSQUEUEENGINE_HOST_SET_{suffix}", "").strip()
+    hosts_file = os.getenv(f"AWSQUEUEENGINE_HOSTS_FILE_{suffix}", "").strip()
+    if inline_hosts:
+        hosts = _parse_hosts_text(inline_hosts)
+    elif hosts_file:
+        try:
+            hosts = load_hosts_from_file(hosts_file)
+        except OSError as exc:
+            print(f"Failed to read host set {clean_name} file {hosts_file}: {exc}", flush=True)
+            sys.exit(1)
+    else:
+        print(
+            f"Unknown host set {clean_name!r}. Configure AWSQUEUEENGINE_HOST_SET_{suffix} "
+            f"or AWSQUEUEENGINE_HOSTS_FILE_{suffix} on the queue host.",
+            flush=True,
+        )
+        sys.exit(1)
+    if not hosts:
+        print(f"Host set {clean_name!r} is empty.", flush=True)
+        sys.exit(1)
+    return hosts
+
+
+def _payload_display_text(item):
+    return item.get("payload_remote_path") or item.get("payload_s3_uri") or item.get("payload") or "-"
+
+
+def _archive_payload_to_temp(payload_path):
+    payload = Path(payload_path).expanduser()
+    if not payload.exists():
+        raise FileNotFoundError(f"local payload not found: {payload}")
+    tmp = tempfile.NamedTemporaryFile(prefix="awsqueueengine-payload-", suffix=".tar.gz", delete=False)
+    tmp_path = Path(tmp.name)
+    tmp.close()
+    try:
+        with tarfile.open(tmp_path, "w:gz") as tar:
+            if payload.is_dir():
+                children = list(payload.iterdir())
+                if children:
+                    for child in children:
+                        tar.add(child, arcname=child.name)
+                else:
+                    tar.add(payload, arcname=".")
+            else:
+                tar.add(payload, arcname=payload.name)
+    except Exception:
+        try:
+            tmp_path.unlink()
+        except OSError:
+            pass
+        raise
+    return tmp_path
+
+
+def _upload_payload_archive_to_s3(archive_path, payload_name):
+    if not S3_BUCKET:
+        raise RuntimeError("AWSQUEUEENGINE_S3_BUCKET is required for remote submit with --payload.")
+    try:
+        import boto3
+    except ImportError as exc:
+        raise RuntimeError("boto3 is required for remote submit with --payload.") from exc
+
+    timestamp = datetime.utcnow().strftime("%Y%m%dT%H%M%SZ")
+    clean_name = "".join(ch if ch.isalnum() or ch in "._-" else "_" for ch in payload_name) or "payload"
+    key_parts = [part for part in (S3_PREFIX, f"{timestamp}-{uuid.uuid4().hex}", f"{clean_name}.tar.gz") if part]
+    key = "/".join(key_parts)
+    boto3.client("s3").upload_file(str(archive_path), S3_BUCKET, key)
+    return f"s3://{S3_BUCKET}/{key}"
+
+
+def _build_remote_submit_argv(args, command, payload_s3_uri=None, payload_size_bytes=None):
+    argv = ["awsqueueengine", "submit"]
+    if args.host_set:
+        argv.extend(["--host-set", args.host_set])
+    if args.hosts:
+        for host_value in args.hosts:
+            argv.extend(["--hosts", host_value])
+    if args.priority is not None:
+        argv.extend(["--priority", str(args.priority)])
+    elif args.high_priority:
+        argv.append("--high-priority")
+    if args.preempt:
+        argv.append("--preempt")
+    if payload_s3_uri:
+        argv.extend(["--payload-s3-uri", payload_s3_uri])
+    if payload_size_bytes is not None:
+        argv.extend(["--payload-size-bytes", str(payload_size_bytes)])
+    argv.append(command)
+    return argv
+
+
+def _run_remote_submit(queue_host, remote_argv):
+    remote_cmd = shlex.join(remote_argv)
+    return subprocess.run([SSH_BIN, queue_host, remote_cmd], capture_output=True, text=True, check=False)
+
+
+def _handle_remote_submit(args, command):
+    if args.hosts_file:
+        print("--hosts-file is not supported with --queue-host; host validation happens on the queue host.", flush=True)
+        sys.exit(1)
+
+    payload_s3_uri = None
+    payload_size_bytes = None
+    archive_path = None
+    if args.payload:
+        payload_path = Path(args.payload).expanduser()
+        payload_size_bytes = sizeof_local_path_bytes(payload_path)
+        try:
+            archive_path = _archive_payload_to_temp(payload_path)
+            payload_s3_uri = _upload_payload_archive_to_s3(archive_path, payload_path.name)
+        except Exception as exc:
+            print(f"Remote submit payload upload failed: {exc}", flush=True)
+            sys.exit(1)
+        finally:
+            if archive_path:
+                try:
+                    archive_path.unlink()
+                except OSError:
+                    pass
+
+    remote_argv = _build_remote_submit_argv(
+        args,
+        command,
+        payload_s3_uri=payload_s3_uri,
+        payload_size_bytes=payload_size_bytes,
+    )
+    result = _run_remote_submit(args.queue_host, remote_argv)
+    if result.stdout:
+        print(result.stdout, end="" if result.stdout.endswith("\n") else "\n", flush=True)
+    if result.stderr:
+        print(result.stderr, end="" if result.stderr.endswith("\n") else "\n", file=sys.stderr, flush=True)
+    if result.returncode != 0:
+        sys.exit(result.returncode)
 
 
 def main():
@@ -98,6 +262,11 @@ def main():
         help="Optional file with hostnames (comma or whitespace separated).",
         default=None,
     )
+    p_status.add_argument(
+        "--host-set",
+        help="Show status only for a named host set configured on this machine",
+        default=None,
+    )
     sub.add_parser("qstat", help="Show running jobs tracked by monitor")
     p_submit = sub.add_parser("submit", help="Enqueue a job (command string)")
     p_submit.add_argument(
@@ -113,9 +282,17 @@ def main():
         help="Only run this job on listed host(s). Repeat flag or use comma-separated values.",
         default=None,
     )
+    p_submit.add_argument(
+        "--host-set",
+        help="Only run this job on a named host set configured on the queue host",
+        default=None,
+    )
     p_submit.add_argument("--priority", type=int, default=None, help="Integer priority (higher runs first)")
     p_submit.add_argument("--high-priority", action="store_true", help="Mark this job as high priority in the queue")
     p_submit.add_argument("--preempt", action="store_true", help="Allow this job to preempt a running managed job if needed")
+    p_submit.add_argument("--queue-host", help="Forward this submit to a remote queue host over SSH", default=None)
+    p_submit.add_argument("--payload-s3-uri", default=None, help=argparse.SUPPRESS)
+    p_submit.add_argument("--payload-size-bytes", type=int, default=None, help=argparse.SUPPRESS)
     p_submit.add_argument("command", nargs=argparse.REMAINDER, help="Command to run remotely (quoted)")
     p_requeue = sub.add_parser(
         "requeue-running",
@@ -183,7 +360,10 @@ def main():
         sys.exit(1)
 
     if args.cmd == "status":
-        monitor_hosts = _resolve_hosts_for_cli(args.hosts_file)
+        if args.host_set and args.hosts_file:
+            print("--host-set and --hosts-file cannot be used together.", flush=True)
+            sys.exit(1)
+        monitor_hosts = _resolve_host_set(args.host_set) if args.host_set else _resolve_hosts_for_cli(args.hosts_file)
         rows = status_all(monitor_hosts)
         print(f"{'HOST':8}  {'REACH':8}  {'PID':8}  {'TAG':12}  INFO", flush=True)
         for r in rows:
@@ -201,7 +381,7 @@ def main():
             for host in sorted(running_jobs):
                 item = running_jobs[host]
                 hosts_text = ",".join(item["hosts"]) if item["hosts"] else "any"
-                payload_text = item.get("payload_remote_path") or item.get("payload") or "-"
+                payload_text = _payload_display_text(item)
                 cmd_text = str(item.get("cmd") or "")
                 dur_text = _format_elapsed(item.get("started_at"))
                 print(
@@ -214,8 +394,27 @@ def main():
             print("No command provided.", flush=True)
             sys.exit(1)
 
-        valid_hosts = set(_resolve_hosts_for_cli(args.hosts_file))
-        hosts = None
+        if args.queue_host and args.payload_s3_uri:
+            print("--payload-s3-uri is only for queue-host-side submit handling.", flush=True)
+            sys.exit(1)
+        if args.host_set and args.hosts:
+            print("--host-set and --hosts cannot be used together.", flush=True)
+            sys.exit(1)
+
+        command = " ".join(args.command).strip()
+        if not command:
+            print("No command provided.", flush=True)
+            sys.exit(1)
+        if args.queue_host:
+            _handle_remote_submit(args, command)
+            return
+
+        if args.host_set and args.hosts_file:
+            print("--host-set and --hosts-file cannot be used together.", flush=True)
+            sys.exit(1)
+
+        hosts = _resolve_host_set(args.host_set) if args.host_set else None
+        valid_hosts = set(hosts or _resolve_hosts_for_cli(args.hosts_file))
         if args.hosts:
             requested_hosts = _parse_cli_host_values(args.hosts)
             invalid_hosts = sorted({h for h in requested_hosts if h not in valid_hosts})
@@ -232,16 +431,14 @@ def main():
         else:
             priority = 0
 
-        command = " ".join(args.command).strip()
-        if not command:
-            print("No command provided.", flush=True)
-            sys.exit(1)
         item = {
             "cmd": command,
-            "payload": args.payload,
+            "payload": None if args.payload_s3_uri else args.payload,
             "priority": priority,
             "hosts": hosts,
             "preempt": args.preempt,
+            "payload_s3_uri": args.payload_s3_uri,
+            "payload_size_bytes": args.payload_size_bytes,
         }
         enqueue_item(item)
         print("Enqueued:", item, flush=True)
@@ -298,9 +495,10 @@ def main():
             for i, raw_item in enumerate(q, 1):
                 item = normalize_job_item(raw_item)
                 hosts_text = ",".join(item["hosts"]) if item["hosts"] else "any"
+                payload_text = _payload_display_text(item)
                 print(
                     f"{i:3d}. [priority={item['priority']}] [hosts={hosts_text}] [preempt={item['preempt']}] "
-                    f"cmd={item['cmd']!r} payload={item['payload']!r}",
+                    f"cmd={item['cmd']!r} payload={payload_text!r}",
                     flush=True
                 )
     elif args.cmd == "qdel":
@@ -329,9 +527,10 @@ def main():
         print(f"Removed {len(removed_jobs)} job(s).", flush=True)
         for idx, item in sorted(removed_jobs, key=lambda pair: pair[0]):
             hosts_text = ",".join(item["hosts"]) if item["hosts"] else "any"
+            payload_text = _payload_display_text(item)
             print(
                 f"  {idx:3d}. [priority={item['priority']}] [hosts={hosts_text}] [preempt={item['preempt']}] "
-                f"cmd={item['cmd']!r} payload={item['payload']!r}",
+                f"cmd={item['cmd']!r} payload={payload_text!r}",
                 flush=True,
             )
     elif args.cmd == "clear":

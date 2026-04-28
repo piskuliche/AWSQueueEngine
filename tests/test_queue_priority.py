@@ -99,6 +99,8 @@ class QueuePriorityTests(unittest.TestCase):
         self.assertIsNone(first["hosts"])
         self.assertFalse(first["preempt"])
         self.assertIsNone(first["payload_remote_path"])
+        self.assertIsNone(first["payload_s3_uri"])
+        self.assertIsNone(first["payload_size_bytes"])
         self.assertFalse(first["resume_first"])
         self.assertIsNone(first["resume_host"])
 
@@ -107,6 +109,8 @@ class QueuePriorityTests(unittest.TestCase):
         self.assertIsNone(second["hosts"])
         self.assertFalse(second["preempt"])
         self.assertIsNone(second["payload_remote_path"])
+        self.assertIsNone(second["payload_s3_uri"])
+        self.assertIsNone(second["payload_size_bytes"])
         self.assertFalse(second["resume_first"])
         self.assertIsNone(second["resume_host"])
 
@@ -115,6 +119,8 @@ class QueuePriorityTests(unittest.TestCase):
         self.assertIsNone(third["hosts"])
         self.assertFalse(third["preempt"])
         self.assertIsNone(third["payload_remote_path"])
+        self.assertIsNone(third["payload_s3_uri"])
+        self.assertIsNone(third["payload_size_bytes"])
         self.assertFalse(third["resume_first"])
         self.assertIsNone(third["resume_host"])
 
@@ -124,6 +130,8 @@ class QueuePriorityTests(unittest.TestCase):
         self.assertIsNone(fourth["hosts"])
         self.assertFalse(fourth["preempt"])
         self.assertIsNone(fourth["payload_remote_path"])
+        self.assertIsNone(fourth["payload_s3_uri"])
+        self.assertIsNone(fourth["payload_size_bytes"])
         self.assertFalse(fourth["resume_first"])
         self.assertIsNone(fourth["resume_host"])
 
@@ -141,6 +149,8 @@ class QueuePriorityTests(unittest.TestCase):
                 "hosts": ["eci17"],
                 "preempt": False,
                 "payload_remote_path": None,
+                "payload_s3_uri": None,
+                "payload_size_bytes": None,
                 "resume_first": False,
                 "resume_host": None,
                 "submit_failures": 0,
@@ -153,6 +163,8 @@ class QueuePriorityTests(unittest.TestCase):
                 "cmd": "python train.py",
                 "payload": "/tmp/local",
                 "payload_remote_path": "/remote/payload",
+                "payload_s3_uri": "s3://bucket/key.tar.gz",
+                "payload_size_bytes": 123,
                 "priority": 3,
                 "hosts": ["eci2", "eci3"],
                 "preempt": True,
@@ -165,6 +177,8 @@ class QueuePriorityTests(unittest.TestCase):
         self.assertEqual(resume_item["cmd"], "python train.py")
         self.assertEqual(resume_item["payload"], "/tmp/local")
         self.assertEqual(resume_item["payload_remote_path"], "/remote/payload")
+        self.assertEqual(resume_item["payload_s3_uri"], "s3://bucket/key.tar.gz")
+        self.assertEqual(resume_item["payload_size_bytes"], 123)
         self.assertEqual(resume_item["priority"], 100)
         self.assertEqual(resume_item["hosts"], ["eci7"])
         self.assertTrue(resume_item["preempt"])

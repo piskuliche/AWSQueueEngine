@@ -164,7 +164,9 @@ def _build_completed_job_record(host, running_item, finished_at):
         started_at = None
     payload_local_path = item.get("payload")
     payload_remote_path = item.get("payload_remote_path")
-    payload_text = payload_remote_path or payload_local_path or "-"
+    payload_s3_uri = item.get("payload_s3_uri")
+    payload_size_bytes = item.get("payload_size_bytes")
+    payload_text = payload_remote_path or payload_s3_uri or payload_local_path or "-"
     return {
         "host": host,
         "dur": _format_duration_seconds(duration_seconds),
@@ -175,6 +177,8 @@ def _build_completed_job_record(host, running_item, finished_at):
         "payload": payload_text,
         "payload_local_path": payload_local_path,
         "payload_remote_path": payload_remote_path,
+        "payload_s3_uri": payload_s3_uri,
+        "payload_size_bytes": payload_size_bytes,
         "cmd": str(item.get("cmd") or ""),
         "started_at": started_at,
         "finished_at": float(finished_at),
@@ -318,6 +322,8 @@ def _launch_job_on_host(host, job_item, running_jobs):
     job_cmd = str(item.get("cmd") or "")
     payload = item.get("payload")
     payload_remote_path = item.get("payload_remote_path")
+    payload_s3_uri = item.get("payload_s3_uri")
+    payload_size_bytes = item.get("payload_size_bytes")
     target_hosts = item.get("hosts")
     priority = item.get("priority", 0)
     preempt = item.get("preempt", False)
@@ -332,9 +338,13 @@ def _launch_job_on_host(host, job_item, running_jobs):
         job_cmd,
         payload_local_path=payload,
         payload_remote_path=payload_remote_path,
+        payload_s3_uri=payload_s3_uri,
+        payload_size_bytes=payload_size_bytes,
     )
     if not res.get("ok"):
         print(f"  Failed to start on {host}: {res.get('err')}", flush=True)
+        if res.get("payload") and not item.get("payload_remote_path"):
+            item["payload_remote_path"] = res.get("payload")
         if res.get("err") != "pidfile present but process not running":
             failures = item.get("submit_failures", 0) + 1
             item["submit_failures"] = failures
@@ -360,6 +370,8 @@ def _launch_job_on_host(host, job_item, running_jobs):
         "hosts": target_hosts,
         "preempt": False,
         "payload_remote_path": remote_payload,
+        "payload_s3_uri": payload_s3_uri,
+        "payload_size_bytes": payload_size_bytes,
         "started_at": time.time(),
     }
     save_running_jobs(running_jobs)
@@ -486,6 +498,7 @@ def monitor_loop(hosts, poll_interval=CHECK_INTERVAL, stop_event: threading.Even
                             f"Hosts restriction: {item.get('hosts') or 'any'}\n"
                             f"Payload dir: {item.get('payload') or '-'}\n"
                             f"Payload remote path: {item.get('payload_remote_path') or '-'}\n"
+                            f"Payload S3 URI: {item.get('payload_s3_uri') or '-'}\n"
                             f"Generated at: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n"
                         )
                         _send_alert_email_with_limits(

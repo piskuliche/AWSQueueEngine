@@ -77,6 +77,8 @@ class MonitorRunningStatePruneTests(unittest.TestCase):
                 "hosts": ["eci8"],
                 "payload": "/tmp/local",
                 "payload_remote_path": "/remote/payload",
+                "payload_s3_uri": "s3://bucket/payload.tar.gz",
+                "payload_size_bytes": 123,
                 "started_at": 10.0,
             },
             finished_at=40.0,
@@ -86,6 +88,8 @@ class MonitorRunningStatePruneTests(unittest.TestCase):
         self.assertEqual(record["payload"], "/remote/payload")
         self.assertEqual(record["payload_local_path"], "/tmp/local")
         self.assertEqual(record["payload_remote_path"], "/remote/payload")
+        self.assertEqual(record["payload_s3_uri"], "s3://bucket/payload.tar.gz")
+        self.assertEqual(record["payload_size_bytes"], 123)
         self.assertEqual(record["priority"], 7)
         self.assertTrue(record["preempt"])
         self.assertEqual(record["hosts"], ["eci8"])

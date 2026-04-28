@@ -81,6 +81,27 @@ def _normalize_payload_remote_path(value):
     return clean_value or None
 
 
+def _normalize_payload_s3_uri(value):
+    if not isinstance(value, str):
+        return None
+    clean_value = value.strip()
+    return clean_value or None
+
+
+def _normalize_payload_size_bytes(value):
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, int):
+        return value if value >= 0 else None
+    if isinstance(value, str):
+        try:
+            parsed = int(value.strip())
+        except ValueError:
+            return None
+        return parsed if parsed >= 0 else None
+    return None
+
+
 def _normalize_resume_first(value):
     if isinstance(value, bool):
         return value
@@ -107,6 +128,8 @@ def normalize_job_item(item):
             "hosts": None,
             "preempt": DEFAULT_PREEMPT,
             "payload_remote_path": None,
+            "payload_s3_uri": None,
+            "payload_size_bytes": None,
             "resume_first": DEFAULT_RESUME_FIRST,
             "resume_host": None,
         }
@@ -119,6 +142,8 @@ def normalize_job_item(item):
             "hosts": None,
             "preempt": DEFAULT_PREEMPT,
             "payload_remote_path": None,
+            "payload_s3_uri": None,
+            "payload_size_bytes": None,
             "resume_first": DEFAULT_RESUME_FIRST,
             "resume_host": None,
         }
@@ -133,6 +158,8 @@ def normalize_job_item(item):
         "hosts": _normalize_hosts(item.get("hosts")),
         "preempt": _normalize_preempt(item.get("preempt", DEFAULT_PREEMPT)),
         "payload_remote_path": _normalize_payload_remote_path(item.get("payload_remote_path")),
+        "payload_s3_uri": _normalize_payload_s3_uri(item.get("payload_s3_uri")),
+        "payload_size_bytes": _normalize_payload_size_bytes(item.get("payload_size_bytes")),
         "resume_first": _normalize_resume_first(item.get("resume_first", DEFAULT_RESUME_FIRST)),
         "resume_host": _normalize_resume_host(item.get("resume_host")),
         "submit_failures": submit_failures,
