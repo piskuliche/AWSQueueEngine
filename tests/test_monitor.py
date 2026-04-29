@@ -10,6 +10,7 @@ from awsqueueengine.monitor import (
     _initial_alert_runtime_state,
     _prune_running_jobs_for_status,
     _reset_queue_alert_state,
+    _select_preempt_target,
     _should_send_alert,
     _should_send_daily_summary,
     _should_send_empty_queue_alert,
@@ -94,6 +95,37 @@ class MonitorRunningStatePruneTests(unittest.TestCase):
         self.assertTrue(record["preempt"])
         self.assertEqual(record["hosts"], ["eci8"])
         self.assertEqual(record["cmd"], "python run.py")
+
+
+class MonitorPreemptTargetTests(unittest.TestCase):
+    def test_preempt_requires_strictly_higher_priority_than_running_job(self):
+        queue_items = [
+            {"cmd": "same-priority", "priority": 100, "preempt": True, "hosts": ["eci1"]},
+            {"cmd": "lower-priority", "priority": 50, "preempt": True, "hosts": ["eci2"]},
+        ]
+        running_jobs = {
+            "eci1": {"cmd": "active-a", "priority": 100},
+            "eci2": {"cmd": "active-b", "priority": 100},
+        }
+
+        target = _select_preempt_target(queue_items, ["eci1", "eci2"], running_jobs)
+
+        self.assertEqual(target, (None, None, None))
+
+    def test_preempt_selects_lower_priority_victim_on_eligible_host(self):
+        queue_items = [
+            {"cmd": "urgent", "priority": 100, "preempt": True, "hosts": ["eci1", "eci2"]},
+        ]
+        running_jobs = {
+            "eci1": {"cmd": "production-a", "priority": -100},
+            "eci2": {"cmd": "production-b", "priority": 0},
+        }
+
+        queue_idx, item, victim = _select_preempt_target(queue_items, ["eci1", "eci2"], running_jobs)
+
+        self.assertEqual(queue_idx, 0)
+        self.assertEqual(item["cmd"], "urgent")
+        self.assertEqual(victim, "eci1")
 
 
 class MonitorAlertDecisionTests(unittest.TestCase):

@@ -394,10 +394,13 @@ def _select_preempt_target(queue_items, running_hosts, running_jobs):
         item = normalize_job_item(raw_item)
         if not item.get("preempt"):
             continue
+        priority = item.get("priority", 0)
         eligible_hosts = [
             host
             for host in running_hosts
-            if host in running_jobs and _host_is_eligible(item, host)
+            if host in running_jobs
+            and _host_is_eligible(item, host)
+            and priority > running_jobs.get(host, {}).get("priority", 0)
         ]
         if not eligible_hosts:
             continue
@@ -407,7 +410,6 @@ def _select_preempt_target(queue_items, running_hosts, running_jobs):
             return (active.get("priority", 0), host)
 
         victim = sorted(eligible_hosts, key=victim_sort_key)[0]
-        priority = item.get("priority", 0)
         if (
             best_queue_idx is None
             or priority > best_priority
