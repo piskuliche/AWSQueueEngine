@@ -257,6 +257,47 @@ class CliSubmitTests(unittest.TestCase):
         self.assertEqual(items[0]["payload_s3_uri"], "s3://bucket/payload.tar.gz")
         self.assertEqual(items[0]["payload_size_bytes"], 55)
 
+    def test_submit_rejects_missing_payload_path(self):
+        missing = self.home_path / "does_not_exist"
+
+        res = self._run_cli("submit", "--payload", str(missing), "echo", "hello")
+
+        self.assertEqual(res.returncode, 1)
+        self.assertIn(f"Payload not found on local filesystem: {missing}", res.stdout)
+        self.assertEqual(self._read_queue(), [])
+
+    def test_submit_accepts_existing_payload_path(self):
+        payload_dir = self.home_path / "payload"
+        payload_dir.mkdir()
+        (payload_dir / "run.sh").write_text("echo hi\n")
+
+        res = self._run_cli("submit", "--payload", str(payload_dir), "echo", "hello")
+
+        self.assertEqual(res.returncode, 0)
+        items = self._read_queue()
+        self.assertEqual(len(items), 1)
+        self.assertEqual(items[0]["payload"], str(payload_dir))
+
+    def test_remote_submit_rejects_missing_payload_path_before_ssh(self):
+        capture_path = self.home_path / "ssh_args.txt"
+        fake_ssh_dir = self._make_fake_ssh_capture(capture_path)
+        missing = self.home_path / "does_not_exist"
+
+        res = self._run_cli_with_path_prefix(
+            fake_ssh_dir,
+            "submit",
+            "--queue-host",
+            "queuebox",
+            "--payload",
+            str(missing),
+            "echo",
+            "hello",
+        )
+
+        self.assertEqual(res.returncode, 1)
+        self.assertIn(f"Payload not found on local filesystem: {missing}", res.stdout)
+        self.assertFalse(capture_path.exists())
+
     def test_remote_submit_without_payload_forwards_over_ssh_and_does_not_write_local_queue(self):
         capture_path = self.home_path / "ssh_args.txt"
         fake_ssh_dir = self._make_fake_ssh_capture(capture_path)

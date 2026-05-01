@@ -432,6 +432,13 @@ def main():
         if not command:
             print("No command provided.", flush=True)
             sys.exit(1)
+
+        if args.payload:
+            payload_path = Path(args.payload).expanduser()
+            if not payload_path.exists():
+                print(f"Payload not found on local filesystem: {payload_path}", flush=True)
+                sys.exit(1)
+
         if args.queue_host:
             _handle_remote_submit(args, command)
             return
