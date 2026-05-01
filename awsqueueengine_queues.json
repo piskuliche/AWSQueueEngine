@@ -1,0 +1,6 @@
+{
+  "zeke-queue": ["eci1", "eci2"],
+  "ryan-queue": ["eci3", "eci4"],
+  "pato-queue": ["eci26", "eci27", "eci28", "eci29", "eci30"],
+  "production": ["eci1", "eci2", "eci3", "eci4", "eci5", "eci6", "eci7", "eci8", "eci9", "eci10"]
+}
