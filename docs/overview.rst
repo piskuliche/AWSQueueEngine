@@ -10,7 +10,7 @@ Jobs are queued locally, dispatched remotely, and tracked through a monitor proc
 Core capabilities include:
 
 * Queueing jobs with integer priorities.
-* Restricting jobs to specific hosts.
+* Submitting jobs to user queues whose hosts are resolved at dispatch time.
 * Uploading payload directories to remote scratch space.
 * Monitoring running jobs and recording completion metadata.
 * Preempting lower-priority jobs and requeueing them to their original hosts.
@@ -27,6 +27,9 @@ Main Components
 
 ``awsqueueengine.queue``
   Persistent queue storage and priority-aware dequeue logic.
+
+``awsqueueengine.queue_config``
+  User queue to worker-host configuration loaded from one file or one environment variable.
 
 ``awsqueueengine.job_control``
   Remote submission, job termination, log tailing, and payload environment setup.

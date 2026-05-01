@@ -75,6 +75,7 @@ class SubmitToHostS3PayloadTests(unittest.TestCase):
             )
 
         self.assertTrue(result["ok"])
+        self.assertRegex(result["tag"], r"^\d{8}-\d{6}-[0-9a-f]{6}$")
         self.assertEqual(result["payload"], "/scratch/payload-" + result["tag"])
         download_cmd = commands[0]
         self.assertIn("bash -lc", download_cmd)

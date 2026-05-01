@@ -12,6 +12,7 @@ from datetime import datetime
 from pathlib import Path
 from .config import HOSTS, HOSTS_FILE, S3_BUCKET, S3_PREFIX, SSH_BIN
 from .queue import build_resume_item, enqueue_item, load_queue, normalize_job_item, save_queue
+from .queue_config import DEFAULT_QUEUE, QueueConfigSource, get_configured_queue_source, normalize_queue_name
 from .host_status import status_all
 from .monitor import acquire_monitor_lock, load_hosts_from_file, release_monitor_lock, monitor_loop
 from .job_control import submit_to_host, tail_remote_log, kill_managed_on_host
@@ -72,6 +73,17 @@ def _resolve_hosts_for_cli(hosts_file):
         return load_hosts_from_file(selected_hosts_file)
     except OSError as exc:
         print(f"Failed to read hosts file {selected_hosts_file}: {exc}", flush=True)
+        sys.exit(1)
+
+
+def _resolve_queue_hosts_for_cli(hosts_file=None):
+    try:
+        source_kind, _source_value = get_configured_queue_source()
+        legacy_hosts = HOSTS if source_kind else _resolve_hosts_for_cli(hosts_file)
+        source = QueueConfigSource(legacy_hosts=legacy_hosts, legacy_hosts_file=hosts_file or HOSTS_FILE or None)
+        return source.refresh()
+    except ValueError as exc:
+        print(f"Invalid queue host configuration: {exc}", flush=True)
         sys.exit(1)
 
 
@@ -179,16 +191,17 @@ def _upload_payload_archive_to_s3(archive_path, payload_name):
 
 def _build_remote_submit_argv(args, command, payload_s3_uri=None, payload_size_bytes=None):
     argv = ["awsqueueengine", "submit"]
-    if args.host_set:
-        argv.extend(["--host-set", args.host_set])
-    if args.hosts:
+    queue_name = getattr(args, "queue", None) or getattr(args, "host_set", None)
+    if queue_name:
+        argv.extend(["--queue", queue_name])
+    if getattr(args, "hosts", None):
         for host_value in args.hosts:
             argv.extend(["--hosts", host_value])
     if args.priority is not None:
         argv.extend(["--priority", str(args.priority)])
     elif args.high_priority:
         argv.append("--high-priority")
-    if args.preempt:
+    if getattr(args, "preempt", False):
         argv.append("--preempt")
     if payload_s3_uri:
         argv.extend(["--payload-s3-uri", payload_s3_uri])
@@ -284,9 +297,10 @@ def main():
     )
     p_submit.add_argument(
         "--host-set",
-        help="Only run this job on a named host set configured on the queue host",
+        help="Deprecated alias for --queue.",
         default=None,
     )
+    p_submit.add_argument("--queue", help="Submit to a named user queue configured on the queue host", default=None)
     p_submit.add_argument("--priority", type=int, default=None, help="Integer priority (higher runs first)")
     p_submit.add_argument("--high-priority", action="store_true", help="Mark this job as high priority in the queue")
     p_submit.add_argument("--preempt", action="store_true", help="Allow this job to preempt a running managed job if needed")
@@ -340,7 +354,6 @@ def main():
     p_stop.add_argument("host")
 
     args = parser.parse_args()
-    print("Starting the queue engine", flush=True)
 
     if args.test_email_connection:
         recipients = parse_email_recipients()
@@ -363,7 +376,13 @@ def main():
         if args.host_set and args.hosts_file:
             print("--host-set and --hosts-file cannot be used together.", flush=True)
             sys.exit(1)
-        monitor_hosts = _resolve_host_set(args.host_set) if args.host_set else _resolve_hosts_for_cli(args.hosts_file)
+        if args.host_set:
+            queue_name = normalize_queue_name(args.host_set)
+            queue_host_map = _resolve_queue_hosts_for_cli(args.hosts_file)
+            monitor_hosts = queue_host_map.get(queue_name) or _resolve_host_set(args.host_set)
+        else:
+            queue_host_map = _resolve_queue_hosts_for_cli(args.hosts_file)
+            monitor_hosts = list(dict.fromkeys(host for hosts in queue_host_map.values() for host in hosts))
         rows = status_all(monitor_hosts)
         print(f"{'HOST':8}  {'REACH':8}  {'PID':8}  {'TAG':12}  INFO", flush=True)
         for r in rows:
@@ -377,15 +396,17 @@ def main():
         if not running_jobs:
             print("(no running jobs tracked)", flush=True)
         else:
-            print(f"{'HOST':8}  {'DUR':8}  {'PRI':5}  {'PREEMPT':7}  {'HOSTS':15}  {'PAYLOAD':24}  CMD", flush=True)
+            print(f"{'HOST':8}  {'DUR':8}  {'PRI':5}  {'PREEMPT':7}  {'QUEUE':12}  {'HOSTS':15}  {'PAYLOAD':24}  CMD", flush=True)
             for host in sorted(running_jobs):
-                item = running_jobs[host]
+                raw_item = running_jobs[host]
+                item = normalize_job_item(raw_item)
                 hosts_text = ",".join(item["hosts"]) if item["hosts"] else "any"
                 payload_text = _payload_display_text(item)
                 cmd_text = str(item.get("cmd") or "")
-                dur_text = _format_elapsed(item.get("started_at"))
+                dur_text = _format_elapsed(raw_item.get("started_at") if isinstance(raw_item, dict) else None)
                 print(
-                    f"{host:8}  {dur_text:8}  {item['priority']:5d}  {str(item['preempt']):7}  {hosts_text[:15]:15}  {payload_text:24}  "
+                    f"{host:8}  {dur_text:8}  {item['priority']:5d}  {str(item['preempt']):7}  "
+                    f"{item['queue'][:12]:12}  {hosts_text[:15]:15}  {payload_text:24}  "
                     f"{cmd_text}",
                     flush=True,
                 )
@@ -400,6 +421,12 @@ def main():
         if args.host_set and args.hosts:
             print("--host-set and --hosts cannot be used together.", flush=True)
             sys.exit(1)
+        if args.queue and args.host_set:
+            print("--queue and --host-set cannot be used together.", flush=True)
+            sys.exit(1)
+        if args.queue and args.hosts:
+            print("--queue and --hosts cannot be used together.", flush=True)
+            sys.exit(1)
 
         command = " ".join(args.command).strip()
         if not command:
@@ -412,9 +439,19 @@ def main():
         if args.host_set and args.hosts_file:
             print("--host-set and --hosts-file cannot be used together.", flush=True)
             sys.exit(1)
+        if args.queue and args.hosts_file:
+            print("--queue and --hosts-file cannot be used together; configure queues on the queue host.", flush=True)
+            sys.exit(1)
 
-        hosts = _resolve_host_set(args.host_set) if args.host_set else None
-        valid_hosts = set(hosts or _resolve_hosts_for_cli(args.hosts_file))
+        queue_name = normalize_queue_name(args.queue or args.host_set or DEFAULT_QUEUE)
+        queue_host_map = _resolve_queue_hosts_for_cli(args.hosts_file)
+        if queue_name not in queue_host_map:
+            valid_queues = ", ".join(sorted(queue_host_map)) if queue_host_map else "(none)"
+            print(f"Unknown queue {queue_name!r}. Valid queues: {valid_queues}", flush=True)
+            sys.exit(1)
+
+        hosts = None
+        valid_hosts = set(queue_host_map.get(queue_name, []))
         if args.hosts:
             requested_hosts = _parse_cli_host_values(args.hosts)
             invalid_hosts = sorted({h for h in requested_hosts if h not in valid_hosts})
@@ -435,6 +472,7 @@ def main():
             "cmd": command,
             "payload": None if args.payload_s3_uri else args.payload,
             "priority": priority,
+            "queue": queue_name,
             "hosts": hosts,
             "preempt": args.preempt,
             "payload_s3_uri": args.payload_s3_uri,
@@ -444,7 +482,8 @@ def main():
         print("Enqueued:", item, flush=True)
     elif args.cmd == "requeue-running":
         running_jobs = load_running_jobs()
-        valid_hosts = set(_resolve_hosts_for_cli(args.hosts_file))
+        queue_host_map = _resolve_queue_hosts_for_cli(args.hosts_file)
+        valid_hosts = {host for hosts in queue_host_map.values() for host in hosts}
         if args.all:
             target_hosts = [host for host in sorted(running_jobs) if host in valid_hosts]
         else:
@@ -494,10 +533,10 @@ def main():
         else:
             for i, raw_item in enumerate(q, 1):
                 item = normalize_job_item(raw_item)
-                hosts_text = ",".join(item["hosts"]) if item["hosts"] else "any"
+                hosts_text = ",".join(item["hosts"]) if item["hosts"] else "-"
                 payload_text = _payload_display_text(item)
                 print(
-                    f"{i:3d}. [priority={item['priority']}] [hosts={hosts_text}] [preempt={item['preempt']}] "
+                    f"{i:3d}. [priority={item['priority']}] [queue={item['queue']}] [hosts={hosts_text}] [preempt={item['preempt']}] "
                     f"cmd={item['cmd']!r} payload={payload_text!r}",
                     flush=True
                 )
@@ -526,10 +565,10 @@ def main():
 
         print(f"Removed {len(removed_jobs)} job(s).", flush=True)
         for idx, item in sorted(removed_jobs, key=lambda pair: pair[0]):
-            hosts_text = ",".join(item["hosts"]) if item["hosts"] else "any"
+            hosts_text = ",".join(item["hosts"]) if item["hosts"] else "-"
             payload_text = _payload_display_text(item)
             print(
-                f"  {idx:3d}. [priority={item['priority']}] [hosts={hosts_text}] [preempt={item['preempt']}] "
+                f"  {idx:3d}. [priority={item['priority']}] [queue={item['queue']}] [hosts={hosts_text}] [preempt={item['preempt']}] "
                 f"cmd={item['cmd']!r} payload={payload_text!r}",
                 flush=True,
             )
@@ -556,7 +595,8 @@ def main():
         write_pidfile()
         print(f"Monitor started (pid={os.getpid()})", flush=True)
 
-        monitor_hosts = _resolve_hosts_for_cli(args.hosts_file)
+        source_kind, _source_value = get_configured_queue_source()
+        monitor_hosts = HOSTS if source_kind else _resolve_hosts_for_cli(args.hosts_file)
         try:
             monitor_loop(monitor_hosts, stop_event=stop_event, hosts_file=args.hosts_file)
             print("Monitor exited cleanly.", flush=True)

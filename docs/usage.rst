@@ -49,22 +49,29 @@ the queue user's home directory and should be the only place running the monitor
 .. code-block:: bash
 
    pip install .
-   export AWSQUEUEENGINE_HOSTS_FILE="/home/ubuntu/queue_hosts.txt"
+   cat > /home/ubuntu/awsqueueengine_queues.json <<'JSON'
+   {
+     "default": ["eci1", "eci2", "eci3"],
+     "fast-gpus": ["eci1", "eci2"],
+     "large-mem": ["eci3"]
+   }
+   JSON
+   export AWSQUEUEENGINE_QUEUES_FILE="/home/ubuntu/awsqueueengine_queues.json"
    nohup awsqueueengine start-monitor >> ~/aws_queue_manager.log 2>&1 &
 
-The hosts file should list every worker the monitor is allowed to use. You can
-also define named host sets on the queue host for user-friendly targeting:
+The queue config is the single source of truth for worker assignment. Edit this
+file to move hosts between user queues; the monitor reloads it while running.
+For simple static setups, use one environment variable instead of a file:
 
 .. code-block:: bash
 
-   export AWSQUEUEENGINE_HOST_SET_FAST_GPUS="eci1 eci2 eci3"
-   export AWSQUEUEENGINE_HOSTS_FILE_LARGE_MEM="/home/ubuntu/large_mem_hosts.txt"
+   export AWSQUEUEENGINE_QUEUES="default=eci1,eci2,eci3;fast-gpus=eci1,eci2"
 
 Users can then submit to those pools without knowing the individual host names:
 
 .. code-block:: bash
 
-   awsqueueengine submit --queue-host queue-manager --host-set fast-gpus "python train.py"
+   awsqueueengine submit --queue-host queue-manager --queue fast-gpus "python train.py"
 
 Worker Host Setup
 ~~~~~~~~~~~~~~~~~
@@ -88,9 +95,9 @@ Basic Commands
    awsqueueengine status
    awsqueueengine submit --payload ./my_payload "cd $PAYLOAD_DIR && bash run.sh"
    awsqueueengine submit --queue-host queue-manager --payload ./my_payload "cd $PAYLOAD_DIR && bash run.sh"
-   awsqueueengine submit --queue-host queue-manager --host-set fast-gpus "python train.py"
+   awsqueueengine submit --queue-host queue-manager --queue fast-gpus "python train.py"
+   awsqueueengine submit --queue large-mem "python analyze.py"
    awsqueueengine submit --priority 25 "python train.py --epochs 10"
-   awsqueueengine submit --hosts eci17 --priority 100 "bash pinned-job.sh"
    awsqueueengine submit --preempt --priority 999 "bash urgent-job.sh"
    awsqueueengine requeue-running --hosts eci17
    awsqueueengine requeue-running --all
@@ -100,22 +107,32 @@ Basic Commands
    awsqueueengine start-monitor
    awsqueueengine stop-monitor
 
-Host Targeting
---------------
+Queue Targeting
+---------------
 
-Use ``--hosts`` multiple times or pass a comma-separated list to constrain a job to one or more hosts.
-
-.. code-block:: bash
-
-   awsqueueengine submit --hosts eci16 --hosts eci18 "bash pinned-job.sh"
-   awsqueueengine requeue-running --hosts eci16,eci18
-
-You can also manage the monitored host pool from a file:
+Use ``--queue`` to submit to a user queue. Jobs store the queue name, and the
+monitor assigns the concrete worker host at dispatch time from the current queue
+config.
 
 .. code-block:: bash
 
-   awsqueueengine status --hosts-file ~/queue_hosts.txt
-   awsqueueengine start-monitor --hosts-file ~/queue_hosts.txt
+   awsqueueengine submit --queue fast-gpus "python train.py"
+   awsqueueengine submit --queue large-mem "python analyze.py"
+
+Use one queue source: either ``AWSQUEUEENGINE_QUEUES_FILE`` or
+``AWSQUEUEENGINE_QUEUES``. The file form is preferred when you want to add,
+remove, or move hosts without restarting the monitor.
+
+.. code-block:: bash
+
+   # Preferred: live-reloaded file.
+   export AWSQUEUEENGINE_QUEUES_FILE="/home/ubuntu/awsqueueengine_queues.json"
+
+   # Or, for static process environment config:
+   export AWSQUEUEENGINE_QUEUES="default=eci1,eci2;fast-gpus=eci1"
+
+``--hosts`` and ``--host-set`` remain for legacy scripts, but new remote
+behavior should prefer queues.
 
 Payloads
 --------
@@ -147,22 +164,20 @@ Local submitters need write access to ``AWSQUEUEENGINE_S3_BUCKET``:
    export AWSQUEUEENGINE_S3_PREFIX="awsqueueengine/payloads"  # optional
    awsqueueengine submit --queue-host queue-manager --payload ./my_payload "cd $PAYLOAD_DIR && bash run.sh"
 
-Worker hosts need the AWS CLI and read access to the same bucket/prefix. Host
-validation for remote submit happens on the queue host; set
-``AWSQUEUEENGINE_HOSTS_FILE=/path/to/queue_hosts.txt`` there to use a central
-host list. Configure an S3 lifecycle rule for uploaded payload archives.
+Worker hosts need the AWS CLI and read access to the same bucket/prefix. Queue
+validation for remote submit happens on the queue host against
+``AWSQUEUEENGINE_QUEUES_FILE`` or ``AWSQUEUEENGINE_QUEUES``. Configure an S3
+lifecycle rule for uploaded payload archives.
 
-Named host sets can be configured on the queue host and selected during submit:
+User queues can be configured on the queue host and selected during submit:
 
 .. code-block:: bash
 
-   export AWSQUEUEENGINE_HOST_SET_FAST_GPUS="eci1 eci2 eci3"
-   export AWSQUEUEENGINE_HOSTS_FILE_LARGE_MEM="/home/ubuntu/large_mem_hosts.txt"
-   awsqueueengine submit --queue-host queue-manager --host-set fast-gpus "python train.py"
+   export AWSQUEUEENGINE_QUEUES_FILE="/home/ubuntu/awsqueueengine_queues.json"
+   awsqueueengine submit --queue-host queue-manager --queue fast-gpus "python train.py"
 
-``fast-gpus`` maps to ``AWSQUEUEENGINE_HOST_SET_FAST_GPUS`` or
-``AWSQUEUEENGINE_HOSTS_FILE_FAST_GPUS``. The monitor still runs once over the
-full host pool; the host set is stored as the job's host allowlist.
+``AWSQUEUEENGINE_QUEUES_FILE`` and ``AWSQUEUEENGINE_QUEUES`` are mutually
+exclusive. The monitor reloads the file source each poll.
 
 Preemption and Requeue
 ----------------------

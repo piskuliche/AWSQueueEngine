@@ -2,6 +2,7 @@
 import uuid
 import shlex
 import time
+from datetime import datetime
 from pathlib import Path
 from urllib.parse import urlparse
 from .config import REMOTE_LOG_DIR, SSH_TIMEOUT, HOSTS
@@ -18,6 +19,11 @@ def _payload_name_from_s3_uri(payload_s3_uri):
     return name or "payload"
 
 
+def _new_job_tag():
+    timestamp = datetime.now().strftime("%Y%m%d-%H%M%S")
+    return f"{timestamp}-{uuid.uuid4().hex[:6]}"
+
+
 def submit_to_host(
     host,
     job_command,
@@ -26,7 +32,7 @@ def submit_to_host(
     payload_s3_uri=None,
     payload_size_bytes=None,
 ):
-    tag = uuid.uuid4().hex[:12]
+    tag = _new_job_tag()
     remote_payload_dir = None
     if payload_remote_path:
         remote_payload_dir = str(payload_remote_path).strip() or None

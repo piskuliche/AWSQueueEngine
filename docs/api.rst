@@ -19,6 +19,10 @@ Monitor And Queueing
    :members:
    :undoc-members:
 
+.. automodule:: awsqueueengine.queue_config
+   :members:
+   :undoc-members:
+
 Remote Execution
 ----------------
 

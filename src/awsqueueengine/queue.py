@@ -1,6 +1,7 @@
 # Queue management helpers
 import json
 from .config import QUEUE_FILE
+from .queue_config import DEFAULT_QUEUE, host_is_eligible_for_item, normalize_queue_name
 
 DEFAULT_PRIORITY = 0
 DEFAULT_PREEMPT = False
@@ -125,6 +126,7 @@ def normalize_job_item(item):
             "cmd": item,
             "payload": None,
             "priority": DEFAULT_PRIORITY,
+            "queue": DEFAULT_QUEUE,
             "hosts": None,
             "preempt": DEFAULT_PREEMPT,
             "payload_remote_path": None,
@@ -139,6 +141,7 @@ def normalize_job_item(item):
             "cmd": str(item),
             "payload": None,
             "priority": DEFAULT_PRIORITY,
+            "queue": DEFAULT_QUEUE,
             "hosts": None,
             "preempt": DEFAULT_PREEMPT,
             "payload_remote_path": None,
@@ -155,6 +158,7 @@ def normalize_job_item(item):
         "cmd": item.get("cmd"),
         "payload": item.get("payload"),
         "priority": _normalize_priority(item.get("priority", DEFAULT_PRIORITY)),
+        "queue": normalize_queue_name(item.get("queue", DEFAULT_QUEUE)),
         "hosts": _normalize_hosts(item.get("hosts")),
         "preempt": _normalize_preempt(item.get("preempt", DEFAULT_PREEMPT)),
         "payload_remote_path": _normalize_payload_remote_path(item.get("payload_remote_path")),
@@ -169,6 +173,7 @@ def normalize_job_item(item):
 def build_resume_item(job_item, host, priority=None):
     item = normalize_job_item(job_item)
     item["hosts"] = [host]
+    item["queue"] = normalize_queue_name(item.get("queue", DEFAULT_QUEUE))
     item["resume_first"] = True
     item["resume_host"] = host
     item["submit_failures"] = 0
@@ -183,16 +188,15 @@ def enqueue_item(item):
     save_queue(q)
 
 
-def _is_host_eligible(item, host):
-    hosts = item.get("hosts")
-    return not hosts or host in hosts
+def _is_host_eligible(item, host, queue_host_map=None):
+    return host_is_eligible_for_item(item, host, queue_host_map)
 
 
-def _select_best_index(q, host=None):
+def _select_best_index(q, host=None, queue_host_map=None):
     if host is not None:
         for idx, queued_item in enumerate(q):
             normalized_item = normalize_job_item(queued_item)
-            if not _is_host_eligible(normalized_item, host):
+            if not _is_host_eligible(normalized_item, host, queue_host_map=queue_host_map):
                 continue
             if normalized_item.get("resume_first") and normalized_item.get("resume_host") == host:
                 return idx
@@ -202,7 +206,7 @@ def _select_best_index(q, host=None):
 
     for idx, queued_item in enumerate(q):
         normalized_item = normalize_job_item(queued_item)
-        if host is not None and not _is_host_eligible(normalized_item, host):
+        if host is not None and not _is_host_eligible(normalized_item, host, queue_host_map=queue_host_map):
             continue
 
         priority = normalized_item["priority"]
@@ -228,9 +232,9 @@ def dequeue():
     return _dequeue_index(q, _select_best_index(q))
 
 
-def dequeue_for_host(host):
+def dequeue_for_host(host, queue_host_map=None):
     """Dequeue the highest-priority job eligible for the provided host."""
     q = load_queue()
     if not q:
         return None
-    return _dequeue_index(q, _select_best_index(q, host=host))
+    return _dequeue_index(q, _select_best_index(q, host=host, queue_host_map=queue_host_map))

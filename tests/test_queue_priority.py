@@ -146,6 +146,7 @@ class QueuePriorityTests(unittest.TestCase):
                 "cmd": "job",
                 "payload": None,
                 "priority": 100,
+                "queue": "default",
                 "hosts": ["eci17"],
                 "preempt": False,
                 "payload_remote_path": None,

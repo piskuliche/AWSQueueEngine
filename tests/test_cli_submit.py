@@ -37,6 +37,8 @@ class CliSubmitTests(unittest.TestCase):
             "AWSQUEUEENGINE_S3_PREFIX",
             "AWSQUEUEENGINE_HOST_SET_FAST",
             "AWSQUEUEENGINE_HOSTS_FILE_FAST",
+            "AWSQUEUEENGINE_QUEUES",
+            "AWSQUEUEENGINE_QUEUES_FILE",
         ):
             env.pop(key, None)
         if env_extra:
@@ -67,6 +69,8 @@ class CliSubmitTests(unittest.TestCase):
             "AWSQUEUEENGINE_S3_PREFIX",
             "AWSQUEUEENGINE_HOST_SET_FAST",
             "AWSQUEUEENGINE_HOSTS_FILE_FAST",
+            "AWSQUEUEENGINE_QUEUES",
+            "AWSQUEUEENGINE_QUEUES_FILE",
         ):
             env.pop(key, None)
         env["HOME"] = str(self.home_path)
@@ -124,6 +128,7 @@ class CliSubmitTests(unittest.TestCase):
         items = self._read_queue()
         self.assertEqual(len(items), 1)
         self.assertEqual(items[0]["cmd"], "echo hello")
+        self.assertEqual(items[0]["queue"], "default")
         self.assertEqual(items[0]["hosts"], ["eci16", "eci18"])
         self.assertEqual(items[0]["priority"], 0)
 
@@ -197,7 +202,22 @@ class CliSubmitTests(unittest.TestCase):
         items = self._read_queue()
         self.assertTrue(items[0]["preempt"])
 
-    def test_submit_host_set_expands_to_hosts_allowlist(self):
+    def test_submit_queue_persists_queue_name_without_host_allowlist(self):
+        res = self._run_cli(
+            "submit",
+            "--queue",
+            "fast",
+            "echo",
+            "hello",
+            env_extra={"AWSQUEUEENGINE_QUEUES": "default=eci1;fast=eci16,eci18"},
+        )
+
+        self.assertEqual(res.returncode, 0)
+        items = self._read_queue()
+        self.assertEqual(items[0]["queue"], "fast")
+        self.assertIsNone(items[0]["hosts"])
+
+    def test_submit_host_set_alias_uses_legacy_host_set_as_queue(self):
         res = self._run_cli(
             "submit",
             "--host-set",
@@ -209,13 +229,14 @@ class CliSubmitTests(unittest.TestCase):
 
         self.assertEqual(res.returncode, 0)
         items = self._read_queue()
-        self.assertEqual(items[0]["hosts"], ["eci16", "eci18"])
+        self.assertEqual(items[0]["queue"], "fast")
+        self.assertIsNone(items[0]["hosts"])
 
     def test_submit_rejects_unknown_host_set(self):
         res = self._run_cli("submit", "--host-set", "fast", "echo", "hello")
 
         self.assertEqual(res.returncode, 1)
-        self.assertIn("Unknown host set 'fast'", res.stdout)
+        self.assertIn("Unknown queue 'fast'", res.stdout)
         self.assertEqual(self._read_queue(), [])
 
     def test_submit_internal_s3_payload_fields_persist(self):
@@ -303,7 +324,7 @@ class CliSubmitTests(unittest.TestCase):
         captured = capture_path.read_text().splitlines()
         self.assertEqual(captured[0], "queuebox")
         self.assertIn("awsqueueengine submit", captured[1])
-        self.assertIn("--host-set fast", captured[1])
+        self.assertIn("--queue fast", captured[1])
         self.assertIn("--priority 5", captured[1])
         self.assertIn("'echo hello world'", captured[1])
 
@@ -478,6 +499,7 @@ class CliSubmitTests(unittest.TestCase):
         self.assertEqual(res.returncode, 0)
         self.assertIn("HOST", res.stdout)
         self.assertIn("DUR", res.stdout)
+        self.assertIn("QUEUE", res.stdout)
         self.assertIn("eci5", res.stdout)
         self.assertIn("bash run.sh --epochs 5", res.stdout)
         self.assertRegex(res.stdout, r"\d{2}:\d{2}:\d{2}")
@@ -487,6 +509,13 @@ class CliSubmitTests(unittest.TestCase):
 
         self.assertEqual(res.returncode, 0)
         self.assertIn("Email test skipped", res.stdout)
+
+    def test_list_does_not_print_startup_banner(self):
+        res = self._run_cli("list")
+
+        self.assertEqual(res.returncode, 0)
+        self.assertNotIn("Starting the queue engine", res.stdout)
+        self.assertIn("(queue empty)", res.stdout)
 
 
 if __name__ == "__main__":

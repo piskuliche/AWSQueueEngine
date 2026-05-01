@@ -256,7 +256,7 @@ class MonitorHostSourceTests(unittest.TestCase):
                     ]
                 return [{"host": "eci1", "reachable": True, "pid": None}]
 
-            def fake_dequeue_for_host(host):
+            def fake_dequeue_for_host(host, queue_host_map=None):
                 dequeue_calls.append(host)
                 if host == "eci2" and dequeue_calls.count("eci2") == 1:
                     return {"cmd": "echo run-once", "priority": 0, "hosts": None, "preempt": False}

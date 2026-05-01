@@ -40,16 +40,23 @@ should be the only place running the monitor:
 
 ```bash
 pip install .
-export AWSQUEUEENGINE_HOSTS_FILE="/home/ubuntu/queue_hosts.txt"
+cat > /home/ubuntu/awsqueueengine_queues.json <<'JSON'
+{
+  "default": ["eci1", "eci2", "eci3"],
+  "fast-gpus": ["eci1", "eci2"],
+  "large-mem": ["eci3"]
+}
+JSON
+export AWSQUEUEENGINE_QUEUES_FILE="/home/ubuntu/awsqueueengine_queues.json"
 nohup awsqueueengine start-monitor >> ~/aws_queue_manager.log 2>&1 &
 ```
 
-The hosts file should list every worker the monitor can use. You can also define
-named host sets on the queue host:
+The queue config is the single source of truth for worker assignment. Edit this
+file to move hosts between user queues; the monitor reloads it while running.
+For simple static setups, use one environment variable instead of a file:
 
 ```bash
-export AWSQUEUEENGINE_HOST_SET_FAST_GPUS="eci1 eci2 eci3"
-export AWSQUEUEENGINE_HOSTS_FILE_LARGE_MEM="/home/ubuntu/large_mem_hosts.txt"
+export AWSQUEUEENGINE_QUEUES="default=eci1,eci2,eci3;fast-gpus=eci1,eci2"
 ```
 
 ### Worker host setup
@@ -68,14 +75,11 @@ After installation, use the CLI:
 
 ```bash
 awsqueueengine status
-awsqueueengine status --hosts-file ~/queue_hosts.txt
 awsqueueengine submit --payload ./my_payload "cd $PAYLOAD_DIR && bash run.sh"
 awsqueueengine submit --queue-host queue-manager --payload ./my_payload "cd $PAYLOAD_DIR && bash run.sh"
-awsqueueengine submit --queue-host queue-manager --host-set fast-gpus "python train.py"
-awsqueueengine submit --hosts-file ~/queue_hosts.txt --hosts eci17 "bash pinned-job.sh"
+awsqueueengine submit --queue-host queue-manager --queue fast-gpus "python train.py"
+awsqueueengine submit --queue large-mem "python analyze.py"
 awsqueueengine submit --priority 25 "python train.py --epochs 10"
-awsqueueengine submit --hosts eci17 --priority 100 "bash pinned-job.sh"
-awsqueueengine submit --hosts eci16 --hosts eci18 "bash host-allowlist-job.sh"
 awsqueueengine submit --preempt --priority 999 "bash urgent-job.sh"
 awsqueueengine requeue-running --hosts eci17
 awsqueueengine requeue-running --all
@@ -84,7 +88,6 @@ awsqueueengine qstat
 awsqueueengine qdel 2
 awsqueueengine qdel 1 3
 awsqueueengine start-monitor
-awsqueueengine start-monitor --hosts-file ~/queue_hosts.txt
 awsqueueengine status-monitor
 awsqueueengine stop-monitor
 awsqueueengine tail eci3
@@ -96,9 +99,10 @@ awsqueueengine --test-email-connection
 `submit --high-priority` is still supported for backward compatibility and maps to
 priority `100`. If both `--priority` and `--high-priority` are supplied, `--priority`
 takes precedence.
-Use `--hosts` multiple times (or comma-separated values) to target multiple hosts.
-Use `start-monitor --hosts-file <path>` to source monitor hosts from a file and reload
-changes automatically while the monitor is running.
+Use `--queue <name>` to submit to a user queue. Jobs store the queue name, and
+the monitor assigns the concrete worker host at dispatch time from the current
+queue config. `--hosts` and `--host-set` remain for legacy scripts, but new
+remote behavior should prefer queues.
 Use `--preempt` to allow a queued job to interrupt a currently running managed job
 when no free eligible host is available. The interrupted job is requeued and restarted.
 Use `requeue-running` to kill monitor-tracked running job(s) and requeue them back to
@@ -126,29 +130,25 @@ awsqueueengine submit --queue-host queue-manager --payload ./my_payload "cd $PAY
 
 The local submitter needs AWS credentials with write access to the bucket/prefix.
 Worker hosts need the AWS CLI and read access to the same bucket/prefix. The queue
-host should run the monitor and own the queue files. If you use host restrictions
-with remote submit, validation happens on the queue host; set
-`AWSQUEUEENGINE_HOSTS_FILE=/path/to/queue_hosts.txt` there if you do not want to
-use the built-in host list. Configure an S3 lifecycle rule for the payload prefix
-to clean up uploaded archives.
+host should run the monitor and own the queue files. Queue validation happens on
+the queue host against `AWSQUEUEENGINE_QUEUES_FILE` or `AWSQUEUEENGINE_QUEUES`.
+Configure an S3 lifecycle rule for the payload prefix to clean up uploaded archives.
 
-### Named host sets
+### User queues
 
-Named host sets let users submit to predetermined host pools while still using the
-same queue and the same monitor. Define them on the queue host, then submit with
-`--host-set <name>`:
+User queues let users submit to predetermined host pools while still using the
+same job queue and monitor. Define them on the queue host, then submit with
+`--queue <name>`:
 
 ```bash
-export AWSQUEUEENGINE_HOST_SET_FAST_GPUS="eci1 eci2 eci3"
-export AWSQUEUEENGINE_HOSTS_FILE_LARGE_MEM="/home/ubuntu/large_mem_hosts.txt"
+export AWSQUEUEENGINE_QUEUES_FILE="/home/ubuntu/awsqueueengine_queues.json"
 
-awsqueueengine submit --queue-host queue-manager --host-set fast-gpus "python train.py"
+awsqueueengine submit --queue-host queue-manager --queue fast-gpus "python train.py"
 ```
 
-Host set names are normalized for environment variables: `fast-gpus` maps to
-`AWSQUEUEENGINE_HOST_SET_FAST_GPUS` or `AWSQUEUEENGINE_HOSTS_FILE_FAST_GPUS`.
-The monitor should still run once over the full host pool; a named host set is
-stored as that job's host allowlist.
+`AWSQUEUEENGINE_QUEUES_FILE` and `AWSQUEUEENGINE_QUEUES` are mutually exclusive.
+The file form is preferred for live changes because the monitor reloads it each
+poll; environment variables are read from the running process environment.
 
 
 Suggested to run with:

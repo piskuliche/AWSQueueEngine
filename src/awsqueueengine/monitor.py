@@ -15,6 +15,7 @@ from .config import (
 )
 from .host_status import status_all
 from .queue import build_resume_item, dequeue_for_host, load_queue, save_queue, normalize_job_item
+from .queue_config import QueueConfigSource, host_is_eligible_for_item
 from .job_control import submit_to_host, write_run_info, kill_managed_on_host
 from .running_state import load_running_jobs, save_running_jobs
 from .completion_state import append_completed_records
@@ -117,9 +118,8 @@ class _MonitorHostSource:
         return list(self._hosts)
 
 
-def _host_is_eligible(job_item, host):
-    hosts = job_item.get("hosts")
-    return not hosts or host in hosts
+def _host_is_eligible(job_item, host, queue_host_map=None):
+    return host_is_eligible_for_item(job_item, host, queue_host_map)
 
 
 def _requeue_front(job_item):
@@ -172,6 +172,7 @@ def _build_completed_job_record(host, running_item, finished_at):
         "dur": _format_duration_seconds(duration_seconds),
         "duration_seconds": duration_seconds,
         "priority": item.get("priority", 0),
+        "queue": item.get("queue", "default"),
         "preempt": item.get("preempt", False),
         "hosts": item.get("hosts"),
         "payload": payload_text,
@@ -324,10 +325,11 @@ def _launch_job_on_host(host, job_item, running_jobs):
     payload_remote_path = item.get("payload_remote_path")
     payload_s3_uri = item.get("payload_s3_uri")
     payload_size_bytes = item.get("payload_size_bytes")
+    queue_name = item.get("queue", "default")
     target_hosts = item.get("hosts")
     priority = item.get("priority", 0)
     preempt = item.get("preempt", False)
-    hosts_text = ",".join(target_hosts) if target_hosts else "any"
+    hosts_text = ",".join(target_hosts) if target_hosts else f"queue:{queue_name}"
     print(
         f"[{time.strftime('%H:%M:%S')}] Launching (priority={priority}, hosts={hosts_text}, preempt={preempt}) on {host}: "
         f"{job_cmd[:120]}{'...' if len(job_cmd)>120 else ''}",
@@ -367,6 +369,7 @@ def _launch_job_on_host(host, job_item, running_jobs):
         "cmd": job_cmd,
         "payload": payload,
         "priority": priority,
+        "queue": queue_name,
         "hosts": target_hosts,
         "preempt": False,
         "payload_remote_path": remote_payload,
@@ -384,7 +387,7 @@ def _launch_job_on_host(host, job_item, running_jobs):
     return True
 
 
-def _select_preempt_target(queue_items, running_hosts, running_jobs):
+def _select_preempt_target(queue_items, running_hosts, running_jobs, queue_host_map=None):
     best_queue_idx = None
     best_item = None
     best_priority = None
@@ -399,7 +402,7 @@ def _select_preempt_target(queue_items, running_hosts, running_jobs):
             host
             for host in running_hosts
             if host in running_jobs
-            and _host_is_eligible(item, host)
+            and _host_is_eligible(item, host, queue_host_map=queue_host_map)
             and priority > running_jobs.get(host, {}).get("priority", 0)
         ]
         if not eligible_hosts:
@@ -448,9 +451,12 @@ def monitor_loop(hosts, poll_interval=CHECK_INTERVAL, stop_event: threading.Even
 
     if stop_event is None:
         stop_event = threading.Event()
-    host_source = _MonitorHostSource(hosts, hosts_file=hosts_file)
-    if host_source.hosts_file:
-        print(f"Monitoring hosts from file: {host_source.hosts_file}", flush=True)
+    try:
+        queue_source = QueueConfigSource(hosts, legacy_hosts_file=hosts_file)
+    except ValueError as exc:
+        print(f"[ERROR] Invalid queue host configuration: {exc}", flush=True)
+        return
+    print(f"Monitoring queue hosts from {queue_source.source_kind}: {queue_source.source_value}", flush=True)
 
     running_jobs = load_running_jobs()
     alert_recipients = parse_email_recipients()
@@ -466,7 +472,12 @@ def monitor_loop(hosts, poll_interval=CHECK_INTERVAL, stop_event: threading.Even
     try:
         no_hosts_warned = False
         while not stop_event.is_set():
-            current_hosts = host_source.refresh()
+            try:
+                queue_host_map = queue_source.refresh()
+            except ValueError as exc:
+                print(f"[WARN] Invalid queue host configuration: {exc}. Keeping previous config.", flush=True)
+                queue_host_map = {}
+            current_hosts = queue_source.all_hosts()
             if not current_hosts:
                 if not no_hosts_warned:
                     print("[WARN] No eligible hosts configured; monitor will wait for hosts.", flush=True)
@@ -487,7 +498,7 @@ def monitor_loop(hosts, poll_interval=CHECK_INTERVAL, stop_event: threading.Even
                 print(f"[WARN] unreachable hosts: {', '.join(unreachable_hosts)}", flush=True)
             if free_hosts:
                 for host in free_hosts:
-                    job_item = dequeue_for_host(host)
+                    job_item = dequeue_for_host(host, queue_host_map=queue_host_map)
                     if not job_item:
                         continue
                     launched = _launch_job_on_host(host, job_item, running_jobs)
@@ -497,7 +508,8 @@ def monitor_loop(hosts, poll_interval=CHECK_INTERVAL, stop_event: threading.Even
                             f"Failed to start queued job on host {host}.\n\n"
                             f"Command: {item.get('cmd')}\n"
                             f"Priority: {item.get('priority')}\n"
-                            f"Hosts restriction: {item.get('hosts') or 'any'}\n"
+                            f"Queue: {item.get('queue') or 'default'}\n"
+                            f"Hosts restriction: {item.get('hosts') or 'none'}\n"
                             f"Payload dir: {item.get('payload') or '-'}\n"
                             f"Payload remote path: {item.get('payload_remote_path') or '-'}\n"
                             f"Payload S3 URI: {item.get('payload_s3_uri') or '-'}\n"
@@ -558,6 +570,7 @@ def monitor_loop(hosts, poll_interval=CHECK_INTERVAL, stop_event: threading.Even
                 queue_items,
                 running_hosts,
                 running_jobs,
+                queue_host_map=queue_host_map,
             )
             if preempt_queue_idx is not None and preempt_item and victim_host:
                 queue_items.pop(preempt_queue_idx)
