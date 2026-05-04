@@ -1,4 +1,5 @@
 # CLI interface for AWSQueueManager
+import json
 import sys, os
 import argparse
 import shlex
@@ -18,6 +19,7 @@ from .monitor import acquire_monitor_lock, load_hosts_from_file, release_monitor
 from .job_control import new_job_tag, submit_to_host, tail_remote_log, kill_managed_on_host
 from .staging import sizeof_local_path_bytes, where_is_next_submit
 from .running_state import load_running_jobs
+from .completion_state import load_completed_jobs
 from .notifications import parse_email_recipients, send_email
 
 
@@ -251,6 +253,104 @@ def _write_local_run_info(payload_path, info):
     return info_path
 
 
+def _read_run_info_file(info_path):
+    info = {}
+    for line in info_path.read_text().splitlines():
+        if ":" not in line:
+            continue
+        key, _, value = line.partition(":")
+        clean_key = key.strip()
+        if not clean_key:
+            continue
+        info[clean_key] = value.strip()
+    return info
+
+
+def _write_run_info_file(info_path, info):
+    lines = []
+    for key, value in info.items():
+        if value is None or value == "":
+            continue
+        lines.append(f"{key}: {value}")
+    info_path.write_text("\n".join(lines) + "\n")
+
+
+def _format_epoch(value):
+    if isinstance(value, bool):
+        return ""
+    if isinstance(value, (int, float)):
+        try:
+            return datetime.fromtimestamp(float(value)).strftime("%Y-%m-%d %H:%M:%S")
+        except (OverflowError, OSError, ValueError):
+            return ""
+    return ""
+
+
+def lookup_job_state(job_id):
+    """Search local queue/running/completed state for a job_id and return a state dict."""
+    if not job_id:
+        return None
+    for idx, raw_item in enumerate(load_queue(), 1):
+        item = normalize_job_item(raw_item)
+        if item.get("job_id") == job_id:
+            hosts = item.get("hosts")
+            return {
+                "status": "queued",
+                "job_id": job_id,
+                "queue_position": idx,
+                "queue": item.get("queue"),
+                "hosts_filter": ",".join(hosts) if hosts else "",
+                "cmd": str(item.get("cmd") or ""),
+            }
+    running_jobs = load_running_jobs()
+    for host, raw_item in running_jobs.items():
+        item = normalize_job_item(raw_item)
+        if item.get("job_id") == job_id:
+            started_at = raw_item.get("started_at") if isinstance(raw_item, dict) else None
+            return {
+                "status": "running",
+                "job_id": job_id,
+                "host": host,
+                "remote_payload_path": item.get("payload_remote_path") or "",
+                "started_at": _format_epoch(started_at),
+                "queue": item.get("queue"),
+                "cmd": str(item.get("cmd") or ""),
+            }
+    for record in reversed(load_completed_jobs()):
+        if isinstance(record, dict) and record.get("job_id") == job_id:
+            return {
+                "status": "completed",
+                "job_id": job_id,
+                "host": record.get("host") or "",
+                "remote_payload_path": record.get("payload_remote_path") or "",
+                "started_at": _format_epoch(record.get("started_at")),
+                "finished_at": _format_epoch(record.get("finished_at")),
+                "duration": record.get("dur") or "",
+                "queue": record.get("queue") or "",
+                "cmd": str(record.get("cmd") or ""),
+            }
+    return None
+
+
+def _query_job_state_remote(queue_host, job_id):
+    remote_argv = ["awsqueueengine", "job-info", job_id]
+    remote_cmd = shlex.join(remote_argv)
+    result = subprocess.run([SSH_BIN, queue_host, remote_cmd], capture_output=True, text=True, check=False)
+    if result.returncode != 0:
+        detail = (result.stderr or result.stdout or "").strip()
+        raise RuntimeError(f"remote job-info failed (rc={result.returncode}): {detail}")
+    raw = (result.stdout or "").strip()
+    if not raw:
+        return None
+    try:
+        parsed = json.loads(raw)
+    except json.JSONDecodeError as exc:
+        raise RuntimeError(f"could not parse remote job-info output: {exc}; raw={raw!r}")
+    if not parsed:
+        return None
+    return parsed
+
+
 def _handle_remote_submit(args, command):
     if args.hosts_file:
         print("--hosts-file is not supported with --queue-host; host validation happens on the queue host.", flush=True)
@@ -414,6 +514,25 @@ def main():
 
     p_stop = sub.add_parser("stop", help="Kill managed job(s) on a host")
     p_stop.add_argument("host")
+
+    p_info = sub.add_parser(
+        "info",
+        help="Refresh local run.info from queue host state (host, remote payload, status)",
+    )
+    p_info.add_argument(
+        "--payload",
+        "-p",
+        help="Local payload directory containing run.info (default: current directory)",
+        default=None,
+    )
+    p_info.add_argument(
+        "--queue-host",
+        help="Queue host to query (default: queue_host value from run.info)",
+        default=None,
+    )
+
+    p_job_info = sub.add_parser("job-info", help="Emit JSON state for a job_id from local queue/running/completed")
+    p_job_info.add_argument("job_id")
 
     args = parser.parse_args()
 
@@ -745,6 +864,43 @@ def main():
             print(f"Kill error (rc={res['rc']}): {detail}", flush=True)
     elif args.cmd == "where":
         where_is_next_submit()
+    elif args.cmd == "job-info":
+        state = lookup_job_state(args.job_id)
+        print(json.dumps(state if state is not None else {}), flush=True)
+    elif args.cmd == "info":
+        payload_dir = Path(args.payload).expanduser() if args.payload else Path.cwd()
+        info_path = payload_dir / "run.info"
+        if not info_path.exists():
+            print(f"run.info not found at {info_path}", flush=True)
+            sys.exit(1)
+        existing = _read_run_info_file(info_path)
+        job_id = existing.get("job_id")
+        if not job_id:
+            print(f"No job_id in {info_path}", flush=True)
+            sys.exit(1)
+        queue_host = args.queue_host or existing.get("queue_host") or "local"
+        if queue_host == "local":
+            state = lookup_job_state(job_id)
+        else:
+            try:
+                state = _query_job_state_remote(queue_host, job_id)
+            except RuntimeError as exc:
+                print(f"Failed to query {queue_host}: {exc}", flush=True)
+                sys.exit(1)
+        if not state:
+            print(f"Job {job_id} not found in queue host state (queued/running/completed).", flush=True)
+            sys.exit(1)
+        merged = dict(existing)
+        for key, value in state.items():
+            if value is None or value == "":
+                continue
+            merged[key] = value
+        _write_run_info_file(info_path, merged)
+        print(
+            f"Updated {info_path}: status={merged.get('status', '?')} "
+            f"host={merged.get('host', '-')} remote_payload={merged.get('remote_payload_path', '-')}",
+            flush=True,
+        )
     else:
         parser.print_help()
 
