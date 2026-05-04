@@ -154,6 +154,7 @@ class QueuePriorityTests(unittest.TestCase):
                 "payload_size_bytes": None,
                 "resume_first": False,
                 "resume_host": None,
+                "job_id": None,
                 "submit_failures": 0,
             },
         )

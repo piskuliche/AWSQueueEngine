@@ -180,6 +180,7 @@ def _build_completed_job_record(host, running_item, finished_at):
         "payload_remote_path": payload_remote_path,
         "payload_s3_uri": payload_s3_uri,
         "payload_size_bytes": payload_size_bytes,
+        "job_id": item.get("job_id"),
         "cmd": str(item.get("cmd") or ""),
         "started_at": started_at,
         "finished_at": float(finished_at),
@@ -329,6 +330,7 @@ def _launch_job_on_host(host, job_item, running_jobs):
     target_hosts = item.get("hosts")
     priority = item.get("priority", 0)
     preempt = item.get("preempt", False)
+    job_id = item.get("job_id")
     hosts_text = ",".join(target_hosts) if target_hosts else f"queue:{queue_name}"
     print(
         f"[{time.strftime('%H:%M:%S')}] Launching (priority={priority}, hosts={hosts_text}, preempt={preempt}) on {host}: "
@@ -342,6 +344,7 @@ def _launch_job_on_host(host, job_item, running_jobs):
         payload_remote_path=payload_remote_path,
         payload_s3_uri=payload_s3_uri,
         payload_size_bytes=payload_size_bytes,
+        tag=job_id,
     )
     if not res.get("ok"):
         print(f"  Failed to start on {host}: {res.get('err')}", flush=True)
@@ -375,6 +378,7 @@ def _launch_job_on_host(host, job_item, running_jobs):
         "payload_remote_path": remote_payload,
         "payload_s3_uri": payload_s3_uri,
         "payload_size_bytes": payload_size_bytes,
+        "job_id": res.get("tag") or job_id,
         "started_at": time.time(),
     }
     save_running_jobs(running_jobs)

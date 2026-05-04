@@ -120,6 +120,13 @@ def _normalize_resume_host(value):
     return clean_value or None
 
 
+def _normalize_job_id(value):
+    if not isinstance(value, str):
+        return None
+    clean_value = value.strip()
+    return clean_value or None
+
+
 def normalize_job_item(item):
     if isinstance(item, str):
         return {
@@ -134,6 +141,7 @@ def normalize_job_item(item):
             "payload_size_bytes": None,
             "resume_first": DEFAULT_RESUME_FIRST,
             "resume_host": None,
+            "job_id": None,
         }
 
     if not isinstance(item, dict):
@@ -149,6 +157,7 @@ def normalize_job_item(item):
             "payload_size_bytes": None,
             "resume_first": DEFAULT_RESUME_FIRST,
             "resume_host": None,
+            "job_id": None,
         }
 
     submit_failures = item.get("submit_failures", 0)
@@ -166,6 +175,7 @@ def normalize_job_item(item):
         "payload_size_bytes": _normalize_payload_size_bytes(item.get("payload_size_bytes")),
         "resume_first": _normalize_resume_first(item.get("resume_first", DEFAULT_RESUME_FIRST)),
         "resume_host": _normalize_resume_host(item.get("resume_host")),
+        "job_id": _normalize_job_id(item.get("job_id")),
         "submit_failures": submit_failures,
     }
 

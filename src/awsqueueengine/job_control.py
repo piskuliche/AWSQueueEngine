@@ -19,9 +19,12 @@ def _payload_name_from_s3_uri(payload_s3_uri):
     return name or "payload"
 
 
-def _new_job_tag():
+def new_job_tag():
     timestamp = datetime.now().strftime("%Y%m%d-%H%M%S")
     return f"{timestamp}-{uuid.uuid4().hex[:6]}"
+
+
+_new_job_tag = new_job_tag  # backward-compat alias
 
 
 def submit_to_host(
@@ -31,8 +34,9 @@ def submit_to_host(
     payload_remote_path=None,
     payload_s3_uri=None,
     payload_size_bytes=None,
+    tag=None,
 ):
-    tag = _new_job_tag()
+    tag = tag or new_job_tag()
     remote_payload_dir = None
     if payload_remote_path:
         remote_payload_dir = str(payload_remote_path).strip() or None

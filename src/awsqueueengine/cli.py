@@ -15,7 +15,7 @@ from .queue import build_resume_item, enqueue_item, load_queue, normalize_job_it
 from .queue_config import DEFAULT_QUEUE, QueueConfigSource, get_configured_queue_source, normalize_queue_name
 from .host_status import status_all
 from .monitor import acquire_monitor_lock, load_hosts_from_file, release_monitor_lock, monitor_loop
-from .job_control import submit_to_host, tail_remote_log, kill_managed_on_host
+from .job_control import new_job_tag, submit_to_host, tail_remote_log, kill_managed_on_host
 from .staging import sizeof_local_path_bytes, where_is_next_submit
 from .running_state import load_running_jobs
 from .notifications import parse_email_recipients, send_email
@@ -189,7 +189,7 @@ def _upload_payload_archive_to_s3(archive_path, payload_name):
     return f"s3://{S3_BUCKET}/{key}"
 
 
-def _build_remote_submit_argv(args, command, payload_s3_uri=None, payload_size_bytes=None):
+def _build_remote_submit_argv(args, command, payload_s3_uri=None, payload_size_bytes=None, job_id=None):
     argv = ["awsqueueengine", "submit"]
     queue_name = getattr(args, "queue", None) or getattr(args, "host_set", None)
     if queue_name:
@@ -207,6 +207,8 @@ def _build_remote_submit_argv(args, command, payload_s3_uri=None, payload_size_b
         argv.extend(["--payload-s3-uri", payload_s3_uri])
     if payload_size_bytes is not None:
         argv.extend(["--payload-size-bytes", str(payload_size_bytes)])
+    if job_id:
+        argv.extend(["--job-id", job_id])
     argv.append(command)
     return argv
 
@@ -214,6 +216,39 @@ def _build_remote_submit_argv(args, command, payload_s3_uri=None, payload_size_b
 def _run_remote_submit(queue_host, remote_argv):
     remote_cmd = shlex.join(remote_argv)
     return subprocess.run([SSH_BIN, queue_host, remote_cmd], capture_output=True, text=True, check=False)
+
+
+def _proxy_remote_cli(queue_host, remote_argv):
+    """Run an awsqueueengine CLI command on a remote queue host and stream its output."""
+    remote_cmd = shlex.join(remote_argv)
+    result = subprocess.run([SSH_BIN, queue_host, remote_cmd], capture_output=True, text=True, check=False)
+    if result.stdout:
+        print(result.stdout, end="" if result.stdout.endswith("\n") else "\n", flush=True)
+    if result.stderr:
+        print(result.stderr, end="" if result.stderr.endswith("\n") else "\n", file=sys.stderr, flush=True)
+    if result.returncode != 0:
+        sys.exit(result.returncode)
+
+
+def _write_local_run_info(payload_path, info):
+    """Write a run.info file in the user's local payload dir with submit metadata."""
+    if not payload_path:
+        return None
+    target_dir = Path(payload_path).expanduser()
+    if not target_dir.exists() or not target_dir.is_dir():
+        return None
+    info_path = target_dir / "run.info"
+    lines = []
+    for key, value in info.items():
+        if value is None or value == "":
+            continue
+        lines.append(f"{key}: {value}")
+    try:
+        info_path.write_text("\n".join(lines) + "\n")
+    except OSError as exc:
+        print(f"[WARN] Could not write {info_path}: {exc}", flush=True)
+        return None
+    return info_path
 
 
 def _handle_remote_submit(args, command):
@@ -240,11 +275,13 @@ def _handle_remote_submit(args, command):
                 except OSError:
                     pass
 
+    job_id = getattr(args, "job_id", None) or new_job_tag()
     remote_argv = _build_remote_submit_argv(
         args,
         command,
         payload_s3_uri=payload_s3_uri,
         payload_size_bytes=payload_size_bytes,
+        job_id=job_id,
     )
     result = _run_remote_submit(args.queue_host, remote_argv)
     if result.stdout:
@@ -253,6 +290,20 @@ def _handle_remote_submit(args, command):
         print(result.stderr, end="" if result.stderr.endswith("\n") else "\n", file=sys.stderr, flush=True)
     if result.returncode != 0:
         sys.exit(result.returncode)
+
+    queue_name = getattr(args, "queue", None) or getattr(args, "host_set", None) or DEFAULT_QUEUE
+    _write_local_run_info(
+        args.payload,
+        {
+            "job_id": job_id,
+            "submitted_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+            "queue_host": args.queue_host,
+            "queue": queue_name,
+            "cmd": command,
+            "payload_s3_uri": payload_s3_uri or "",
+        },
+    )
+    print(f"Submitted {job_id}", flush=True)
 
 
 def main():
@@ -280,7 +331,12 @@ def main():
         help="Show status only for a named host set configured on this machine",
         default=None,
     )
-    sub.add_parser("qstat", help="Show running jobs tracked by monitor")
+    p_qstat = sub.add_parser("qstat", help="Show running jobs tracked by monitor")
+    p_qstat.add_argument(
+        "--queue-host",
+        help="Show running jobs from a remote queue host over SSH",
+        default=None,
+    )
     p_submit = sub.add_parser("submit", help="Enqueue a job (command string)")
     p_submit.add_argument(
         "--hosts-file",
@@ -307,6 +363,7 @@ def main():
     p_submit.add_argument("--queue-host", help="Forward this submit to a remote queue host over SSH", default=None)
     p_submit.add_argument("--payload-s3-uri", default=None, help=argparse.SUPPRESS)
     p_submit.add_argument("--payload-size-bytes", type=int, default=None, help=argparse.SUPPRESS)
+    p_submit.add_argument("--job-id", default=None, help=argparse.SUPPRESS)
     p_submit.add_argument("command", nargs=argparse.REMAINDER, help="Command to run remotely (quoted)")
     p_requeue = sub.add_parser(
         "requeue-running",
@@ -332,7 +389,12 @@ def main():
         help="Requeue running job(s) on all hosts with tracked running jobs.",
     )
 
-    sub.add_parser("list", help="Show queued jobs")
+    p_list = sub.add_parser("list", help="Show queued jobs")
+    p_list.add_argument(
+        "--queue-host",
+        help="Show queued jobs from a remote queue host over SSH",
+        default=None,
+    )
     p_qdel = sub.add_parser("qdel", help="Delete queued job(s) by list index")
     p_qdel.add_argument("job_ids", nargs="+", type=int, help="1-based queue index(es) from `list` output")
     sub.add_parser("clear", help="Clear the queue")
@@ -392,11 +454,18 @@ def main():
             info = (r["raw"][:60] + "...") if r["raw"] else ""
             print(f"{r['host']:8}  {reach:8}  {pid:8}  {tag:12}  {info}", flush=True)
     elif args.cmd == "qstat":
+        if getattr(args, "queue_host", None):
+            _proxy_remote_cli(args.queue_host, ["awsqueueengine", "qstat"])
+            return
         running_jobs = load_running_jobs()
         if not running_jobs:
             print("(no running jobs tracked)", flush=True)
         else:
-            print(f"{'HOST':8}  {'DUR':8}  {'PRI':5}  {'PREEMPT':7}  {'QUEUE':12}  {'HOSTS':15}  {'PAYLOAD':24}  CMD", flush=True)
+            print(
+                f"{'HOST':8}  {'JOB':22}  {'DUR':8}  {'PRI':5}  {'PREEMPT':7}  {'QUEUE':12}  "
+                f"{'HOSTS':15}  {'PAYLOAD':24}  CMD",
+                flush=True,
+            )
             for host in sorted(running_jobs):
                 raw_item = running_jobs[host]
                 item = normalize_job_item(raw_item)
@@ -404,8 +473,9 @@ def main():
                 payload_text = _payload_display_text(item)
                 cmd_text = str(item.get("cmd") or "")
                 dur_text = _format_elapsed(raw_item.get("started_at") if isinstance(raw_item, dict) else None)
+                job_id_text = item.get("job_id") or "-"
                 print(
-                    f"{host:8}  {dur_text:8}  {item['priority']:5d}  {str(item['preempt']):7}  "
+                    f"{host:8}  {job_id_text:22}  {dur_text:8}  {item['priority']:5d}  {str(item['preempt']):7}  "
                     f"{item['queue'][:12]:12}  {hosts_text[:15]:15}  {payload_text:24}  "
                     f"{cmd_text}",
                     flush=True,
@@ -475,18 +545,37 @@ def main():
         else:
             priority = 0
 
+        job_id = args.job_id or new_job_tag()
+        local_payload_path = None if args.payload_s3_uri else args.payload
         item = {
             "cmd": command,
-            "payload": None if args.payload_s3_uri else args.payload,
+            "payload": local_payload_path,
             "priority": priority,
             "queue": queue_name,
             "hosts": hosts,
             "preempt": args.preempt,
             "payload_s3_uri": args.payload_s3_uri,
             "payload_size_bytes": args.payload_size_bytes,
+            "job_id": job_id,
         }
         enqueue_item(item)
         print("Enqueued:", item, flush=True)
+        # Only write run.info / print Submitted on the original submitter's machine.
+        # When this CLI invocation is a forwarded remote submit (--job-id was passed in),
+        # the local-side caller will print Submitted and write run.info.
+        if not args.job_id:
+            _write_local_run_info(
+                local_payload_path,
+                {
+                    "job_id": job_id,
+                    "submitted_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                    "queue_host": "local",
+                    "queue": queue_name,
+                    "cmd": command,
+                    "payload_s3_uri": args.payload_s3_uri or "",
+                },
+            )
+            print(f"Submitted {job_id}", flush=True)
     elif args.cmd == "requeue-running":
         running_jobs = load_running_jobs()
         queue_host_map = _resolve_queue_hosts_for_cli(args.hosts_file)
@@ -534,6 +623,9 @@ def main():
         if requeued_count == 0:
             print("No running jobs were requeued.", flush=True)
     elif args.cmd == "list":
+        if getattr(args, "queue_host", None):
+            _proxy_remote_cli(args.queue_host, ["awsqueueengine", "list"])
+            return
         q = load_queue()
         if not q:
             print("(queue empty)", flush=True)
@@ -542,8 +634,10 @@ def main():
                 item = normalize_job_item(raw_item)
                 hosts_text = ",".join(item["hosts"]) if item["hosts"] else "-"
                 payload_text = _payload_display_text(item)
+                job_id_text = item.get("job_id") or "-"
                 print(
-                    f"{i:3d}. [priority={item['priority']}] [queue={item['queue']}] [hosts={hosts_text}] [preempt={item['preempt']}] "
+                    f"{i:3d}. [job={job_id_text}] [priority={item['priority']}] [queue={item['queue']}] "
+                    f"[hosts={hosts_text}] [preempt={item['preempt']}] "
                     f"cmd={item['cmd']!r} payload={payload_text!r}",
                     flush=True
                 )
