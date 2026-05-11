@@ -9,6 +9,8 @@ from pathlib import Path
 from .config import (
     ALERT_DAILY_EMAIL_LIMIT,
     CHECK_INTERVAL,
+    HOST_STORAGE_COOLDOWN_SECONDS,
+    HOST_TRANSPORT_COOLDOWN_SECONDS,
     JOB_FAIL_ALERT_COOLDOWN_SECONDS,
     MAX_SUBMIT_FAILURES,
     MONITOR_STATE_FILE,
@@ -19,6 +21,7 @@ from .queue_config import QueueConfigSource, host_is_eligible_for_item
 from .job_control import submit_to_host, write_run_info, kill_managed_on_host
 from .running_state import load_running_jobs, save_running_jobs
 from .completion_state import append_completed_records
+from .deferred_state import append_deferred_job
 from .notifications import parse_email_recipients, send_email
 
 
@@ -128,6 +131,12 @@ def _requeue_front(job_item):
     save_queue(q)
 
 
+def _requeue_back(job_item):
+    q = load_queue()
+    q.append(normalize_job_item(job_item))
+    save_queue(q)
+
+
 def _build_status_text(status_rows, running_jobs, queue_items):
     now_text = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     total_hosts = len(status_rows)
@@ -234,6 +243,45 @@ def _save_monitor_state(state):
         print(f"[WARN] Could not save monitor state: {exc}", flush=True)
 
 
+def _load_host_disabled_until():
+    state = _load_monitor_state()
+    raw = state.get("host_disabled_until") or {}
+    if not isinstance(raw, dict):
+        return {}
+    now_ts = time.time()
+    cleaned = {}
+    for host, value in raw.items():
+        if not isinstance(host, str):
+            continue
+        try:
+            until_ts = float(value)
+        except (TypeError, ValueError):
+            continue
+        if until_ts > now_ts:
+            cleaned[host] = until_ts
+    return cleaned
+
+
+def _save_host_disabled_until(host_disabled_until):
+    state = _load_monitor_state()
+    now_ts = time.time()
+    cleaned = {h: float(ts) for h, ts in host_disabled_until.items() if float(ts) > now_ts}
+    state["host_disabled_until"] = cleaned
+    _save_monitor_state(state)
+
+
+def _prune_expired_disabled_hosts(host_disabled_until):
+    now_ts = time.time()
+    expired = [host for host, ts in host_disabled_until.items() if ts <= now_ts]
+    if not expired:
+        return False
+    for host in expired:
+        host_disabled_until.pop(host, None)
+        print(f"[INFO] Host {host} cooldown ended; re-enabled.", flush=True)
+    _save_host_disabled_until(host_disabled_until)
+    return True
+
+
 def _load_last_daily_summary_date():
     state = _load_monitor_state()
     text = state.get("last_daily_summary_date")
@@ -306,6 +354,43 @@ def _mark_alert_sent(alert_state, alert_type, now_ts):
         alert_state["job_fail_cooldown_until"] = now_ts + JOB_FAIL_ALERT_COOLDOWN_SECONDS
 
 
+def _disable_host_and_alert(host, reason, err, job_item, host_disabled_until, alert_recipients, alert_state):
+    if reason == "host_storage":
+        cooldown_seconds = HOST_STORAGE_COOLDOWN_SECONDS
+    else:
+        cooldown_seconds = HOST_TRANSPORT_COOLDOWN_SECONDS
+    until_ts = time.time() + cooldown_seconds
+    host_disabled_until[host] = until_ts
+    _save_host_disabled_until(host_disabled_until)
+    until_text = datetime.fromtimestamp(until_ts).strftime("%Y-%m-%d %H:%M:%S")
+    cooldown_minutes = max(1, cooldown_seconds // 60)
+    item = normalize_job_item(job_item)
+    print(
+        f"[INFO] Host {host} disabled until {until_text} ({cooldown_minutes} min, reason={reason}).",
+        flush=True,
+    )
+    subject = f"[AWSQueueEngine] Host {host} disabled ({reason}, {cooldown_minutes} min)"
+    body = (
+        f"Host {host} has been temporarily disabled after a {reason} failure starting a job.\n\n"
+        f"Reason: {reason}\n"
+        f"Error: {err or '-'}\n"
+        f"Cooldown: {cooldown_minutes} minute(s)\n"
+        f"Re-enabled at: {until_text}\n\n"
+        f"The affected job was requeued at the back of the queue and will not be retried on {host} "
+        f"until the cooldown ends.\n\n"
+        f"Job details:\n"
+        f"  Command: {item.get('cmd')}\n"
+        f"  Job ID: {item.get('job_id') or '-'}\n"
+        f"  Queue: {item.get('queue') or 'default'}\n"
+        f"  Priority: {item.get('priority')}\n"
+        f"  Payload dir: {item.get('payload') or '-'}\n"
+        f"  Payload remote path: {item.get('payload_remote_path') or '-'}\n"
+        f"  Payload S3 URI: {item.get('payload_s3_uri') or '-'}\n"
+        f"Generated at: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n"
+    )
+    _send_alert_email_with_limits(alert_recipients, subject, body, alert_state, "host_disable")
+
+
 def _send_alert_email_with_limits(recipients, subject, body, alert_state, alert_type):
     now_dt = datetime.now()
     now_ts = time.time()
@@ -347,24 +432,64 @@ def _launch_job_on_host(host, job_item, running_jobs):
         tag=job_id,
     )
     if not res.get("ok"):
-        print(f"  Failed to start on {host}: {res.get('err')}", flush=True)
+        reason = res.get("reason") or "job"
+        err_text = res.get("err")
+        print(f"  Failed to start on {host}: {err_text} (reason={reason})", flush=True)
         if res.get("payload") and not item.get("payload_remote_path"):
             item["payload_remote_path"] = res.get("payload")
-        if res.get("err") != "pidfile present but process not running":
-            failures = item.get("submit_failures", 0) + 1
-            item["submit_failures"] = failures
-            if failures >= MAX_SUBMIT_FAILURES:
-                print(
-                    f"  Job exceeded max submit failures ({MAX_SUBMIT_FAILURES}); dropping from queue: "
-                    f"{str(item.get('cmd') or '')[:120]}",
-                    flush=True,
-                )
-            else:
-                print(f"  Requeuing job (failure {failures}/{MAX_SUBMIT_FAILURES}).", flush=True)
-                _requeue_front(item)
-        else:
+
+        if reason in ("host_storage", "host_transport"):
+            item["submit_failures"] = 0
+            _requeue_back(item)
+            print(f"  Requeued job at back of queue; {host} flagged for cooldown ({reason}).", flush=True)
+            return {
+                "launched": False,
+                "reason": reason,
+                "err": err_text,
+                "host_failed": True,
+                "deferred": False,
+                "item": item,
+            }
+
+        if err_text == "pidfile present but process not running":
             print(f"    Job Failed on {host}; but had pid file. Job maybe had error.", flush=True)
-        return False
+            return {
+                "launched": False,
+                "reason": "job",
+                "err": err_text,
+                "host_failed": False,
+                "deferred": False,
+                "item": item,
+            }
+
+        failures = item.get("submit_failures", 0) + 1
+        item["submit_failures"] = failures
+        if failures >= MAX_SUBMIT_FAILURES:
+            print(
+                f"  Job exceeded max submit failures ({MAX_SUBMIT_FAILURES}); deferring for manual requeue: "
+                f"{str(item.get('cmd') or '')[:120]}",
+                flush=True,
+            )
+            append_deferred_job(item, last_error=err_text, last_host=host)
+            return {
+                "launched": False,
+                "reason": "job",
+                "err": err_text,
+                "host_failed": False,
+                "deferred": True,
+                "item": item,
+            }
+
+        print(f"  Requeuing job (failure {failures}/{MAX_SUBMIT_FAILURES}).", flush=True)
+        _requeue_front(item)
+        return {
+            "launched": False,
+            "reason": "job",
+            "err": err_text,
+            "host_failed": False,
+            "deferred": False,
+            "item": item,
+        }
 
     remote_payload = res.get("payload") or payload_remote_path
     print(f"  Started {res.get('tag')} pid={res.get('pid')} payload={remote_payload or '-'}", flush=True)
@@ -388,7 +513,7 @@ def _launch_job_on_host(host, job_item, running_jobs):
         host=host,
         remote_payload_path=remote_payload,
     )
-    return True
+    return {"launched": True, "reason": None, "err": None, "host_failed": False, "deferred": False, "item": item}
 
 
 def _select_preempt_target(queue_items, running_hosts, running_jobs, queue_host_map=None):
@@ -465,6 +590,13 @@ def monitor_loop(hosts, poll_interval=CHECK_INTERVAL, stop_event: threading.Even
     running_jobs = load_running_jobs()
     alert_recipients = parse_email_recipients()
     alert_state = _initial_alert_runtime_state()
+    host_disabled_until = _load_host_disabled_until()
+    if host_disabled_until:
+        until_summary = ", ".join(
+            f"{host}@{datetime.fromtimestamp(ts).strftime('%Y-%m-%d %H:%M:%S')}"
+            for host, ts in sorted(host_disabled_until.items())
+        )
+        print(f"Restored host cooldowns: {until_summary}", flush=True)
     low_queue_alert_sent = False
     empty_queue_alert_sent = False
     last_daily_summary_date = _load_last_daily_summary_date()
@@ -489,8 +621,18 @@ def monitor_loop(hosts, poll_interval=CHECK_INTERVAL, stop_event: threading.Even
             else:
                 no_hosts_warned = False
 
+            _prune_expired_disabled_hosts(host_disabled_until)
             status = status_all(current_hosts)
-            free_hosts = [s["host"] for s in status if s["reachable"] and s["pid"] is None]
+            free_hosts = [
+                s["host"]
+                for s in status
+                if s["reachable"] and s["pid"] is None and s["host"] not in host_disabled_until
+            ]
+            disabled_free_hosts = [
+                s["host"]
+                for s in status
+                if s["reachable"] and s["pid"] is None and s["host"] in host_disabled_until
+            ]
             running_hosts = [s["host"] for s in status if s["reachable"] and s["pid"] is not None]
             unreachable_hosts = [s["host"] for s in status if not s["reachable"]]
             state_changed, completed_records = _prune_running_jobs_for_status(running_jobs, status)
@@ -500,33 +642,58 @@ def monitor_loop(hosts, poll_interval=CHECK_INTERVAL, stop_event: threading.Even
                 append_completed_records(completed_records)
             if unreachable_hosts:
                 print(f"[WARN] unreachable hosts: {', '.join(unreachable_hosts)}", flush=True)
+            if disabled_free_hosts:
+                print(
+                    f"[INFO] Skipping disabled hosts (in cooldown): {', '.join(sorted(disabled_free_hosts))}",
+                    flush=True,
+                )
             if free_hosts:
                 for host in free_hosts:
+                    if host in host_disabled_until:
+                        # Host got disabled mid-loop by an earlier failure this cycle.
+                        continue
                     job_item = dequeue_for_host(host, queue_host_map=queue_host_map)
                     if not job_item:
                         continue
-                    launched = _launch_job_on_host(host, job_item, running_jobs)
-                    if not launched:
-                        item = normalize_job_item(job_item)
-                        alert_body = (
-                            f"Failed to start queued job on host {host}.\n\n"
-                            f"Command: {item.get('cmd')}\n"
-                            f"Priority: {item.get('priority')}\n"
-                            f"Queue: {item.get('queue') or 'default'}\n"
-                            f"Hosts restriction: {item.get('hosts') or 'none'}\n"
-                            f"Payload dir: {item.get('payload') or '-'}\n"
-                            f"Payload remote path: {item.get('payload_remote_path') or '-'}\n"
-                            f"Payload S3 URI: {item.get('payload_s3_uri') or '-'}\n"
-                            f"Generated at: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n"
-                        )
-                        _send_alert_email_with_limits(
+                    launch_result = _launch_job_on_host(host, job_item, running_jobs)
+                    if launch_result.get("launched"):
+                        continue
+                    failed_item = launch_result.get("item") or normalize_job_item(job_item)
+                    if launch_result.get("host_failed"):
+                        _disable_host_and_alert(
+                            host,
+                            launch_result.get("reason"),
+                            launch_result.get("err"),
+                            failed_item,
+                            host_disabled_until,
                             alert_recipients,
-                            f"[AWSQueueEngine] Job failed to start on {host}",
-                            alert_body,
                             alert_state,
-                            "job_fail",
                         )
-                        break  # avoid retrying the same requeued job on other free hosts this cycle
+                        # Job was requeued at the back; continue to other free hosts.
+                        continue
+                    alert_body = (
+                        f"Failed to start queued job on host {host}.\n\n"
+                        f"Command: {failed_item.get('cmd')}\n"
+                        f"Priority: {failed_item.get('priority')}\n"
+                        f"Queue: {failed_item.get('queue') or 'default'}\n"
+                        f"Hosts restriction: {failed_item.get('hosts') or 'none'}\n"
+                        f"Payload dir: {failed_item.get('payload') or '-'}\n"
+                        f"Payload remote path: {failed_item.get('payload_remote_path') or '-'}\n"
+                        f"Payload S3 URI: {failed_item.get('payload_s3_uri') or '-'}\n"
+                        f"Reason: {launch_result.get('reason')}\n"
+                        f"Error: {launch_result.get('err') or '-'}\n"
+                        f"Deferred for manual requeue: {launch_result.get('deferred')}\n"
+                        f"Generated at: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n"
+                    )
+                    subject_suffix = " (deferred)" if launch_result.get("deferred") else ""
+                    _send_alert_email_with_limits(
+                        alert_recipients,
+                        f"[AWSQueueEngine] Job failed to start on {host}{subject_suffix}",
+                        alert_body,
+                        alert_state,
+                        "job_fail",
+                    )
+                    break  # job-side failure: avoid retrying the same requeued job on other free hosts this cycle
 
             queue_items = load_queue()
             queue_len = len(queue_items)

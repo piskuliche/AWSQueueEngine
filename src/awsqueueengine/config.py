@@ -12,6 +12,7 @@ SSH_TIMEOUT = 60  # seconds for each ssh call
 QUEUE_FILE = Path.home() / ".aws_slurm_like_queue.json"
 RUNNING_FILE = Path.home() / ".aws_slurm_like_running.json"
 COMPLETED_FILE = Path.home() / ".aws_slurm_like_completed.json"
+DEFERRED_FILE = Path.home() / ".aws_slurm_like_deferred.json"
 MONITOR_STATE_FILE = Path.home() / ".aws_slurm_like_monitor_state.json"
 REMOTE_SCRATCH_ROOTS = ["/home/ubuntu/1scratch", "/home/ubuntu/2scratch"]  # order = preference
 S3_BUCKET = os.getenv("AWSQUEUEENGINE_S3_BUCKET", "").strip()
@@ -25,3 +26,5 @@ MAILTRAP_CATEGORY = os.getenv("AWSQUEUEENGINE_MAILTRAP_CATEGORY", "Queue Monitor
 ALERT_DAILY_EMAIL_LIMIT = int(os.getenv("AWSQUEUEENGINE_ALERT_DAILY_EMAIL_LIMIT", "150"))
 JOB_FAIL_ALERT_COOLDOWN_SECONDS = int(os.getenv("AWSQUEUEENGINE_JOB_FAIL_ALERT_COOLDOWN_SECONDS", "900"))
 MAX_SUBMIT_FAILURES = int(os.getenv("AWSQUEUEENGINE_MAX_SUBMIT_FAILURES", "3"))
+HOST_STORAGE_COOLDOWN_SECONDS = int(os.getenv("AWSQUEUEENGINE_HOST_STORAGE_COOLDOWN_SECONDS", "7200"))
+HOST_TRANSPORT_COOLDOWN_SECONDS = int(os.getenv("AWSQUEUEENGINE_HOST_TRANSPORT_COOLDOWN_SECONDS", "600"))

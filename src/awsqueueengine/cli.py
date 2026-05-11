@@ -20,6 +20,7 @@ from .job_control import new_job_tag, submit_to_host, tail_remote_log, kill_mana
 from .staging import sizeof_local_path_bytes, where_is_next_submit
 from .running_state import load_running_jobs
 from .completion_state import load_completed_jobs
+from .deferred_state import load_deferred_jobs, pop_deferred_by_indices, pop_all_deferred, save_deferred_jobs
 from .notifications import parse_email_recipients, send_email
 
 
@@ -498,6 +499,42 @@ def main():
     p_qdel = sub.add_parser("qdel", help="Delete queued job(s) by list index")
     p_qdel.add_argument("job_ids", nargs="+", type=int, help="1-based queue index(es) from `list` output")
     sub.add_parser("clear", help="Clear the queue")
+    p_deferred = sub.add_parser(
+        "deferred",
+        help="Show jobs deferred after exceeding submit failure limit",
+    )
+    p_deferred.add_argument(
+        "--queue-host",
+        help="Show deferred jobs from a remote queue host over SSH",
+        default=None,
+    )
+    p_requeue_deferred = sub.add_parser(
+        "requeue-deferred",
+        help="Move deferred job(s) back into the main queue",
+    )
+    p_requeue_deferred.add_argument(
+        "indices",
+        nargs="*",
+        type=int,
+        default=[],
+        help="1-based deferred index(es) from `deferred` output",
+    )
+    p_requeue_deferred.add_argument(
+        "--all",
+        "-all",
+        action="store_true",
+        help="Requeue all deferred jobs",
+    )
+    p_requeue_deferred.add_argument(
+        "--drop",
+        action="store_true",
+        help="Drop the deferred entries instead of moving them back to the queue",
+    )
+    p_requeue_deferred.add_argument(
+        "--queue-host",
+        help="Run requeue-deferred against a remote queue host over SSH",
+        default=None,
+    )
     sub.add_parser("start", help="Start monitor loop (runs until Ctrl-C)")
     sub.add_parser("where", help="Show where the next job will be submitted")
     p_start_monitor = sub.add_parser("start-monitor", help="Start the monitor loop (daemon mode)")
@@ -795,6 +832,88 @@ def main():
     elif args.cmd == "clear":
         save_queue([])
         print("Queue cleared.", flush=True)
+    elif args.cmd == "deferred":
+        if getattr(args, "queue_host", None):
+            _proxy_remote_cli(args.queue_host, ["awsqueueengine", "deferred"])
+            return
+        jobs = load_deferred_jobs()
+        if not jobs:
+            print("(no deferred jobs)", flush=True)
+        else:
+            for i, raw_item in enumerate(jobs, 1):
+                item = normalize_job_item(raw_item)
+                hosts_text = ",".join(item["hosts"]) if item["hosts"] else "-"
+                payload_text = _payload_display_text(item)
+                job_id_text = item.get("job_id") or "-"
+                deferred_at = raw_item.get("deferred_at") if isinstance(raw_item, dict) else None
+                last_host = raw_item.get("last_host") if isinstance(raw_item, dict) else None
+                last_error_raw = raw_item.get("last_error") if isinstance(raw_item, dict) else None
+                last_error = (last_error_raw or "-")
+                if len(last_error) > 120:
+                    last_error = last_error[:117] + "..."
+                deferred_at_text = _format_epoch(deferred_at) or "-"
+                print(
+                    f"{i:3d}. [job={job_id_text}] [priority={item['priority']}] [queue={item['queue']}] "
+                    f"[hosts={hosts_text}] [last_host={last_host or '-'}] [deferred_at={deferred_at_text}] "
+                    f"cmd={item['cmd']!r} payload={payload_text!r} last_error={last_error!r}",
+                    flush=True,
+                )
+    elif args.cmd == "requeue-deferred":
+        if args.all and args.indices:
+            print("--all cannot be combined with explicit indices.", flush=True)
+            sys.exit(1)
+        if not args.all and not args.indices:
+            print("Provide deferred index(es) or pass --all.", flush=True)
+            sys.exit(1)
+
+        if getattr(args, "queue_host", None):
+            remote_argv = ["awsqueueengine", "requeue-deferred"]
+            if args.all:
+                remote_argv.append("--all")
+            else:
+                remote_argv.extend(str(i) for i in args.indices)
+            if args.drop:
+                remote_argv.append("--drop")
+            _proxy_remote_cli(args.queue_host, remote_argv)
+            return
+
+        jobs = load_deferred_jobs()
+        if not jobs:
+            print("(no deferred jobs)", flush=True)
+            return
+
+        if args.all:
+            popped_pairs = pop_all_deferred()
+        else:
+            invalid = [i for i in args.indices if i < 1 or i > len(jobs)]
+            if invalid:
+                print(
+                    f"Invalid deferred index(es): {', '.join(str(i) for i in sorted(set(invalid)))}. "
+                    f"Deferred size: {len(jobs)}",
+                    flush=True,
+                )
+                sys.exit(1)
+            popped_pairs = pop_deferred_by_indices(args.indices)
+
+        if not popped_pairs:
+            print("No deferred jobs were moved.", flush=True)
+            return
+
+        action_label = "Dropped" if args.drop else "Requeued"
+        for idx, raw_item in popped_pairs:
+            item = normalize_job_item(raw_item)
+            item["submit_failures"] = 0
+            if not args.drop:
+                enqueue_item(item)
+            hosts_text = ",".join(item["hosts"]) if item["hosts"] else "-"
+            payload_text = _payload_display_text(item)
+            print(
+                f"  {idx:3d}. [job={item.get('job_id') or '-'}] [priority={item['priority']}] "
+                f"[queue={item['queue']}] [hosts={hosts_text}] "
+                f"cmd={item['cmd']!r} payload={payload_text!r}",
+                flush=True,
+            )
+        print(f"{action_label} {len(popped_pairs)} deferred job(s).", flush=True)
     elif args.cmd == "start-monitor":
         # Prevent double-start
         pid = read_pidfile()

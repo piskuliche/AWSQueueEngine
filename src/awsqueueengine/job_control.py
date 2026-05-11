@@ -51,7 +51,7 @@ def submit_to_host(
             pid = out2.strip() if out2 else None
             return {"host": host, "tag": tag, "pid": pid, "ok": True}
         else:
-            return {"host": host, "tag": tag, "pid": None, "ok": False, "err": err or out}
+            return {"host": host, "tag": tag, "pid": None, "ok": False, "err": err or out, "reason": "host_transport"}
     if payload_s3_uri and not remote_payload_dir:
         try:
             needed_bytes = int(payload_size_bytes or 0)
@@ -59,7 +59,7 @@ def submit_to_host(
             needed_bytes = 0
         remote_root, info = choose_scratch_on_host(host, needed_bytes)
         if not remote_root:
-            return {"host": host, "ok": False, "err": f"no suitable scratch: {info}"}
+            return {"host": host, "ok": False, "err": f"no suitable scratch: {info}", "reason": "host_storage"}
         jobname = _payload_name_from_s3_uri(payload_s3_uri)
         remote_payload_dir = f"{remote_root}/{jobname}-{tag}"
         archive_path = f"{remote_payload_dir}/payload.tar.gz"
@@ -81,23 +81,24 @@ def submit_to_host(
                 "ok": False,
                 "err": f"s3 payload download failed: {err or out}",
                 "payload": remote_payload_dir,
+                "reason": "host_transport",
             }
     if not remote_payload_dir:
         local_path = Path(payload_local_path).expanduser()
         if not local_path.exists():
-            return {"host": host, "ok": False, "err": f"local payload not found: {local_path}"}
+            return {"host": host, "ok": False, "err": f"local payload not found: {local_path}", "reason": "job"}
         needed_bytes = sizeof_local_path_bytes(local_path)
         remote_root, info = choose_scratch_on_host(host, needed_bytes)
         if not remote_root:
-            return {"host": host, "ok": False, "err": f"no suitable scratch: {info}"}
+            return {"host": host, "ok": False, "err": f"no suitable scratch: {info}", "reason": "host_storage"}
         jobname = Path(payload_local_path).name
         remote_payload_dir = f"{remote_root}/{jobname}-{tag}"
         rc, out, err = ssh_run(host, f"mkdir -p {remote_root} && chmod 700 {remote_root}", timeout=30)
         if rc != 0:
-            return {"host": host, "ok": False, "err": f"mkdir failed: {err or out}", "payload": remote_payload_dir}
+            return {"host": host, "ok": False, "err": f"mkdir failed: {err or out}", "payload": remote_payload_dir, "reason": "host_transport"}
         ok, method, sout, serr = rsync_to_host_with_fallback(str(local_path), host, remote_payload_dir)
         if not ok:
-            return {"host": host, "ok": False, "err": f"rsync failed: {serr or sout}"}
+            return {"host": host, "ok": False, "err": f"rsync failed: {serr or sout}", "reason": "host_transport"}
     remote_cmd = (
         rf"mkdir -p {REMOTE_LOG_DIR} && cd $HOME || true && "
         rf"nohup env MANAGER_TAG={tag} PAYLOAD_DIR={remote_payload_dir} bash -lc {shlex.quote(job_command)} "
@@ -111,7 +112,7 @@ def submit_to_host(
         if ps_out.strip():
             return {"host": host, "tag": tag, "pid": pid, "ok": True, "payload": remote_payload_dir}
         else:
-            return {"host": host, "tag": tag, "pid": pid, "ok": False, "err": "pidfile present but process not running", "payload": remote_payload_dir}
+            return {"host": host, "tag": tag, "pid": pid, "ok": False, "err": "pidfile present but process not running", "payload": remote_payload_dir, "reason": "job"}
     rc4, out4, _ = ssh_run(host, "ps -eo pid,cmd | grep -F 'MANAGER_TAG=' | grep -v grep || true", timeout=8)
     if out4:
         try:
@@ -119,7 +120,7 @@ def submit_to_host(
             return {"host": host, "tag": tag, "pid": pid_guess, "ok": True, "payload": remote_payload_dir, "note": "started-no-pidfile"}
         except Exception:
             pass
-    return {"host": host, "tag": tag, "pid": None, "ok": False, "err": err or out, "payload": remote_payload_dir}
+    return {"host": host, "tag": tag, "pid": None, "ok": False, "err": err or out, "payload": remote_payload_dir, "reason": "job"}
 
 def kill_managed_on_host(host, ssh_run=ssh_run, grace_seconds=3):
     cmd = r"""
