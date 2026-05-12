@@ -30,6 +30,7 @@ from ..shared.queue_config import (
     get_configured_queue_source,
     normalize_queue_name,
 )
+from ..shared.run_info import format_epoch
 from ..shared.running_state import load_running_jobs
 from ..shared.worker_actions import kill_managed_on_host, new_job_tag
 from .monitor import (
@@ -94,17 +95,6 @@ def _format_elapsed(started_at):
     hours, rem = divmod(elapsed_seconds, 3600)
     minutes, seconds = divmod(rem, 60)
     return f"{hours:02d}:{minutes:02d}:{seconds:02d}"
-
-
-def _format_epoch(value):
-    if isinstance(value, bool):
-        return ""
-    if isinstance(value, (int, float)):
-        try:
-            return datetime.fromtimestamp(float(value)).strftime("%Y-%m-%d %H:%M:%S")
-        except (OverflowError, OSError, ValueError):
-            return ""
-    return ""
 
 
 def _payload_display_text(item):
@@ -312,7 +302,7 @@ def cmd_deferred(args):
         last_error = (last_error_raw or "-")
         if len(last_error) > 120:
             last_error = last_error[:117] + "..."
-        deferred_at_text = _format_epoch(deferred_at) or "-"
+        deferred_at_text = format_epoch(deferred_at) or "-"
         print(
             f"{i:3d}. [job={job_id_text}] [priority={item['priority']}] [queue={item['queue']}] "
             f"[hosts={hosts_text}] [last_host={last_host or '-'}] [deferred_at={deferred_at_text}] "
@@ -430,7 +420,7 @@ def cmd_enable_host(args):
         now_ts = time.time()
         for host in sorted(cooldowns):
             until_ts = cooldowns[host]
-            until_text = _format_epoch(until_ts) or "-"
+            until_text = format_epoch(until_ts) or "-"
             remaining_seconds = max(0, int(until_ts - now_ts))
             hours, rem = divmod(remaining_seconds, 3600)
             minutes, seconds = divmod(rem, 60)
