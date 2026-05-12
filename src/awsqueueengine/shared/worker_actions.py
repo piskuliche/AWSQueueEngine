@@ -8,7 +8,6 @@
 """
 import uuid
 from datetime import datetime
-from pathlib import Path
 
 from .config import REMOTE_LOG_DIR
 from .ssh_utils import ssh_run

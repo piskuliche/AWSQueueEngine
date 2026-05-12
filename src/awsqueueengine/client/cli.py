@@ -22,7 +22,6 @@ from ..shared.queue_config import (
     normalize_queue_name,
 )
 from ..shared.run_info import (
-    format_epoch,
     read_run_info_file,
     write_local_run_info,
     write_run_info_file,

@@ -5,7 +5,6 @@ Phase 2 will route the SSH enqueue through the JSON-over-SSH protocol
 """
 import shlex
 import subprocess
-import sys
 import tarfile
 import tempfile
 import uuid

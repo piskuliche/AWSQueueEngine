@@ -9,13 +9,6 @@ import subprocess
 import sys
 
 from ..shared.config import SSH_BIN
-# Re-export run.info helpers so existing callers keep working.
-from ..shared.run_info import (  # noqa: F401
-    format_epoch,
-    read_run_info_file,
-    write_local_run_info,
-    write_run_info_file,
-)
 
 
 def proxy_remote_cli(queue_host, remote_argv):
