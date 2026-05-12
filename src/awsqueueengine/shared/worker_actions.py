@@ -6,6 +6,7 @@
   for `stop <host>` and `requeue-running`.
 - `tail_remote_log()`: client calls for `tail <host>`.
 """
+import shlex
 import uuid
 from datetime import datetime
 
@@ -79,13 +80,20 @@ def tail_remote_log(host, lines=200):
     check = check_host_for_tag(host)
     if not check["reachable"]:
         return {"host": host, "ok": False, "reason": "unreachable"}
+    # Tags come from the worker's `ps` output (MANAGER_TAG=...) and the
+    # log filenames it produced. Treat as untrusted input on the shell.
+    try:
+        lines_n = int(lines)
+    except (TypeError, ValueError):
+        lines_n = 200
+    log_dir_q = shlex.quote(REMOTE_LOG_DIR)
     tag = check.get("tag")
     if tag:
         path = f"{REMOTE_LOG_DIR}/{tag}.log"
     else:
-        rc, out, err = ssh_run(host, f"ls -t {REMOTE_LOG_DIR}/*.log 2>/dev/null | head -n1 || true")
+        rc, out, err = ssh_run(host, f"ls -t {log_dir_q}/*.log 2>/dev/null | head -n1 || true")
         if rc != 0 or not out:
             return {"host": host, "ok": True, "tag": None, "out": "(no log found)"}
         path = out.strip()
-    rc, out, err = ssh_run(host, f"tail -n {lines} {path} || true")
+    rc, out, err = ssh_run(host, f"tail -n {lines_n} {shlex.quote(path)} || true")
     return {"host": host, "ok": True, "tag": tag, "out": out, "err": err}
