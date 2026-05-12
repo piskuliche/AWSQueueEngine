@@ -4,7 +4,7 @@ import unittest
 from pathlib import Path
 from unittest.mock import patch
 
-from awsqueueengine.queue_config import QueueConfigSource, host_is_eligible_for_item
+from awsqueueengine.shared.queue_config import QueueConfigSource, host_is_eligible_for_item
 
 
 class QueueConfigTests(unittest.TestCase):

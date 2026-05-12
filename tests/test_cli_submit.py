@@ -406,12 +406,12 @@ class CliSubmitTests(unittest.TestCase):
 
             return Result()
 
-        from awsqueueengine import cli
+        from awsqueueengine.client import cli as client_cli
 
-        with patch("awsqueueengine.cli._upload_payload_archive_to_s3", return_value="s3://bucket/key.tar.gz") as upload, patch(
-            "awsqueueengine.cli._run_remote_submit", side_effect=fake_run_remote_submit
+        with patch("awsqueueengine.client.cli.upload_payload_archive_to_s3", return_value="s3://bucket/key.tar.gz") as upload, patch(
+            "awsqueueengine.client.cli.run_remote_submit", side_effect=fake_run_remote_submit
         ):
-            cli._handle_remote_submit(Args(), "bash run.sh")
+            client_cli.cmd_submit_remote(Args(), "bash run.sh")
 
         upload.assert_called_once()
         self.assertEqual(captured["queue_host"], "queuebox")

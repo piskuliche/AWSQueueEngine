@@ -11,6 +11,8 @@ setup(
     entry_points={
         'console_scripts': [
             'awsqueueengine=awsqueueengine.cli:main',
+            'awsqe-client=awsqueueengine.client.cli:main',
+            'awsqe-host=awsqueueengine.host.cli:main',
         ],
     },
     python_requires='>=3.6',

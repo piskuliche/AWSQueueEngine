@@ -6,6 +6,18 @@ import os
 import threading
 from datetime import datetime
 from pathlib import Path
+
+from ..shared.completion_state import append_completed_records
+from ..shared.deferred_state import append_deferred_job
+from ..shared.host_status import status_all
+from ..shared.queue import build_resume_item, dequeue_for_host, load_queue, save_queue, normalize_job_item
+from ..shared.queue_config import (
+    QueueConfigSource,
+    host_is_eligible_for_item,
+    load_hosts_from_file,
+)
+from ..shared.running_state import load_running_jobs, save_running_jobs
+from ..shared.worker_actions import kill_managed_on_host
 from .config import (
     ALERT_DAILY_EMAIL_LIMIT,
     CHECK_INTERVAL,
@@ -15,13 +27,7 @@ from .config import (
     MAX_SUBMIT_FAILURES,
     MONITOR_STATE_FILE,
 )
-from .host_status import status_all
-from .queue import build_resume_item, dequeue_for_host, load_queue, save_queue, normalize_job_item
-from .queue_config import QueueConfigSource, host_is_eligible_for_item
-from .job_control import submit_to_host, write_run_info, kill_managed_on_host
-from .running_state import load_running_jobs, save_running_jobs
-from .completion_state import append_completed_records
-from .deferred_state import append_deferred_job
+from .job_control import submit_to_host, write_run_info
 from .notifications import parse_email_recipients, send_email
 
 
@@ -37,17 +43,6 @@ def _normalize_hosts(host_values):
         normalized_hosts.append(clean_host)
         seen.add(clean_host)
     return normalized_hosts
-
-
-def load_hosts_from_file(hosts_file):
-    hosts_path = Path(hosts_file).expanduser()
-    raw_text = hosts_path.read_text()
-    parsed_hosts = []
-    for raw_line in raw_text.splitlines():
-        # Strip inline comments and support both comma/whitespace separators.
-        line = raw_line.split("#", 1)[0].replace(",", " ")
-        parsed_hosts.extend(line.split())
-    return _normalize_hosts(parsed_hosts)
 
 
 class _MonitorHostSource:

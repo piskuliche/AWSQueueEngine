@@ -2,7 +2,7 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from awsqueueengine import completion_state
+from awsqueueengine.shared import completion_state
 
 
 class CompletionStateTests(unittest.TestCase):
