@@ -1,14 +1,20 @@
-# Job submission and control
-import uuid
+"""Host-side job placement on worker hosts.
+
+`submit_to_host` is the workhorse called by the monitor. `write_run_info`
+writes the run.info file in the submitter's payload directory.
+"""
 import shlex
-import time
-from datetime import datetime
 from pathlib import Path
 from urllib.parse import urlparse
-from .config import REMOTE_LOG_DIR, SSH_TIMEOUT, HOSTS
-from .ssh_utils import ssh_run
-from .staging import sizeof_local_path_bytes, choose_scratch_on_host, rsync_to_host_with_fallback
-from .queue import load_queue, save_queue, dequeue
+
+from ..shared.config import REMOTE_LOG_DIR, SSH_TIMEOUT
+from ..shared.ssh_utils import ssh_run
+from ..shared.worker_actions import new_job_tag
+from ..shared.worker_staging import (
+    choose_scratch_on_host,
+    rsync_to_host_with_fallback,
+    sizeof_local_path_bytes,
+)
 
 
 def _payload_name_from_s3_uri(payload_s3_uri):
@@ -17,14 +23,6 @@ def _payload_name_from_s3_uri(payload_s3_uri):
     if name.endswith(".tar.gz"):
         name = name[:-7]
     return name or "payload"
-
-
-def new_job_tag():
-    timestamp = datetime.now().strftime("%Y%m%d-%H%M%S")
-    return f"{timestamp}-{uuid.uuid4().hex[:6]}"
-
-
-_new_job_tag = new_job_tag  # backward-compat alias
 
 
 def submit_to_host(
@@ -122,76 +120,6 @@ def submit_to_host(
             pass
     return {"host": host, "tag": tag, "pid": None, "ok": False, "err": err or out, "payload": remote_payload_dir, "reason": "job"}
 
-def kill_managed_on_host(host, ssh_run=ssh_run, grace_seconds=3):
-    cmd = r"""
-pidfiles=$(ls -1 {remote_log_dir}/*.pid 2>/dev/null || true)
-roots=""
-tracked_pidfiles=""
-for pidfile in $pidfiles; do
-  pid=$(cat "$pidfile" 2>/dev/null | tr -d '[:space:]')
-  if [ -z "$pid" ]; then
-    continue
-  fi
-  if ps -p "$pid" -o pid= >/dev/null 2>&1; then
-    roots="$roots $pid"
-    tracked_pidfiles="$tracked_pidfiles $pidfile"
-  fi
-done
-if [ -z "$roots" ]; then
-  roots=$(pgrep -f '[M]ANAGER_TAG=' || true)
-fi
-if [ -n "$roots" ]; then
-  all=""
-  for root in $roots; do
-    queue="$root"
-    descendants="$root"
-    while [ -n "$queue" ]; do
-      next=""
-      for q in $queue; do
-        kids=$(pgrep -P "$q" 2>/dev/null || true)
-        if [ -n "$kids" ]; then
-          next="$next $kids"
-        fi
-      done
-      queue=$(echo $next)
-      if [ -n "$queue" ]; then
-        descendants="$descendants $queue"
-      fi
-    done
-    all="$all $descendants"
-  done
-  final=$(echo $all | tr ' ' '\n' | grep -E '.' | sort -n | uniq | tr '\n' ' ')
-  if [ -n "$final" ]; then
-    kill -TERM $final 2>/dev/null || true
-    sleep {grace}
-    kill -KILL $final 2>/dev/null || true
-  fi
-fi
-for pidfile in $tracked_pidfiles; do
-  rm -f "$pidfile" 2>/dev/null || true
-done
-pkill -f '[p]memd.cuda' || true
-pkill -f '[p]memd.cuda.MPI' || true
-exit 0
-""".format(grace=int(grace_seconds), remote_log_dir=REMOTE_LOG_DIR)
-    rc, out, err = ssh_run(host, cmd)
-    return {"host": host, "rc": rc, "out": out, "err": err}
-
-def tail_remote_log(host, lines=200):
-    from .host_status import check_host_for_tag
-    check = check_host_for_tag(host)
-    if not check["reachable"]:
-        return {"host": host, "ok": False, "reason": "unreachable"}
-    tag = check.get("tag")
-    if tag:
-        path = f"{REMOTE_LOG_DIR}/{tag}.log"
-    else:
-        rc, out, err = ssh_run(host, f"ls -t {REMOTE_LOG_DIR}/*.log 2>/dev/null | head -n1 || true")
-        if rc != 0 or not out:
-            return {"host": host, "ok": True, "tag": None, "out": "(no log found)"}
-        path = out.strip()
-    rc, out, err = ssh_run(host, f"tail -n {lines} {path} || true")
-    return {"host": host, "ok": True, "tag": tag, "out": out, "err": err}
 
 def write_run_info(local_payload_path, jobid, host, remote_payload_path):
     if not local_payload_path:

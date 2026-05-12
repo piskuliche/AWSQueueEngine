@@ -1,6 +1,6 @@
 import json
 
-from .config import COMPLETED_FILE
+from .paths import COMPLETED_FILE
 
 
 def load_completed_jobs():

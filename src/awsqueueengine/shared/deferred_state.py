@@ -1,7 +1,7 @@
 import json
 import time
 
-from .config import DEFERRED_FILE
+from .paths import DEFERRED_FILE
 from .queue import normalize_job_item
 
 

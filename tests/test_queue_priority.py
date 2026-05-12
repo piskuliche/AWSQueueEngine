@@ -2,7 +2,7 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from awsqueueengine import queue
+from awsqueueengine.shared import queue
 
 
 class QueuePriorityTests(unittest.TestCase):

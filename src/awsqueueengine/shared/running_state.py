@@ -1,6 +1,6 @@
 import json
 
-from .config import RUNNING_FILE
+from .paths import RUNNING_FILE
 from .queue import normalize_job_item
 
 

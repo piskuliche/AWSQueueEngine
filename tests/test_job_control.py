@@ -1,8 +1,9 @@
 import unittest
 from unittest.mock import patch
 
-from awsqueueengine.job_control import kill_managed_on_host, submit_to_host
-from awsqueueengine.config import REMOTE_LOG_DIR
+from awsqueueengine.host.job_control import submit_to_host
+from awsqueueengine.shared.worker_actions import kill_managed_on_host
+from awsqueueengine.shared.config import REMOTE_LOG_DIR
 
 
 class KillManagedOnHostTests(unittest.TestCase):
@@ -64,8 +65,8 @@ class SubmitToHostS3PayloadTests(unittest.TestCase):
                 return 0, "1234", ""
             return 0, "", ""
 
-        with patch("awsqueueengine.job_control.choose_scratch_on_host", return_value=("/scratch", 1000)), patch(
-            "awsqueueengine.job_control.ssh_run", side_effect=fake_ssh_run
+        with patch("awsqueueengine.host.job_control.choose_scratch_on_host", return_value=("/scratch", 1000)), patch(
+            "awsqueueengine.host.job_control.ssh_run", side_effect=fake_ssh_run
         ):
             result = submit_to_host(
                 "eci5",
@@ -91,8 +92,8 @@ class SubmitToHostS3PayloadTests(unittest.TestCase):
                 return 1, "", "download failed"
             return 0, "", ""
 
-        with patch("awsqueueengine.job_control.choose_scratch_on_host", return_value=("/scratch", 1000)), patch(
-            "awsqueueengine.job_control.ssh_run", side_effect=fake_ssh_run
+        with patch("awsqueueengine.host.job_control.choose_scratch_on_host", return_value=("/scratch", 1000)), patch(
+            "awsqueueengine.host.job_control.ssh_run", side_effect=fake_ssh_run
         ):
             result = submit_to_host(
                 "eci5",
