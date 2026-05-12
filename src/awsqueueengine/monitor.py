@@ -270,16 +270,25 @@ def _save_host_disabled_until(host_disabled_until):
     _save_monitor_state(state)
 
 
-def _prune_expired_disabled_hosts(host_disabled_until):
-    now_ts = time.time()
-    expired = [host for host, ts in host_disabled_until.items() if ts <= now_ts]
-    if not expired:
-        return False
-    for host in expired:
-        host_disabled_until.pop(host, None)
-        print(f"[INFO] Host {host} cooldown ended; re-enabled.", flush=True)
-    _save_host_disabled_until(host_disabled_until)
-    return True
+def get_host_cooldowns():
+    """Return a {host: until_ts} map of currently-active host cooldowns."""
+    return _load_host_disabled_until()
+
+
+def clear_host_cooldowns(hosts=None, all_hosts=False):
+    """Remove cooldown entries. Returns the list of host names actually cleared."""
+    current = _load_host_disabled_until()
+    if all_hosts:
+        cleared = sorted(current.keys())
+        current = {}
+    else:
+        cleared = []
+        for host in hosts or []:
+            if host in current:
+                cleared.append(host)
+                current.pop(host, None)
+    _save_host_disabled_until(current)
+    return cleared
 
 
 def _load_last_daily_summary_date():
@@ -360,8 +369,12 @@ def _disable_host_and_alert(host, reason, err, job_item, host_disabled_until, al
     else:
         cooldown_seconds = HOST_TRANSPORT_COOLDOWN_SECONDS
     until_ts = time.time() + cooldown_seconds
-    host_disabled_until[host] = until_ts
-    _save_host_disabled_until(host_disabled_until)
+    # Read-modify-write on disk so a concurrent `enable-host` CLI release isn't clobbered.
+    disk_state = _load_host_disabled_until()
+    disk_state[host] = until_ts
+    _save_host_disabled_until(disk_state)
+    host_disabled_until.clear()
+    host_disabled_until.update(disk_state)
     until_text = datetime.fromtimestamp(until_ts).strftime("%Y-%m-%d %H:%M:%S")
     cooldown_minutes = max(1, cooldown_seconds // 60)
     item = normalize_job_item(job_item)
@@ -621,7 +634,12 @@ def monitor_loop(hosts, poll_interval=CHECK_INTERVAL, stop_event: threading.Even
             else:
                 no_hosts_warned = False
 
-            _prune_expired_disabled_hosts(host_disabled_until)
+            refreshed_disabled = _load_host_disabled_until()
+            ended_cooldowns = sorted(set(host_disabled_until) - set(refreshed_disabled))
+            for ended_host in ended_cooldowns:
+                print(f"[INFO] Host {ended_host} cooldown ended or released; eligible again.", flush=True)
+            host_disabled_until.clear()
+            host_disabled_until.update(refreshed_disabled)
             status = status_all(current_hosts)
             free_hosts = [
                 s["host"]

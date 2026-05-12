@@ -15,7 +15,14 @@ from .config import HOSTS, HOSTS_FILE, S3_BUCKET, S3_PREFIX, SSH_BIN
 from .queue import build_resume_item, enqueue_item, load_queue, normalize_job_item, save_queue
 from .queue_config import DEFAULT_QUEUE, QueueConfigSource, get_configured_queue_source, normalize_queue_name
 from .host_status import status_all
-from .monitor import acquire_monitor_lock, load_hosts_from_file, release_monitor_lock, monitor_loop
+from .monitor import (
+    acquire_monitor_lock,
+    clear_host_cooldowns,
+    get_host_cooldowns,
+    load_hosts_from_file,
+    monitor_loop,
+    release_monitor_lock,
+)
 from .job_control import new_job_tag, submit_to_host, tail_remote_log, kill_managed_on_host
 from .staging import sizeof_local_path_bytes, where_is_next_submit
 from .running_state import load_running_jobs
@@ -535,6 +542,26 @@ def main():
         help="Run requeue-deferred against a remote queue host over SSH",
         default=None,
     )
+    p_enable_host = sub.add_parser(
+        "enable-host",
+        help="Show active host cooldowns; with HOST(s) or --all, release them early",
+    )
+    p_enable_host.add_argument(
+        "hosts",
+        nargs="*",
+        help="Host name(s) to release from cooldown (omit to list current cooldowns)",
+    )
+    p_enable_host.add_argument(
+        "--all",
+        "-all",
+        action="store_true",
+        help="Release every host currently in cooldown",
+    )
+    p_enable_host.add_argument(
+        "--queue-host",
+        help="Run against a remote queue host over SSH",
+        default=None,
+    )
     sub.add_parser("start", help="Start monitor loop (runs until Ctrl-C)")
     sub.add_parser("where", help="Show where the next job will be submitted")
     p_start_monitor = sub.add_parser("start-monitor", help="Start the monitor loop (daemon mode)")
@@ -914,6 +941,46 @@ def main():
                 flush=True,
             )
         print(f"{action_label} {len(popped_pairs)} deferred job(s).", flush=True)
+    elif args.cmd == "enable-host":
+        if args.all and args.hosts:
+            print("--all cannot be combined with explicit host names.", flush=True)
+            sys.exit(1)
+
+        if getattr(args, "queue_host", None):
+            remote_argv = ["awsqueueengine", "enable-host"]
+            if args.all:
+                remote_argv.append("--all")
+            else:
+                remote_argv.extend(args.hosts)
+            _proxy_remote_cli(args.queue_host, remote_argv)
+            return
+
+        if not args.all and not args.hosts:
+            cooldowns = get_host_cooldowns()
+            if not cooldowns:
+                print("(no host cooldowns active)", flush=True)
+            else:
+                print(f"{'HOST':12}  {'UNTIL':20}  REMAINING", flush=True)
+                now_ts = time.time()
+                for host in sorted(cooldowns):
+                    until_ts = cooldowns[host]
+                    until_text = _format_epoch(until_ts) or "-"
+                    remaining_seconds = max(0, int(until_ts - now_ts))
+                    hours, rem = divmod(remaining_seconds, 3600)
+                    minutes, seconds = divmod(rem, 60)
+                    remaining_text = f"{hours:02d}:{minutes:02d}:{seconds:02d}"
+                    print(f"{host:12}  {until_text:20}  {remaining_text}", flush=True)
+            return
+
+        cleared = clear_host_cooldowns(hosts=args.hosts or None, all_hosts=args.all)
+        if not cleared:
+            if args.all:
+                print("(no host cooldowns active)", flush=True)
+            else:
+                requested = ", ".join(args.hosts)
+                print(f"No active cooldown for: {requested}", flush=True)
+            return
+        print(f"Released {len(cleared)} host(s) from cooldown: {', '.join(cleared)}", flush=True)
     elif args.cmd == "start-monitor":
         # Prevent double-start
         pid = read_pidfile()
