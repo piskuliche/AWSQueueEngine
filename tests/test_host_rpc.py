@@ -202,6 +202,66 @@ class RequeueDeferredTests(_StateFixture):
         self.assertEqual(resp["error"]["code"], "invalid_params")
 
 
+class TailTests(unittest.TestCase):
+    def setUp(self):
+        self._original = rpc.tail_remote_log
+        self.calls = []
+
+        def fake_tail(host, lines=200):
+            self.calls.append({"host": host, "lines": lines})
+            return {"host": host, "ok": True, "tag": "tag-abc", "out": "line1\nline2\n", "err": ""}
+
+        rpc.tail_remote_log = fake_tail
+
+    def tearDown(self):
+        rpc.tail_remote_log = self._original
+
+    def test_tail_returns_helper_output_passthrough(self):
+        resp = rpc.dispatch({"version": 1, "method": "tail", "params": {"host": "eci5"}})
+        self.assertTrue(resp["ok"], resp)
+        self.assertEqual(resp["result"]["host"], "eci5")
+        self.assertEqual(resp["result"]["tag"], "tag-abc")
+        self.assertEqual(resp["result"]["out"], "line1\nline2\n")
+        self.assertEqual(self.calls, [{"host": "eci5", "lines": 200}])
+
+    def test_tail_passes_lines_param(self):
+        resp = rpc.dispatch({"version": 1, "method": "tail", "params": {"host": "eci5", "lines": 50}})
+        self.assertTrue(resp["ok"])
+        self.assertEqual(self.calls[0]["lines"], 50)
+
+    def test_tail_clamps_lines_to_max(self):
+        resp = rpc.dispatch({"version": 1, "method": "tail", "params": {"host": "eci5", "lines": 999999}})
+        self.assertTrue(resp["ok"])
+        self.assertEqual(self.calls[0]["lines"], 5000)
+
+    def test_tail_clamps_lines_to_min(self):
+        resp = rpc.dispatch({"version": 1, "method": "tail", "params": {"host": "eci5", "lines": 0}})
+        self.assertTrue(resp["ok"])
+        self.assertEqual(self.calls[0]["lines"], 1)
+
+    def test_tail_requires_host(self):
+        resp = rpc.dispatch({"version": 1, "method": "tail", "params": {}})
+        self.assertFalse(resp["ok"])
+        self.assertEqual(resp["error"]["code"], "invalid_params")
+
+    def test_tail_rejects_non_int_lines(self):
+        resp = rpc.dispatch({"version": 1, "method": "tail", "params": {"host": "eci5", "lines": "many"}})
+        self.assertFalse(resp["ok"])
+        self.assertEqual(resp["error"]["code"], "invalid_params")
+
+    def test_tail_returns_unreachable_passthrough(self):
+        def unreachable(host, lines=200):
+            return {"host": host, "ok": False, "reason": "unreachable"}
+
+        rpc.tail_remote_log = unreachable
+        resp = rpc.dispatch({"version": 1, "method": "tail", "params": {"host": "eci5"}})
+        # Application-level "host unreachable" still rides on a successful envelope (ok:True at the RPC layer);
+        # the caller inspects result.ok to decide what to render.
+        self.assertTrue(resp["ok"])
+        self.assertFalse(resp["result"]["ok"])
+        self.assertEqual(resp["result"]["reason"], "unreachable")
+
+
 class EnqueueTests(_StateFixture):
     def setUp(self):
         super().setUp()

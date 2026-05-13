@@ -35,7 +35,7 @@ from ..shared.queue_config import (
     normalize_queue_name,
 )
 from ..shared.running_state import load_running_jobs
-from ..shared.worker_actions import new_job_tag
+from ..shared.worker_actions import new_job_tag, tail_remote_log
 from .monitor import clear_host_cooldowns, get_host_cooldowns
 
 
@@ -270,6 +270,17 @@ def handle_job_info(params: dict) -> dict:
     return {"state": state}
 
 
+def handle_tail(params: dict) -> dict:
+    params = _require_dict(params)
+    host = _require_str(params, "host")
+    lines = _optional_int(params, "lines")
+    if lines is None:
+        lines = 200
+    # Clamp to a sane range so a phone client can't ask the host to ship a 10MB log over SSH.
+    lines = max(1, min(lines, 5000))
+    return tail_remote_log(host, lines=lines)
+
+
 # ---------- registry + dispatcher ----------
 
 METHODS: dict[str, Callable[[dict], dict]] = {
@@ -282,6 +293,7 @@ METHODS: dict[str, Callable[[dict], dict]] = {
     "list_cooldowns": handle_list_cooldowns,
     "enable_host": handle_enable_host,
     "job_info": handle_job_info,
+    "tail": handle_tail,
 }
 
 
