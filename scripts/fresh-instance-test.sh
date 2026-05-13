@@ -115,6 +115,30 @@ else
     echo "       below will likely fail with 'awsqe-host: command not found'."
 fi
 
+section "pre-test cleanup (so repeated runs start from a known state)"
+# Leave ~/.awsqe/client/ alone so a real client config survives; only nuke
+# the host state dir and any legacy / .migrated.bak files.
+rm -rf ~/.awsqe/host
+rm -f ~/.aws_slurm_like_*.json ~/.aws_slurm_like_*.migrated.bak
+echo "(cleared any leftover host state + legacy files)"
+
+section "stage fake legacy state files (to exercise Phase 5 auto-migration)"
+# Simulate an existing pre-Phase-5 queue host: write the legacy ~/.aws_slurm_like_*.json
+# files. The daemon's first start (cmd_monitor) calls auto_migrate_if_needed()
+# which should move them into ~/.awsqe/host/ and rename the originals to
+# *.migrated.bak. After we verify this once, the migrated_at stamp makes
+# subsequent starts a no-op.
+cat > ~/.aws_slurm_like_queue.json <<'JSON'
+[{"cmd": "echo legacy-job-from-pre-phase5", "job_id": "MIGRATED-001", "priority": 0, "queue": "default", "hosts": null, "preempt": false}]
+JSON
+echo '{}' > ~/.aws_slurm_like_running.json
+echo '[]' > ~/.aws_slurm_like_completed.json
+echo '[]' > ~/.aws_slurm_like_deferred.json
+ls -la ~/.aws_slurm_like_*.json
+echo
+echo "preview via awsqe-host migrate --dry-run:"
+awsqe-host migrate --dry-run
+
 section "set sandbox env in user systemd manager"
 # Pin queue at a non-resolvable host so the monitor cannot reach real workers.
 systemctl --user set-environment AWSQUEUEENGINE_QUEUES="${FAKE_QUEUE}"
@@ -125,10 +149,26 @@ systemctl --user show-environment | grep -E '^(AWSQUEUEENGINE_QUEUES|AWSQUEUEENG
 section "user-mode install --dry-run (inspect unit text)"
 awsqe-host install --user --dry-run
 
-section "user-mode install (real)"
+section "user-mode install (real — daemon's auto-migrate fires here)"
 awsqe-host install --user
 sleep 2
 awsqe-host status --user | head -15
+
+section "verify auto-migrate ran on daemon start"
+echo "looking for '[migration]' in journal:"
+journalctl --user -u awsqe-host --no-pager -n 50 | grep -E "migration|migrated" || echo "[FAIL] no [migration] line in journal"
+echo
+echo "new state files at ~/.awsqe/host/:"
+ls -la ~/.awsqe/host/ 2>/dev/null
+echo
+echo "queue.json should contain the legacy MIGRATED-001 job:"
+cat ~/.awsqe/host/queue.json 2>/dev/null | head -5
+echo
+echo ".migrated.bak files (recovery hatch):"
+ls -la ~/.aws_slurm_like_*.migrated.bak 2>/dev/null
+echo
+echo "legacy ~/.aws_slurm_like_*.json (non-bak) — should be gone:"
+ls -la ~/.aws_slurm_like_queue.json 2>&1 | head -1 || true
 
 section "journal first 25 lines"
 journalctl --user -u awsqe-host --no-pager -n 25 || true
@@ -241,8 +281,13 @@ echo "--- queue contents (should be empty list after 'awsqe-host clear'):"
 cat ~/.awsqe/host/queue.json 2>/dev/null || echo "(no queue file)"
 echo "--- running jobs:"
 cat ~/.awsqe/host/running.json 2>/dev/null || echo "(no running file)"
-echo "--- legacy *.migrated.bak files (should be empty on a fresh AMI):"
-ls -la ~/.aws_slurm_like_*.migrated.bak 2>/dev/null || echo "(none — expected on fresh instance)"
+echo "--- legacy *.migrated.bak files (from the migration test above):"
+ls -la ~/.aws_slurm_like_*.migrated.bak 2>/dev/null || echo "(none)"
+
+section "remove migration test artifacts so repeated runs start fresh"
+rm -f ~/.aws_slurm_like_*.json ~/.aws_slurm_like_*.migrated.bak
+rm -rf ~/.awsqe/host
+echo "(migration test artifacts removed; ~/.awsqe/client/ left in place)"
 
 section "done"
 EOF
