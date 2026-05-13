@@ -1,17 +1,15 @@
-"""Client-side submit helpers: archive payload, upload to S3, SSH-enqueue.
+"""Client-side submit helpers: archive payload and upload to S3.
 
-Phase 2 will route the SSH enqueue through the JSON-over-SSH protocol
-(`shared/rpc_client.py`) instead of re-invoking the legacy CLI.
+After Phase 2, the actual enqueue happens over the JSON-over-SSH RPC
+(:mod:`awsqueueengine.shared.rpc_client`), so the SSH/CLI-proxy helpers
+that used to live here are gone — see git history for the legacy form.
 """
-import shlex
-import subprocess
 import tarfile
 import tempfile
 import uuid
 from datetime import datetime
 from pathlib import Path
 
-from ..shared.config import SSH_BIN
 from .config import S3_BUCKET, S3_PREFIX
 
 
@@ -56,32 +54,3 @@ def upload_payload_archive_to_s3(archive_path, payload_name):
     key = "/".join(key_parts)
     boto3.client("s3").upload_file(str(archive_path), S3_BUCKET, key)
     return f"s3://{S3_BUCKET}/{key}"
-
-
-def build_remote_submit_argv(args, command, payload_s3_uri=None, payload_size_bytes=None, job_id=None):
-    argv = ["awsqueueengine", "submit"]
-    queue_name = getattr(args, "queue", None) or getattr(args, "host_set", None)
-    if queue_name:
-        argv.extend(["--queue", queue_name])
-    if getattr(args, "hosts", None):
-        for host_value in args.hosts:
-            argv.extend(["--hosts", host_value])
-    if args.priority is not None:
-        argv.extend(["--priority", str(args.priority)])
-    elif args.high_priority:
-        argv.append("--high-priority")
-    if getattr(args, "preempt", False):
-        argv.append("--preempt")
-    if payload_s3_uri:
-        argv.extend(["--payload-s3-uri", payload_s3_uri])
-    if payload_size_bytes is not None:
-        argv.extend(["--payload-size-bytes", str(payload_size_bytes)])
-    if job_id:
-        argv.extend(["--job-id", job_id])
-    argv.append(command)
-    return argv
-
-
-def run_remote_submit(queue_host, remote_argv):
-    remote_cmd = shlex.join(remote_argv)
-    return subprocess.run([SSH_BIN, queue_host, remote_cmd], capture_output=True, text=True, check=False)
