@@ -326,4 +326,10 @@ def logs(*, user_mode: bool, follow: bool, lines: int | None, dry_run: bool) -> 
     if dry_run:
         print(f"[dry-run] {' '.join(argv)}", flush=True)
         return 0
-    return subprocess.run(argv).returncode
+    try:
+        return subprocess.run(argv).returncode
+    except KeyboardInterrupt:
+        # `awsqe-host logs -f` blocks indefinitely; Ctrl-C is the documented
+        # way to exit. Swallow it so the user gets a clean shell prompt back
+        # instead of a multi-line traceback. SIGINT exit code is 128+2=130.
+        return 130
