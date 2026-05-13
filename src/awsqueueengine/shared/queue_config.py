@@ -19,6 +19,7 @@ defaults instead of the real config.
 """
 import json
 import os
+import sys
 from pathlib import Path
 
 from .config import HOSTS
@@ -218,9 +219,13 @@ class QueueConfigSource:
             file_stamp = self._compute_file_stamp(active_file)
             if file_stamp is None:
                 if not self._missing_file_warned:
+                    # stderr, not stdout — `awsqe-host rpc` writes its JSON response
+                    # to stdout, and any text mixed in breaks the protocol on the
+                    # client side. Systemd still captures stderr to journald.
                     print(
                         f"[WARN] Queue hosts file not found: {active_file}. "
                         f"Keeping previous queue config ({len(self.all_hosts())} host(s)).",
+                        file=sys.stderr,
                         flush=True,
                     )
                     self._missing_file_warned = True
@@ -238,6 +243,7 @@ class QueueConfigSource:
                 print(
                     f"[WARN] Failed to read queue hosts file {active_file}: {exc}. "
                     f"Keeping previous queue config ({len(self.all_hosts())} host(s)).",
+                    file=sys.stderr,
                     flush=True,
                 )
                 self._last_file_stamp = file_stamp
@@ -247,6 +253,7 @@ class QueueConfigSource:
                 print(
                     f"[INFO] Queue hosts updated from {active_file}: "
                     f"{len(next_queues)} queue(s), {len(_all_hosts(next_queues))} host(s)",
+                    file=sys.stderr,
                     flush=True,
                 )
                 self._queues = next_queues
