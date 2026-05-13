@@ -19,7 +19,7 @@ Install AWSQueueEngine locally and make sure you can SSH to the queue host:
 
 ```bash
 pip install .
-ssh queue-manager 'awsqueueengine status-monitor'
+ssh queue-manager 'awsqe-host status'
 ```
 
 Configure the client once so you don't have to pass `--queue-host` on every
@@ -69,8 +69,33 @@ cat > /home/ubuntu/awsqueueengine_queues.json <<'JSON'
 }
 JSON
 export AWSQUEUEENGINE_QUEUES_FILE="/home/ubuntu/awsqueueengine_queues.json"
-nohup awsqueueengine start-monitor >> ~/aws_queue_manager.log 2>&1 &
 ```
+
+Run the monitor as a systemd service (recommended):
+
+```bash
+# System-wide unit (requires sudo). Writes /etc/systemd/system/awsqe-host.service,
+# runs daemon-reload, and enables --now. Runs as $SUDO_USER so the daemon owns
+# the same ~/.aws_slurm_like_*.json files you already have.
+sudo awsqe-host install
+sudo awsqe-host status       # or `awsqe-host logs -f` to tail the journal
+```
+
+Per-user variant (no root; lives at `~/.config/systemd/user/awsqe-host.service`):
+
+```bash
+awsqe-host install --user
+loginctl enable-linger $USER   # so the daemon survives logout
+awsqe-host logs --user -f
+```
+
+Other daemon verbs: `start | stop | restart | status | logs | uninstall`. All
+accept `--user` (for per-user units) and `--dry-run` (prints what would happen).
+If systemd isn't available, `awsqe-host start` falls back to a foreground run
+that you can Ctrl-C — no `nohup &` pattern needed.
+
+Legacy `awsqueueengine start-monitor` still works for backward compatibility
+(foreground + pidfile) and is removed in a later release.
 
 The queue config is the single source of truth for worker assignment. Edit this
 file to move hosts between user queues; the monitor reloads it while running.
@@ -108,9 +133,10 @@ awsqueueengine list
 awsqueueengine qstat
 awsqueueengine qdel 2
 awsqueueengine qdel 1 3
-awsqueueengine start-monitor
-awsqueueengine status-monitor
-awsqueueengine stop-monitor
+awsqe-host start              # systemctl-aware; foreground fallback if no systemd
+awsqe-host status
+awsqe-host stop
+awsqe-host logs -f            # tail the daemon's journal
 awsqueueengine tail eci3
 awsqueueengine stop eci3
 awsqueueengine clear
@@ -172,16 +198,17 @@ The file form is preferred for live changes because the monitor reloads it each
 poll; environment variables are read from the running process environment.
 
 
-Suggested to run with:
+Suggested to run with systemd (see "Remote queue host setup" above):
 
 ```bash
- nohup awsqueueengine start-monitor >> ~/aws_queue_manager.log 2>&1 &
+sudo awsqe-host install
+sudo awsqe-host logs -f
 ```
 
-Or, for development, run directly:
+For development you can run the monitor in the foreground (Ctrl-C to stop):
 
 ```bash
-python -m cli list
+awsqe-host monitor
 ```
 
 ## Email Alerts (Mailtrap API)

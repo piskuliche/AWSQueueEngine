@@ -148,7 +148,7 @@ def main():
         host_cli.cmd_job_info(args)
         return
     if cmd == "start-monitor":
-        host_cli.cmd_start_monitor(args)
+        host_cli.cmd_monitor(args)
         return
     if cmd == "stop-monitor":
         host_cli.cmd_stop_monitor(args)
