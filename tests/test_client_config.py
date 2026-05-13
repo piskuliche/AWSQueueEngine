@@ -126,6 +126,49 @@ class LoadConfigTests(TempConfigFixture):
         self.assertIn("experimental", cfg.extra)
         self.assertEqual(cfg.extra["experimental"]["feature_x"], "on")
 
+    def test_known_key_with_wrong_type_is_preserved_in_extras(self):
+        # A user hand-edits the file and accidentally writes `bucket = 42`.
+        # We must NOT drop their value silently on the next save.
+        self.config_path.parent.mkdir(parents=True, exist_ok=True)
+        self.config_path.write_text('[s3]\nbucket = 42\n')
+        cfg = load_config()
+        self.assertIsNone(cfg.s3_bucket)  # typed field ignored (wrong type)
+        self.assertEqual(cfg.extra.get("s3", {}).get("bucket"), 42)
+
+    def test_known_key_wrong_type_round_trips_through_save(self):
+        self.config_path.parent.mkdir(parents=True, exist_ok=True)
+        self.config_path.write_text('[s3]\nbucket = 42\nprefix = "ok"\n')
+        cfg = load_config()
+        # prefix is a valid string; bucket is a stray int that should survive.
+        self.assertEqual(cfg.s3_prefix, "ok")
+        self.assertEqual(cfg.extra.get("s3", {}).get("bucket"), 42)
+        save_config(cfg)
+        reloaded = load_config()
+        self.assertEqual(reloaded.s3_prefix, "ok")
+        self.assertEqual(reloaded.extra.get("s3", {}).get("bucket"), 42)
+
+    def test_user_correction_overrides_preserved_wrong_type(self):
+        # Bad value in file → load → set_value → save → file has the new
+        # typed value, the old stray int is gone.
+        self.config_path.parent.mkdir(parents=True, exist_ok=True)
+        self.config_path.write_text('[s3]\nbucket = 42\n')
+        cfg = load_config()
+        set_value(cfg, "s3.bucket", "real-bucket")
+        save_config(cfg)
+        reloaded = load_config()
+        self.assertEqual(reloaded.s3_bucket, "real-bucket")
+        self.assertNotEqual(reloaded.extra.get("s3", {}).get("bucket"), 42)
+
+    def test_known_key_wrong_type_emits_warning_to_stderr(self):
+        self.config_path.parent.mkdir(parents=True, exist_ok=True)
+        self.config_path.write_text('[default]\nqueue_host = 99\n')
+        import contextlib, io
+        buf = io.StringIO()
+        with contextlib.redirect_stderr(buf):
+            load_config()
+        self.assertIn("default.queue_host", buf.getvalue())
+        self.assertIn("wrong type", buf.getvalue())
+
 
 class SaveAndRoundTripTests(TempConfigFixture):
     def test_save_creates_parent_directory(self):

@@ -110,14 +110,29 @@ def load_config(path: Path | None = None) -> ClientConfig:
             continue
         for key, value in table.items():
             pair = (section, key)
+            consumed = False
             if pair == ("default", "queue_host") and isinstance(value, str):
                 config.queue_host = value.strip() or None
+                consumed = True
             elif pair == ("s3", "bucket") and isinstance(value, str):
                 config.s3_bucket = value.strip() or None
+                consumed = True
             elif pair == ("s3", "prefix") and isinstance(value, str):
                 config.s3_prefix = value.strip().strip("/") or None
-            elif pair not in known_pairs:
-                config.extra.setdefault(section, {})[key] = value
+                consumed = True
+            if consumed:
+                continue
+            # A known key with the wrong type would otherwise be silently
+            # dropped on the next save. Stash it in `extra` so save_config
+            # round-trips it and warn so the user knows to clean it up.
+            if pair in known_pairs:
+                print(
+                    f"[WARN] config: {section}.{key} has wrong type "
+                    f"({type(value).__name__}); preserving as-is and ignoring it.",
+                    file=sys.stderr,
+                    flush=True,
+                )
+            config.extra.setdefault(section, {})[key] = value
     return config
 
 
