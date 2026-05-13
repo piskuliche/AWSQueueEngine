@@ -162,11 +162,20 @@ def _render_toml_value(value: Any) -> str:
         return str(value)
     if isinstance(value, float):
         return repr(value)
-    if isinstance(value, str):
-        escaped = value.replace("\\", "\\\\").replace('"', '\\"')
-        return f'"{escaped}"'
-    # Anything else: fall back to a quoted repr so we don't crash on extras.
-    return f'"{str(value)}"'
+    # Strings AND any non-numeric extra value (e.g. things tomllib gave us as
+    # lists/dicts under `extra`) get coerced to text and routed through the
+    # same TOML basic-string escape, so the output is always valid TOML on
+    # save — never invalid syntax just because str(value) happened to contain
+    # a quote or backslash.
+    text = value if isinstance(value, str) else str(value)
+    escaped = (
+        text.replace("\\", "\\\\")
+            .replace('"', '\\"')
+            .replace("\n", "\\n")
+            .replace("\r", "\\r")
+            .replace("\t", "\\t")
+    )
+    return f'"{escaped}"'
 
 
 # ---------- precedence resolution ----------

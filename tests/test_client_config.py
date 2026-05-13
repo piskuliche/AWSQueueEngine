@@ -148,6 +148,28 @@ class SaveAndRoundTripTests(TempConfigFixture):
         self.assertEqual(loaded.queue_host, "q1")
         self.assertEqual(loaded.extra.get("keep_me"), {"k": "v"})
 
+    def test_extras_with_special_chars_round_trip_without_breaking_toml(self):
+        # Quotes, backslashes, tabs, newlines in an extra value must be
+        # escaped on save so the file remains valid TOML.
+        tricky = 'has "quote" and \\backslash\\ and\ttab\nand newline'
+        cfg = ClientConfig(queue_host="q1", extra={"extras": {"note": tricky}})
+        save_config(cfg)
+        # The file must still parse as valid TOML.
+        loaded = load_config()
+        self.assertEqual(loaded.queue_host, "q1")
+        self.assertEqual(loaded.extra.get("extras"), {"note": tricky})
+
+    def test_extras_with_non_string_value_round_trip_as_text(self):
+        # tomllib hands us lists/dicts/ints for some unknown keys; the
+        # emitter must not produce invalid TOML on save. Numbers stay
+        # numeric, everything else degrades to a quoted string.
+        cfg = ClientConfig(queue_host="q1", extra={"extras": {"weird": ["a", 'b"c']}})
+        save_config(cfg)
+        # Parses without error — that's the load-bearing assertion.
+        loaded = load_config()
+        self.assertEqual(loaded.queue_host, "q1")
+        self.assertIn("weird", loaded.extra.get("extras", {}))
+
     def test_save_is_atomic_when_possible(self):
         cfg = ClientConfig(queue_host="q")
         save_config(cfg)
