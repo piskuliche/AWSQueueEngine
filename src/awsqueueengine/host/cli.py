@@ -14,6 +14,7 @@ import time
 from datetime import datetime
 from pathlib import Path
 
+from ..shared.cli_utils import join_command_argv
 from ..shared.config import HOSTS, HOSTS_FILE
 from ..shared.deferred_state import load_deferred_jobs, pop_all_deferred, pop_deferred_by_indices
 from ..shared.job_lookup import lookup_job_state
@@ -638,7 +639,7 @@ def dispatch(args, parser=None):
         if not args.command:
             print("No command provided.", flush=True)
             sys.exit(1)
-        command = " ".join(args.command).strip()
+        command = join_command_argv(args.command)
         if not command:
             print("No command provided.", flush=True)
             sys.exit(1)

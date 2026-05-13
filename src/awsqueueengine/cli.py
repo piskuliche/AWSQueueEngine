@@ -16,6 +16,7 @@ from pathlib import Path
 from .client import cli as client_cli
 from .client.config import effective_queue_host
 from .host import cli as host_cli
+from .shared.cli_utils import join_command_argv
 
 
 def _build_parser():
@@ -172,7 +173,7 @@ def main():
         if args.queue and args.hosts:
             print("--queue and --hosts cannot be used together.", flush=True)
             sys.exit(1)
-        command = " ".join(args.command).strip()
+        command = join_command_argv(args.command)
         if not command:
             print("No command provided.", flush=True)
             sys.exit(1)

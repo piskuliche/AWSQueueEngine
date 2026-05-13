@@ -146,9 +146,22 @@ section "system-mode install --dry-run (preview only)"
 # unit is already running; running both side-by-side would have two daemons
 # competing for the same state files. Dry-run is enough to confirm the
 # system-mode unit generator works in this environment.
-sudo -n true 2>/dev/null \
-    && sudo awsqe-host install --dry-run \
-    || echo "(skipped: no passwordless sudo available on this host)"
+#
+# Heads up: this often fails with a PackageNotFoundError when the package
+# was installed via `pip install --user` as the regular user, because root's
+# Python has no metadata for it. That's a deployment-pattern detail, not a
+# Phase 4 bug: a production system install would use `sudo pip install -e .`
+# (or a venv) so root can resolve `awsqueueengine`. We don't fix it here
+# because the user-mode path already passed the lifecycle test above.
+if ! sudo -n true 2>/dev/null; then
+    echo "(skipped: no passwordless sudo on this host)"
+elif ! sudo python3 -c "import importlib.metadata; importlib.metadata.distribution('awsqueueengine')" 2>/dev/null; then
+    echo "(skipped: root's Python can't find awsqueueengine — expected with"
+    echo " pip install --user. For a real system install, use sudo pip install"
+    echo " or a system-wide venv.)"
+else
+    sudo awsqe-host install --dry-run || echo "(system-mode dry-run failed; see traceback above)"
+fi
 EOF
 
 # --- 3. client → host RPC tests from THIS dev box --------------------------
