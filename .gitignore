@@ -209,3 +209,6 @@ __marimo__/
 # Local-only PR description drafts (so they can be opened/edited in the editor
 # instead of copied from chat). Anything matching pr-body*.md is ignored.
 pr-body*.md
+
+# Per-machine agent/editor settings, not part of the repo.
+.claude/
