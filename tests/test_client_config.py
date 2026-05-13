@@ -1,7 +1,10 @@
 """Tests for awsqueueengine.client.config."""
+import contextlib
+import io
 import os
 import tempfile
 import unittest
+from argparse import Namespace
 from pathlib import Path
 from unittest.mock import patch
 
@@ -246,6 +249,29 @@ class EffectiveS3Tests(TempConfigFixture):
     def test_env_prefix_is_stripped_of_slashes(self):
         with patch.dict(os.environ, {"AWSQUEUEENGINE_S3_PREFIX": "/foo/bar/"}):
             self.assertEqual(effective_s3_prefix(), "foo/bar")
+
+
+class CmdConfigSetTests(TempConfigFixture):
+    """Cover the cli `config set` handler's confirmation message."""
+
+    def _run_cmd_set(self, key, value):
+        from awsqueueengine.client.cli import cmd_config_set
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            cmd_config_set(Namespace(key=key, value=value))
+        return buf.getvalue()
+
+    def test_echoes_normalized_value_for_s3_prefix(self):
+        output = self._run_cmd_set("s3.prefix", "  foo/bar/  ")
+        self.assertIn("'foo/bar'", output)
+        self.assertNotIn("'  foo/bar/  '", output)
+        # And the on-disk value matches what we echoed.
+        loaded = load_config()
+        self.assertEqual(loaded.s3_prefix, "foo/bar")
+
+    def test_echoes_raw_value_when_no_normalization_applies(self):
+        output = self._run_cmd_set("queue-host", "queue-manager")
+        self.assertIn("'queue-manager'", output)
 
 
 if __name__ == "__main__":

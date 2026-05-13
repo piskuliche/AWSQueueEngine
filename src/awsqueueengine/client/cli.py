@@ -475,7 +475,10 @@ def cmd_config_set(args):
     cfg = load_config()
     set_value(cfg, key, args.value)
     path = save_config(cfg)
-    print(f"Set {key} = {args.value!r} in {path}", flush=True)
+    # Echo what was actually persisted, not the raw input — set_value normalizes
+    # some keys (e.g. s3.prefix strips whitespace and slashes).
+    stored = client_config.get_value(cfg, key)
+    print(f"Set {key} = {stored!r} in {path}", flush=True)
 
 
 def cmd_config_unset(args):
