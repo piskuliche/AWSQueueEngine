@@ -4,6 +4,9 @@ A Slurm-like SSH job manager for AWS GPU hosts, with payload staging and monitor
 
 ## Installation
 
+Requires **Python 3.10+** on both the local submitter and the queue host
+(the codebase uses PEP 604 union annotations).
+
 Install the package anywhere you will run the CLI:
 
 ```bash
