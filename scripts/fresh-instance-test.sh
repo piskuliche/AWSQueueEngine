@@ -237,7 +237,7 @@ systemctl --user show-environment | grep AWSQUEUEENGINE_QUEUES || echo "(QUEUES 
 
 section "state files in remote ~/ "
 ls -la ~/.aws_slurm_like_* 2>/dev/null | head
-echo "--- queue contents (should be empty list after `clear`):"
+echo "--- queue contents (should be empty list after 'awsqe-host clear'):"
 cat ~/.aws_slurm_like_queue.json 2>/dev/null || echo "(no queue file)"
 echo "--- running jobs:"
 cat ~/.aws_slurm_like_running.json 2>/dev/null || echo "(no running file)"
