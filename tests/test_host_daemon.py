@@ -70,6 +70,68 @@ class RenderUnitTests(unittest.TestCase):
         self.assertIn("-m awsqueueengine.host.cli monitor", result)
 
 
+class SystemModeRootCheckTests(unittest.TestCase):
+    """Install/uninstall in system mode must return 1 (not sys.exit) when not root,
+    and the os.geteuid() lookup must be guarded for non-POSIX platforms."""
+
+    def test_user_mode_never_requires_root(self):
+        plan = daemon.resolve_plan(user_mode=True)
+        self.assertFalse(daemon._system_mode_needs_root(plan))
+
+    def test_system_mode_requires_root_when_not_root(self):
+        plan = daemon.resolve_plan(user_mode=False)
+        with patch("awsqueueengine.host.daemon.os.geteuid", return_value=1000):
+            self.assertTrue(daemon._system_mode_needs_root(plan))
+
+    def test_system_mode_satisfied_when_running_as_root(self):
+        plan = daemon.resolve_plan(user_mode=False)
+        with patch("awsqueueengine.host.daemon.os.geteuid", return_value=0):
+            self.assertFalse(daemon._system_mode_needs_root(plan))
+
+    def test_platforms_without_geteuid_are_not_blocked(self):
+        plan = daemon.resolve_plan(user_mode=False)
+        # Simulate Windows: os has no geteuid. Use delattr-and-restore.
+        original = daemon.os.geteuid
+        del daemon.os.geteuid
+        try:
+            self.assertFalse(daemon._system_mode_needs_root(plan))
+        finally:
+            daemon.os.geteuid = original
+
+    def test_install_system_mode_returns_1_when_not_root_instead_of_sysexit(self):
+        buf_err = io.StringIO()
+        with patch("awsqueueengine.host.daemon.systemctl_available", return_value=True), \
+             patch("awsqueueengine.host.daemon.os.geteuid", return_value=1000), \
+             contextlib.redirect_stderr(buf_err):
+            rc = daemon.install(user_mode=False, force=False, dry_run=True)
+        self.assertEqual(rc, 1)
+        self.assertIn("requires root", buf_err.getvalue())
+
+    def test_uninstall_system_mode_returns_1_when_not_root_instead_of_sysexit(self):
+        buf_err = io.StringIO()
+        with patch("awsqueueengine.host.daemon.os.geteuid", return_value=1000), \
+             contextlib.redirect_stderr(buf_err):
+            rc = daemon.uninstall(user_mode=False, dry_run=True)
+        self.assertEqual(rc, 1)
+        self.assertIn("requires root", buf_err.getvalue())
+
+
+class FallbackReturnCodeTests(unittest.TestCase):
+    """stop/status fallbacks (no systemctl) propagate cmd_*_monitor's int return."""
+
+    def test_stop_fallback_propagates_int_from_cmd_stop_monitor(self):
+        with patch("awsqueueengine.host.daemon.systemctl_available", return_value=False), \
+             patch("awsqueueengine.host.cli.cmd_stop_monitor", return_value=7):
+            rc = daemon.stop(user_mode=True, dry_run=False)
+        self.assertEqual(rc, 7)
+
+    def test_status_fallback_propagates_int_from_cmd_status_monitor(self):
+        with patch("awsqueueengine.host.daemon.systemctl_available", return_value=False), \
+             patch("awsqueueengine.host.cli.cmd_status_monitor", return_value=42):
+            rc = daemon.status(user_mode=True, dry_run=False)
+        self.assertEqual(rc, 42)
+
+
 class DryRunInstallTests(unittest.TestCase):
     def _install(self, **kwargs):
         buf = io.StringIO()

@@ -476,31 +476,38 @@ def cmd_monitor(args):
         release_monitor_lock(fd)
 
 
-def cmd_stop_monitor(args):
+def cmd_stop_monitor(args) -> int:
+    """Send SIGTERM to the pidfile-tracked monitor. Returns 0 on success, 1 on
+    'nothing to stop'. Returns int instead of sys.exiting so callers (the
+    daemon module's fallback, the legacy shim) can route the exit code themselves."""
     pid = read_pidfile()
     if not pid:
         print("Monitor not running (no pidfile).", flush=True)
-        sys.exit(1)
+        return 1
 
     if not pid_is_running(pid):
         print(f"Stale pidfile found (pid={pid}); cleaning up.", flush=True)
         remove_pidfile()
-        sys.exit(1)
+        return 1
 
     print(f"Stopping monitor (pid={pid})...", flush=True)
     os.kill(pid, signal.SIGTERM)
+    return 0
 
 
-def cmd_status_monitor(args):
+def cmd_status_monitor(args) -> int:
+    """Report monitor running/not-running. Returns 0 if running, 1 otherwise,
+    so the exit code is scriptable from CI / health checks."""
     pid = read_pidfile()
     if not pid:
         print("Monitor not running.", flush=True)
-        return
+        return 1
 
     if pid_is_running(pid):
         print(f"Monitor running (pid={pid})", flush=True)
-    else:
-        print(f"Monitor NOT running (stale pidfile pid={pid})", flush=True)
+        return 0
+    print(f"Monitor NOT running (stale pidfile pid={pid})", flush=True)
+    return 1
 
 
 def cmd_test_email():

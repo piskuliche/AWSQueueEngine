@@ -155,17 +155,27 @@ def _remove_unit(plan: UnitPlan, *, dry_run: bool) -> bool:
     return True
 
 
-def _require_root_if_system_mode(plan: UnitPlan) -> None:
+def _system_mode_needs_root(plan: UnitPlan) -> bool:
+    """Return True if this is a system-mode op that requires root but isn't running as it.
+
+    Guarded with ``hasattr(os, "geteuid")`` so the module imports cleanly on
+    Windows (where systemctl wouldn't be available anyway, so the verbs would
+    already have errored out earlier on missing systemctl).
+    """
     if plan.user_mode:
-        return
-    if os.geteuid() != 0:
-        print(
-            "System install requires root. Re-run with sudo, or pass --user "
-            "to install a per-user unit at ~/.config/systemd/user/.",
-            flush=True,
-            file=sys.stderr,
-        )
-        sys.exit(1)
+        return False
+    if not hasattr(os, "geteuid"):
+        return False
+    return os.geteuid() != 0
+
+
+def _print_root_required() -> None:
+    print(
+        "System install requires root. Re-run with sudo, or pass --user "
+        "to install a per-user unit at ~/.config/systemd/user/.",
+        flush=True,
+        file=sys.stderr,
+    )
 
 
 # ---------- public verbs ----------
@@ -180,7 +190,9 @@ def install(*, user_mode: bool, force: bool, dry_run: bool) -> int:
         )
         return 1
     plan = resolve_plan(user_mode)
-    _require_root_if_system_mode(plan)
+    if _system_mode_needs_root(plan):
+        _print_root_required()
+        return 1
     if plan.unit_path.exists() and not force:
         print(
             f"Unit already exists at {plan.unit_path}. Pass --force to overwrite.",
@@ -205,7 +217,9 @@ def install(*, user_mode: bool, force: bool, dry_run: bool) -> int:
 
 def uninstall(*, user_mode: bool, dry_run: bool) -> int:
     plan = resolve_plan(user_mode)
-    _require_root_if_system_mode(plan)
+    if _system_mode_needs_root(plan):
+        _print_root_required()
+        return 1
     if systemctl_available():
         _run([*plan.systemctl_args, "disable", "--now", SERVICE_NAME], dry_run=dry_run)
     removed = _remove_unit(plan, dry_run=dry_run)
@@ -261,8 +275,7 @@ def stop(*, user_mode: bool, dry_run: bool) -> int:
         return 0
     from .cli import cmd_stop_monitor
 
-    cmd_stop_monitor(None)
-    return 0
+    return cmd_stop_monitor(None)
 
 
 def restart(*, user_mode: bool, dry_run: bool) -> int:
@@ -288,8 +301,7 @@ def status(*, user_mode: bool, dry_run: bool) -> int:
         return 0
     from .cli import cmd_status_monitor
 
-    cmd_status_monitor(None)
-    return 0
+    return cmd_status_monitor(None)
 
 
 def logs(*, user_mode: bool, follow: bool, lines: int | None, dry_run: bool) -> int:

@@ -151,11 +151,9 @@ def main():
         host_cli.cmd_monitor(args)
         return
     if cmd == "stop-monitor":
-        host_cli.cmd_stop_monitor(args)
-        return
+        sys.exit(host_cli.cmd_stop_monitor(args))
     if cmd == "status-monitor":
-        host_cli.cmd_status_monitor(args)
-        return
+        sys.exit(host_cli.cmd_status_monitor(args))
 
     # DUAL subcommands: --queue-host routes to client; otherwise host.
     if cmd == "submit":
