@@ -592,6 +592,49 @@ class CliSubmitTests(unittest.TestCase):
         self.assertNotIn("Starting the queue engine", res.stdout)
         self.assertIn("(queue empty)", res.stdout)
 
+    def _write_client_config(self, body):
+        cfg_dir = self.home_path / ".awsqe" / "client"
+        cfg_dir.mkdir(parents=True, exist_ok=True)
+        (cfg_dir / "config.toml").write_text(body)
+
+    def test_legacy_list_uses_config_queue_host_when_flag_omitted(self):
+        # With `~/.awsqe/client/config.toml` providing `queue_host`, the legacy
+        # `awsqueueengine list` (no --queue-host) must route via SSH/RPC, not
+        # read the local queue file.
+        self._write_client_config('[default]\nqueue_host = "configbox"\n')
+        capture_path = self.home_path / "ssh_args.txt"
+        stdin_path = self.home_path / "ssh_stdin.txt"
+        fake_ssh_dir = self._make_fake_ssh_rpc(capture_path, stdin_path, result={"jobs": []})
+
+        res = self._run_cli_with_path_prefix(fake_ssh_dir, "list")
+
+        self.assertEqual(res.returncode, 0, msg=res.stdout + res.stderr)
+        captured = capture_path.read_text().splitlines()
+        self.assertEqual(captured[0], "configbox")
+        self.assertEqual(captured[1], "awsqe-host")
+        self.assertEqual(captured[2], "rpc")
+        request = json.loads(stdin_path.read_text())
+        self.assertEqual(request["method"], "list")
+
+    def test_legacy_list_falls_back_to_local_when_config_unset(self):
+        # No config file → no queue_host → reads the local queue file as before.
+        res = self._run_cli("list")
+
+        self.assertEqual(res.returncode, 0)
+        self.assertIn("(queue empty)", res.stdout)
+
+    def test_cli_flag_overrides_config_queue_host(self):
+        self._write_client_config('[default]\nqueue_host = "configbox"\n')
+        capture_path = self.home_path / "ssh_args.txt"
+        stdin_path = self.home_path / "ssh_stdin.txt"
+        fake_ssh_dir = self._make_fake_ssh_rpc(capture_path, stdin_path, result={"jobs": []})
+
+        res = self._run_cli_with_path_prefix(fake_ssh_dir, "list", "--queue-host", "flagbox")
+
+        self.assertEqual(res.returncode, 0, msg=res.stdout + res.stderr)
+        captured = capture_path.read_text().splitlines()
+        self.assertEqual(captured[0], "flagbox")
+
 
 if __name__ == "__main__":
     unittest.main()

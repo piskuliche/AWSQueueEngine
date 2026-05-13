@@ -22,15 +22,33 @@ pip install .
 ssh queue-manager 'awsqueueengine status-monitor'
 ```
 
-For S3-backed payload submit, configure AWS credentials locally with write access
-to the payload bucket, then set:
+Configure the client once so you don't have to pass `--queue-host` on every
+invocation. Settings live in `~/.awsqe/client/config.toml`:
 
 ```bash
-export AWSQUEUEENGINE_S3_BUCKET="my-queue-payload-bucket"
-export AWSQUEUEENGINE_S3_PREFIX="awsqueueengine/payloads"  # optional
+awsqe-client config set queue-host queue-manager
+awsqe-client config set s3.bucket   my-queue-payload-bucket
+awsqe-client config set s3.prefix   awsqueueengine/payloads   # optional; defaults to this
+awsqe-client config show                                       # inspect what's set
 ```
 
-Submit through the remote queue host:
+Resolution precedence for each setting is **CLI flag > env var > config > error**.
+The legacy `awsqueueengine` CLI also reads this file, so `awsqueueengine list`
+with no flag will route to the configured queue host. To force a local read
+(e.g. when you're on the queue host), use `awsqe-host list` directly or
+`awsqe-client config unset queue-host` first.
+
+For S3-backed payload submit you still need AWS credentials with write access
+to the bucket; the env vars `AWSQUEUEENGINE_S3_BUCKET` / `AWSQUEUEENGINE_S3_PREFIX`
+override the config when set.
+
+Submit through the configured queue host:
+
+```bash
+awsqe-client submit --payload ./my_payload "cd $PAYLOAD_DIR && bash run.sh"
+```
+
+Or pass `--queue-host` explicitly to override the config:
 
 ```bash
 awsqueueengine submit --queue-host queue-manager --payload ./my_payload "cd $PAYLOAD_DIR && bash run.sh"

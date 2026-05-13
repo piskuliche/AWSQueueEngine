@@ -14,6 +14,7 @@ import sys
 from pathlib import Path
 
 from .client import cli as client_cli
+from .client.config import effective_queue_host
 from .host import cli as host_cli
 
 
@@ -110,6 +111,12 @@ def main():
     if args.test_email_connection:
         host_cli.cmd_test_email()
         return
+
+    # For the dual subcommands that take --queue-host, fall back to the
+    # client config's queue_host when the flag isn't on the CLI. If neither
+    # is set, args.queue_host stays None and the command runs locally.
+    if hasattr(args, "queue_host"):
+        args.queue_host = effective_queue_host(getattr(args, "queue_host", None))
 
     cmd = args.cmd
 

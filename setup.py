@@ -7,7 +7,12 @@ setup(
     author='piskuliche',
     packages=find_packages(where='src'),
     package_dir={'': 'src'},
-    install_requires=["boto3", "mailtrap"],
+    install_requires=[
+        "boto3",
+        "mailtrap",
+        # tomllib is in the stdlib from 3.11 onward; tomli is the backport for 3.10.
+        "tomli; python_version < '3.11'",
+    ],
     entry_points={
         'console_scripts': [
             'awsqueueengine=awsqueueengine.cli:main',

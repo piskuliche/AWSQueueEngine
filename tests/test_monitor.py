@@ -265,7 +265,11 @@ class MonitorHostSourceTests(unittest.TestCase):
             def fake_launch_job_on_host(host, _job_item, running_jobs):
                 running_jobs[host] = {"cmd": "echo run-once"}
                 launched_hosts.append(host)
-                return True
+                # The real _launch_job_on_host returns a dict; monitor_loop reads
+                # `.get("launched")` on it. Returning a bare True (as this fake
+                # used to) crashed the loop with AttributeError mid-iteration,
+                # which is why this test was flaking.
+                return {"launched": True}
 
             with patch("awsqueueengine.host.monitor.load_running_jobs", return_value={}), patch(
                 "awsqueueengine.host.monitor.parse_email_recipients", return_value=[]

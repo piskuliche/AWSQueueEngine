@@ -1,16 +1,15 @@
 """Client-side submit helpers: archive payload and upload to S3.
 
-After Phase 2, the actual enqueue happens over the JSON-over-SSH RPC
-(:mod:`awsqueueengine.shared.rpc_client`), so the SSH/CLI-proxy helpers
-that used to live here are gone — see git history for the legacy form.
+After Phase 2 the actual enqueue happens over the JSON-over-SSH RPC
+(:mod:`awsqueueengine.shared.rpc_client`). After Phase 3 the S3 bucket
+and prefix come from the resolved client config (CLI > env > config)
+rather than being read directly from environment at import time.
 """
 import tarfile
 import tempfile
 import uuid
 from datetime import datetime
 from pathlib import Path
-
-from .config import S3_BUCKET, S3_PREFIX
 
 
 def archive_payload_to_temp(payload_path):
@@ -40,9 +39,12 @@ def archive_payload_to_temp(payload_path):
     return tmp_path
 
 
-def upload_payload_archive_to_s3(archive_path, payload_name):
-    if not S3_BUCKET:
-        raise RuntimeError("AWSQUEUEENGINE_S3_BUCKET is required for remote submit with --payload.")
+def upload_payload_archive_to_s3(archive_path, payload_name, *, bucket, prefix):
+    if not bucket:
+        raise RuntimeError(
+            "S3 bucket is required for remote submit with --payload. "
+            "Set AWSQUEUEENGINE_S3_BUCKET or run `awsqe-client config set s3.bucket <name>`."
+        )
     try:
         import boto3
     except ImportError as exc:
@@ -50,7 +52,8 @@ def upload_payload_archive_to_s3(archive_path, payload_name):
 
     timestamp = datetime.utcnow().strftime("%Y%m%dT%H%M%SZ")
     clean_name = "".join(ch if ch.isalnum() or ch in "._-" else "_" for ch in payload_name) or "payload"
-    key_parts = [part for part in (S3_PREFIX, f"{timestamp}-{uuid.uuid4().hex}", f"{clean_name}.tar.gz") if part]
+    clean_prefix = (prefix or "").strip().strip("/")
+    key_parts = [part for part in (clean_prefix, f"{timestamp}-{uuid.uuid4().hex}", f"{clean_name}.tar.gz") if part]
     key = "/".join(key_parts)
-    boto3.client("s3").upload_file(str(archive_path), S3_BUCKET, key)
-    return f"s3://{S3_BUCKET}/{key}"
+    boto3.client("s3").upload_file(str(archive_path), bucket, key)
+    return f"s3://{bucket}/{key}"
