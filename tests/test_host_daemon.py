@@ -272,7 +272,7 @@ class LogsTests(unittest.TestCase):
              patch("awsqueueengine.host.daemon.subprocess.run", side_effect=fake_run):
             rc = daemon.logs(user_mode=False, follow=True, lines=50, dry_run=False)
         self.assertEqual(rc, 0)
-        self.assertEqual(captured["argv"], ["journalctl", "-u", "awsqe-host", "-f", "-n", "50"])
+        self.assertEqual(captured["argv"], ["journalctl", "-u", "awsqe-host", "--no-pager", "-f", "-n", "50"])
 
     def test_logs_user_mode_passes_user_flag(self):
         captured = {}

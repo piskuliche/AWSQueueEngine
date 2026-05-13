@@ -318,7 +318,10 @@ def logs(*, user_mode: bool, follow: bool, lines: int | None, dry_run: bool) -> 
             file=sys.stderr,
         )
         return 1
-    argv = [*plan.journalctl_args, "-u", SERVICE_NAME]
+    # Always disable journalctl's pager: with -n the user wants raw output,
+    # with -f journalctl doesn't page anyway, and the pager kicks the user
+    # into less when they probably just wanted to grep / pipe / read.
+    argv = [*plan.journalctl_args, "-u", SERVICE_NAME, "--no-pager"]
     if follow:
         argv.append("-f")
     if lines is not None:
