@@ -55,7 +55,7 @@ echo "rsync done"
 echo
 
 # --- 2. remote-side install + lifecycle test ------------------------------
-echo "--- 2. running install + lifecycle test on remote ---"
+echo "--- 2. install + lifecycle on remote ---"
 ssh -T "${REMOTE_HOST}" "REMOTE_REPO=${REMOTE_REPO} FAKE_QUEUE='${FAKE_QUEUE}' bash -s" <<'EOF'
 set -euo pipefail
 
@@ -77,6 +77,21 @@ python3 -m pip install --user -e . 2>&1 | tail -6
 # Make sure pip user bin dir is on PATH for this shell.
 export PATH="$HOME/.local/bin:$PATH"
 echo "awsqe-host -> $(command -v awsqe-host || echo NOT FOUND)"
+
+section "expose awsqe-host on default ssh PATH (/usr/local/bin symlink)"
+# Non-interactive `ssh patocontrol awsqe-host rpc` (what the client does
+# internally) typically doesn't pick up ~/.local/bin. Symlinking to
+# /usr/local/bin makes it discoverable for the upcoming RPC tests; we
+# clean it up at the end.
+if sudo -n true 2>/dev/null; then
+    sudo ln -sf "$HOME/.local/bin/awsqe-host"    /usr/local/bin/awsqe-host
+    sudo ln -sf "$HOME/.local/bin/awsqe-client"  /usr/local/bin/awsqe-client
+    sudo ln -sf "$HOME/.local/bin/awsqueueengine" /usr/local/bin/awsqueueengine
+    echo "symlinked: $(ls -la /usr/local/bin/awsqe-host /usr/local/bin/awsqe-client /usr/local/bin/awsqueueengine 2>&1 | tail -3)"
+else
+    echo "[WARN] no passwordless sudo; skipping symlink. The dev-box RPC tests"
+    echo "       below will likely fail with 'awsqe-host: command not found'."
+fi
 
 section "set sandbox env in user systemd manager"
 # Pin queue at a non-resolvable host so the monitor cannot reach real workers.
@@ -112,6 +127,58 @@ section "system-mode install --dry-run (preview only)"
 sudo -n true 2>/dev/null \
     && sudo awsqe-host install --dry-run \
     || echo "(skipped: no passwordless sudo available on this host)"
+EOF
+
+# --- 3. client → host RPC tests from THIS dev box --------------------------
+echo
+echo "--- 3. client → host RPC tests from dev box (against ${REMOTE_HOST}) ---"
+
+section() { echo; echo "===== $* ====="; }
+
+section "smoke: can the local CLI reach awsqe-host over ssh?"
+ssh -T "${REMOTE_HOST}" 'command -v awsqe-host && awsqe-host --help 2>&1 | head -3' || {
+    echo "[FAIL] cannot find awsqe-host via non-interactive ssh on ${REMOTE_HOST}."
+    echo "       This usually means /usr/local/bin/awsqe-host wasn't symlinked above."
+    echo "       Skipping the rest of the RPC section."
+}
+
+section "awsqueueengine list --queue-host ${REMOTE_HOST}  (legacy CLI path)"
+if command -v awsqueueengine >/dev/null; then
+    awsqueueengine list --queue-host "${REMOTE_HOST}" || echo "  (legacy list returned non-zero)"
+else
+    echo "(awsqueueengine not on local PATH; skipping)"
+fi
+
+section "awsqe-client list --queue-host ${REMOTE_HOST}  (new CLI path)"
+awsqe-client list --queue-host "${REMOTE_HOST}" || echo "  (awsqe-client list returned non-zero)"
+
+section "awsqe-client qstat --queue-host ${REMOTE_HOST}"
+awsqe-client qstat --queue-host "${REMOTE_HOST}" || echo "  (qstat returned non-zero)"
+
+section "awsqe-client submit --queue-host ${REMOTE_HOST} -- echo from-dev-box-$(date +%s)"
+awsqe-client submit --queue-host "${REMOTE_HOST}" -- echo from-dev-box-$(date +%s) \
+    || echo "  (submit returned non-zero; check the remote daemon's journal)"
+
+section "awsqe-client list --queue-host ${REMOTE_HOST}  (should now show 1 queued job)"
+awsqe-client list --queue-host "${REMOTE_HOST}" || true
+
+# --- 4. cleanup on remote: uninstall daemon, drop symlinks, clear env ------
+echo
+echo "--- 4. cleanup on remote ---"
+ssh -T "${REMOTE_HOST}" "REMOTE_REPO=${REMOTE_REPO} bash -s" <<'EOF'
+set -euo pipefail
+
+cd "${REMOTE_REPO}"
+
+section() { echo; echo "===== $* ====="; }
+
+section "stop daemon + clear the test queue before uninstalling"
+export PATH="$HOME/.local/bin:$PATH"
+awsqe-host stop --user || true
+sleep 1
+# `awsqe-host clear` mutates the queue file; this wipes the submit we did above
+# so nothing lingers if the daemon is reinstalled later.
+awsqe-host clear || true
 
 section "uninstall user daemon"
 awsqe-host uninstall --user
@@ -121,15 +188,21 @@ awsqe-host status --user 2>&1 | head -3 || true
 ls ~/.config/systemd/user/awsqe-host* 2>/dev/null || echo "(no unit file left behind)"
 ls ~/.config/systemd/user/default.target.wants/ 2>/dev/null || echo "(no enabled symlink left)"
 
+section "drop /usr/local/bin symlinks"
+if sudo -n true 2>/dev/null; then
+    sudo rm -f /usr/local/bin/awsqe-host /usr/local/bin/awsqe-client /usr/local/bin/awsqueueengine
+    echo "(symlinks removed)"
+else
+    echo "(no passwordless sudo; left the symlinks in place — remove manually)"
+fi
+
 section "clear sandbox env"
 systemctl --user unset-environment AWSQUEUEENGINE_QUEUES
 systemctl --user show-environment | grep AWSQUEUEENGINE_QUEUES || echo "(QUEUES env cleared)"
 
 section "state files in remote ~/ "
-# On a fresh instance these should be present (the daemon wrote them as it
-# polled). Confirm they're not referencing any real eci-* hostname.
 ls -la ~/.aws_slurm_like_* 2>/dev/null | head
-echo "--- queue contents:"
+echo "--- queue contents (should be empty list after `clear`):"
 cat ~/.aws_slurm_like_queue.json 2>/dev/null || echo "(no queue file)"
 echo "--- running jobs:"
 cat ~/.aws_slurm_like_running.json 2>/dev/null || echo "(no running file)"
