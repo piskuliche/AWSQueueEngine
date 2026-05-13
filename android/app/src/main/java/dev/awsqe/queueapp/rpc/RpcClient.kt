@@ -2,6 +2,7 @@ package dev.awsqe.queueapp.rpc
 
 import dev.awsqe.queueapp.model.ListResult
 import dev.awsqe.queueapp.model.QstatResult
+import dev.awsqe.queueapp.model.StatsResult
 import dev.awsqe.queueapp.model.TailResult
 import dev.awsqe.queueapp.settings.HostSettings
 import kotlinx.coroutines.Dispatchers
@@ -132,6 +133,9 @@ class RpcClient(private val json: Json = DEFAULT_JSON) {
         }
         return json.decodeFromJsonElement(TailResult.serializer(), call(settings, "tail", params))
     }
+
+    suspend fun stats(settings: HostSettings): StatsResult =
+        json.decodeFromJsonElement(StatsResult.serializer(), call(settings, "stats"))
 
     companion object {
         val DEFAULT_JSON = Json {

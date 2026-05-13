@@ -10,14 +10,26 @@ supported — this is a viewer.
 The app speaks the same JSON-over-SSH protocol as the desktop `awsqe-client`:
 on each refresh it opens an SSH connection to the queue host, runs
 `awsqe-host rpc`, pipes the request JSON to stdin, and parses one response
-JSON from stdout. Three methods are used:
+JSON from stdout. Four methods are used:
 
 - `list`    — queued jobs
 - `qstat`   — running jobs, keyed by worker host
-- `tail`    — last N lines of a worker's current job log (added in this branch)
+- `tail`    — last N lines of a worker's current job log
+- `stats`   — aggregated counters for the Overview tab (host pool, running,
+              queued-by-queue, cooldowns) in one round trip
 
 Tailing is implemented as a 3-second poll, not a streamed `tail -F`. That keeps
 the protocol one-shot and matches the desktop client's request/response model.
+
+## Tabs
+
+| Tab | Shows | RPC |
+|---|---|---|
+| **Overview** | `# running`, `# hosts in pool`, `% empty`, jobs-per-queue breakdown, who's running / on cooldown | `stats` |
+| **Running** | Each worker that's currently busy. Tap a row to tail its log. | `qstat` |
+| **Queued** | Pending jobs with their priority, queue, and host pins. | `list` |
+| **Settings** | Host, user, port, private key (PEM/OpenSSH), optional passphrase. | — |
+| _Tail (drilldown)_ | Auto-refreshing monospace log view with pause toggle. | `tail` |
 
 ## Build
 
@@ -50,7 +62,7 @@ external `gradle` install is needed.
      specific key (`ssh-keygen -t ed25519 -f awsqe-phone`) so you can revoke it
      independently of your laptop key.
    - **Passphrase** — optional, only if the key is encrypted.
-4. Tap **Save**. Switch back to Queue and pull the refresh icon.
+4. Tap **Save**. Switch to the Overview tab and tap refresh.
 
 Settings are stored in `EncryptedSharedPreferences` backed by the Android
 Keystore (`AES256_GCM`). Cloud backup is disabled for the prefs file.
@@ -77,10 +89,12 @@ Keystore (`AES256_GCM`). Cloud backup is disabled for the prefs file.
 | File | Purpose |
 |---|---|
 | `app/src/main/java/.../rpc/RpcClient.kt` | sshj-based JSON-over-SSH client. Mirrors `shared/rpc_client.py`. |
-| `app/src/main/java/.../model/Models.kt` | DTOs for `list` / `qstat` / `tail` responses. |
+| `app/src/main/java/.../model/Models.kt` | DTOs for `list` / `qstat` / `tail` / `stats` responses. |
 | `app/src/main/java/.../settings/SettingsStore.kt` | Encrypted prefs holding the host config + private key. |
-| `app/src/main/java/.../ui/QueueViewModel.kt` | Single `AndroidViewModel` driving all three screens. |
-| `app/src/main/java/.../ui/QueueScreen.kt` | Lists running + queued jobs. Tap a running row to tail it. |
+| `app/src/main/java/.../ui/QueueViewModel.kt` | Single `AndroidViewModel` with one StateFlow per tab. |
+| `app/src/main/java/.../ui/DashboardScreen.kt` | Overview metrics + queue/host breakdowns. |
+| `app/src/main/java/.../ui/RunningScreen.kt` | Per-host running jobs. Tap to tail. |
+| `app/src/main/java/.../ui/QueuedScreen.kt` | Pending jobs. |
 | `app/src/main/java/.../ui/TailScreen.kt` | Mono-font log view with 3s auto-refresh + pause toggle. |
 | `app/src/main/java/.../ui/SettingsScreen.kt` | Host/user/key form. |
-| `app/src/main/java/.../MainActivity.kt` | Two-tab nav + tail destination. |
+| `app/src/main/java/.../MainActivity.kt` | Four-tab bottom nav + tail destination. |

@@ -8,6 +8,8 @@ import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.padding
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.filled.List
+import androidx.compose.material.icons.filled.Dashboard
+import androidx.compose.material.icons.filled.PlayArrow
 import androidx.compose.material.icons.filled.Settings
 import androidx.compose.material3.Icon
 import androidx.compose.material3.MaterialTheme
@@ -19,14 +21,17 @@ import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.getValue
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.graphics.vector.ImageVector
 import androidx.navigation.NavDestination.Companion.hierarchy
 import androidx.navigation.NavGraph.Companion.findStartDestination
 import androidx.navigation.compose.NavHost
 import androidx.navigation.compose.composable
 import androidx.navigation.compose.currentBackStackEntryAsState
 import androidx.navigation.compose.rememberNavController
-import dev.awsqe.queueapp.ui.QueueScreen
+import dev.awsqe.queueapp.ui.DashboardScreen
 import dev.awsqe.queueapp.ui.QueueViewModel
+import dev.awsqe.queueapp.ui.QueuedScreen
+import dev.awsqe.queueapp.ui.RunningScreen
 import dev.awsqe.queueapp.ui.SettingsScreen
 import dev.awsqe.queueapp.ui.TailScreen
 
@@ -45,13 +50,17 @@ class MainActivity : ComponentActivity() {
     }
 }
 
-private sealed class Dest(val route: String, val label: String) {
-    object Queue : Dest("queue", "Queue")
-    object Settings : Dest("settings", "Settings")
-    object Tail : Dest("tail/{host}", "Tail") {
-        fun routeFor(host: String) = "tail/$host"
-    }
+private sealed class Tab(val route: String, val label: String, val icon: ImageVector) {
+    object Dashboard : Tab("dashboard", "Overview", Icons.Filled.Dashboard)
+    object Running : Tab("running", "Running", Icons.Filled.PlayArrow)
+    object Queued : Tab("queued", "Queued", Icons.AutoMirrored.Filled.List)
+    object Settings : Tab("settings", "Settings", Icons.Filled.Settings)
 }
+
+private const val TAIL_ROUTE_TEMPLATE = "tail/{host}"
+private fun tailRouteFor(host: String) = "tail/$host"
+
+private val TABS = listOf(Tab.Dashboard, Tab.Running, Tab.Queued, Tab.Settings)
 
 @Composable
 private fun AppRoot(vm: QueueViewModel) {
@@ -61,11 +70,10 @@ private fun AppRoot(vm: QueueViewModel) {
 
     Scaffold(
         bottomBar = {
-            // Hide tabs while tailing — that screen owns the back-button to return to Queue.
+            // Hide tabs while tailing — that screen owns back-navigation to Running.
             if (currentRoute?.startsWith("tail/") != true) {
                 NavigationBar {
-                    val tabs = listOf(Dest.Queue, Dest.Settings)
-                    tabs.forEach { dest ->
+                    TABS.forEach { dest ->
                         val selected = currentRoute == dest.route ||
                             backStack?.destination?.hierarchy?.any { it.route == dest.route } == true
                         NavigationBarItem(
@@ -77,16 +85,7 @@ private fun AppRoot(vm: QueueViewModel) {
                                     restoreState = true
                                 }
                             },
-                            icon = {
-                                Icon(
-                                    when (dest) {
-                                        Dest.Queue -> Icons.AutoMirrored.Filled.List
-                                        Dest.Settings -> Icons.Filled.Settings
-                                        else -> Icons.AutoMirrored.Filled.List
-                                    },
-                                    contentDescription = dest.label,
-                                )
-                            },
+                            icon = { Icon(dest.icon, contentDescription = dest.label) },
                             label = { Text(dest.label) },
                         )
                     }
@@ -96,14 +95,16 @@ private fun AppRoot(vm: QueueViewModel) {
     ) { inner ->
         NavHost(
             navController = nav,
-            startDestination = Dest.Queue.route,
+            startDestination = Tab.Dashboard.route,
             modifier = Modifier.padding(inner),
         ) {
-            composable(Dest.Queue.route) {
-                QueueScreen(vm, onTapRunning = { host -> nav.navigate(Dest.Tail.routeFor(host)) })
+            composable(Tab.Dashboard.route) { DashboardScreen(vm) }
+            composable(Tab.Running.route) {
+                RunningScreen(vm, onTapHost = { host -> nav.navigate(tailRouteFor(host)) })
             }
-            composable(Dest.Settings.route) { SettingsScreen(vm) }
-            composable(Dest.Tail.route) { entry ->
+            composable(Tab.Queued.route) { QueuedScreen(vm) }
+            composable(Tab.Settings.route) { SettingsScreen(vm) }
+            composable(TAIL_ROUTE_TEMPLATE) { entry ->
                 val host = entry.arguments?.getString("host") ?: ""
                 TailScreen(vm, host)
             }

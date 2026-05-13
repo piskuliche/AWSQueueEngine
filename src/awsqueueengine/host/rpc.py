@@ -281,6 +281,47 @@ def handle_tail(params: dict) -> dict:
     return tail_remote_log(host, lines=lines)
 
 
+def handle_stats(params: dict) -> dict:
+    """Aggregated counters for a phone dashboard. One round trip, no math on the client.
+
+    Combines the queue config (host pool), running state, queued list, and host
+    cooldowns. Returns counts plus the underlying name lists so the UI can
+    drill in (or render a sparkline of which hosts are busy) without a follow-up.
+    """
+    _require_dict(params)
+    queue_host_map = _load_queue_host_map()
+    host_pool = sorted({h for hosts in queue_host_map.values() for h in hosts})
+
+    running = load_running_jobs()
+    running_hosts = sorted(running.keys())
+
+    queued = [normalize_job_item(item) for item in load_queue()]
+    queued_by_queue: dict[str, int] = {}
+    for job in queued:
+        queued_by_queue[job.get("queue") or "default"] = queued_by_queue.get(job.get("queue") or "default", 0) + 1
+    # Surface configured queues with 0 jobs too, so the UI can show every row even when idle.
+    for queue_name in queue_host_map:
+        queued_by_queue.setdefault(queue_name, 0)
+
+    cooldown_hosts = sorted(get_host_cooldowns().keys())
+
+    total = len(host_pool)
+    running_count = len(running_hosts)
+    fraction_empty = (total - running_count) / total if total else 0.0
+
+    return {
+        "running_count": running_count,
+        "queued_count": len(queued),
+        "host_total": total,
+        "host_pool": host_pool,
+        "running_hosts": running_hosts,
+        "cooldown_hosts": cooldown_hosts,
+        "queue_host_map": {q: list(hs) for q, hs in queue_host_map.items()},
+        "queued_by_queue": queued_by_queue,
+        "fraction_empty": fraction_empty,
+    }
+
+
 # ---------- registry + dispatcher ----------
 
 METHODS: dict[str, Callable[[dict], dict]] = {
@@ -294,6 +335,7 @@ METHODS: dict[str, Callable[[dict], dict]] = {
     "enable_host": handle_enable_host,
     "job_info": handle_job_info,
     "tail": handle_tail,
+    "stats": handle_stats,
 }
 
 

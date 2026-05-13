@@ -262,6 +262,75 @@ class TailTests(unittest.TestCase):
         self.assertEqual(resp["result"]["reason"], "unreachable")
 
 
+class StatsTests(_StateFixture):
+    def setUp(self):
+        super().setUp()
+        import os
+        os.environ["AWSQUEUEENGINE_QUEUES"] = "default=eci1,eci2,eci3;fast=eci10,eci11"
+        self.addCleanup(lambda: os.environ.pop("AWSQUEUEENGINE_QUEUES", None))
+        # Cooldowns live in MONITOR_STATE_FILE; redirect it under the existing tmpdir.
+        from awsqueueengine.host import monitor as monitor_mod
+        self._monitor_state_original = monitor_mod.MONITOR_STATE_FILE
+        monitor_mod.MONITOR_STATE_FILE = Path(self.tmpdir.name) / "monitor_state.json"
+        self.addCleanup(lambda: setattr(monitor_mod, "MONITOR_STATE_FILE", self._monitor_state_original))
+
+    def _call(self):
+        resp = rpc.dispatch({"version": 1, "method": "stats", "params": {}})
+        self.assertTrue(resp["ok"], resp)
+        return resp["result"]
+
+    def test_stats_empty_state_reports_zero_running_full_pool_empty(self):
+        result = self._call()
+        self.assertEqual(result["running_count"], 0)
+        self.assertEqual(result["queued_count"], 0)
+        self.assertEqual(result["host_total"], 5)
+        self.assertEqual(result["host_pool"], ["eci1", "eci10", "eci11", "eci2", "eci3"])
+        self.assertEqual(result["running_hosts"], [])
+        self.assertEqual(result["cooldown_hosts"], [])
+        self.assertEqual(result["fraction_empty"], 1.0)
+        # Configured queues are surfaced even with 0 jobs each.
+        self.assertEqual(result["queued_by_queue"], {"default": 0, "fast": 0})
+        self.assertEqual(set(result["queue_host_map"].keys()), {"default", "fast"})
+
+    def test_stats_counts_running_and_queued(self):
+        running_state_mod.save_running_jobs({
+            "eci1": {"cmd": "j1", "priority": 0},
+            "eci10": {"cmd": "j2", "priority": 50},
+        })
+        queue_mod.save_queue([
+            {"cmd": "a", "queue": "default", "job_id": "Q1"},
+            {"cmd": "b", "queue": "default", "job_id": "Q2"},
+            {"cmd": "c", "queue": "fast", "job_id": "Q3"},
+        ])
+        result = self._call()
+        self.assertEqual(result["running_count"], 2)
+        self.assertEqual(result["queued_count"], 3)
+        self.assertEqual(result["host_total"], 5)
+        self.assertEqual(set(result["running_hosts"]), {"eci1", "eci10"})
+        self.assertAlmostEqual(result["fraction_empty"], 3 / 5)
+        self.assertEqual(result["queued_by_queue"], {"default": 2, "fast": 1})
+
+    def test_stats_surfaces_cooldown_hosts(self):
+        # Write a future cooldown for eci3 directly into the redirected state file.
+        import json, time
+        from awsqueueengine.host import monitor as monitor_mod
+        monitor_mod.MONITOR_STATE_FILE.write_text(json.dumps({
+            "host_disabled_until": {"eci3": time.time() + 3600},
+        }))
+        result = self._call()
+        self.assertEqual(result["cooldown_hosts"], ["eci3"])
+
+    def test_stats_with_empty_pool_avoids_divide_by_zero(self):
+        original = rpc._load_queue_host_map
+        rpc._load_queue_host_map = lambda: {}
+        try:
+            result = self._call()
+        finally:
+            rpc._load_queue_host_map = original
+        self.assertEqual(result["host_total"], 0)
+        self.assertEqual(result["fraction_empty"], 0.0)
+
+
 class EnqueueTests(_StateFixture):
     def setUp(self):
         super().setUp()

@@ -36,3 +36,20 @@ data class TailResult(
     val out: String = "",
     val err: String = "",
 )
+
+/**
+ * Mirrors host/rpc.py:handle_stats. The host pre-computes everything the
+ * dashboard needs so the phone makes a single round trip per refresh.
+ */
+@Serializable
+data class StatsResult(
+    val running_count: Int = 0,
+    val queued_count: Int = 0,
+    val host_total: Int = 0,
+    val host_pool: List<String> = emptyList(),
+    val running_hosts: List<String> = emptyList(),
+    val cooldown_hosts: List<String> = emptyList(),
+    val queue_host_map: Map<String, List<String>> = emptyMap(),
+    val queued_by_queue: Map<String, Int> = emptyMap(),
+    val fraction_empty: Double = 0.0,
+)
