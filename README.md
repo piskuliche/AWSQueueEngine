@@ -2,230 +2,335 @@
 
 A Slurm-like SSH job manager for AWS GPU hosts, with payload staging and monitoring.
 
+The codebase is split into two binaries that talk to each other over a
+JSON-over-SSH RPC:
+
+- **`awsqe-client`** — runs on your laptop / dev box; archives payloads,
+  uploads them to S3, and asks the queue host to enqueue jobs.
+- **`awsqe-host`** — runs on the queue-manager VM as a systemd service;
+  owns the queue state, dispatches jobs to worker hosts over SSH, and
+  sends email alerts.
+
+The legacy `awsqueueengine` command remains as a backward-compat shim that
+dispatches to one of the two CLIs based on what subcommand you ran.
+
+Requires **Python 3.10+** on both the local submitter and the queue host.
+
 ## Installation
 
-Requires **Python 3.10+** on both the local submitter and the queue host
-(the codebase uses PEP 604 union annotations).
+### Local submitter (laptop / dev box)
 
-Install the package anywhere you will run the CLI:
-
-```bash
-pip install .
-```
-
-### Local submitter setup
-
-Install AWSQueueEngine locally and make sure you can SSH to the queue host:
+A `pip install --user` is fine here. On Ubuntu 23.04+ you may need the
+PEP 668 escape hatch:
 
 ```bash
-pip install .
-ssh queue-manager 'awsqe-host status'
+git clone <repo-url> AWSQueueEngine
+cd AWSQueueEngine
+python3 -m pip install --user -e .                          # most systems
+# or, on Ubuntu 23.04+:
+python3 -m pip install --user --break-system-packages -e .
 ```
 
-Configure the client once so you don't have to pass `--queue-host` on every
-invocation. Settings live in `~/.awsqe/client/config.toml`:
+`awsqe-client`, `awsqe-host`, and `awsqueueengine` all land in
+`~/.local/bin`. Make sure that's on `$PATH`.
+
+### Queue host (production)
+
+Use a **dedicated venv** so the daemon's dependencies don't fight Debian-
+or apt-installed system packages (PEP 668), and **symlink the binaries
+into `/usr/local/bin`** so non-interactive SSH from clients can find
+`awsqe-host` on PATH:
+
+```bash
+sudo apt-get install -y python3 python3-venv python3-pip git
+
+git clone <repo-url> ~/AWSQueueEngine
+cd ~/AWSQueueEngine
+
+sudo python3 -m venv /opt/awsqueueengine-venv
+sudo /opt/awsqueueengine-venv/bin/pip install -U pip
+sudo /opt/awsqueueengine-venv/bin/pip install -e .
+
+sudo ln -sf /opt/awsqueueengine-venv/bin/awsqe-host    /usr/local/bin/awsqe-host
+sudo ln -sf /opt/awsqueueengine-venv/bin/awsqe-client  /usr/local/bin/awsqe-client
+sudo ln -sf /opt/awsqueueengine-venv/bin/awsqueueengine /usr/local/bin/awsqueueengine
+```
+
+Verify:
+
+```bash
+which awsqe-host && head -1 $(which awsqe-host)
+# Should show /usr/local/bin/awsqe-host with a shebang pointing at
+# /opt/awsqueueengine-venv/bin/python3
+```
+
+Cleanup later, if needed: `sudo rm -rf /opt/awsqueueengine-venv /usr/local/bin/{awsqe-host,awsqe-client,awsqueueengine}`.
+
+## Client configuration
+
+Configure the client once so you don't have to pass `--queue-host` or S3
+flags on every command. Settings live in `~/.awsqe/client/config.toml`:
 
 ```bash
 awsqe-client config set queue-host queue-manager
-awsqe-client config set s3.bucket   my-queue-payload-bucket
-awsqe-client config set s3.prefix   awsqueueengine/payloads   # optional; defaults to this
+awsqe-client config set s3.bucket   amberflow-default
+awsqe-client config set s3.prefix   jobs   
 awsqe-client config show                                       # inspect what's set
+awsqe-client config unset queue-host                           # clear one key
 ```
 
-Resolution precedence for each setting is **CLI flag > env var > config > error**.
-The legacy `awsqueueengine` CLI also reads this file, so `awsqueueengine list`
-with no flag will route to the configured queue host. To force a local read
-(e.g. when you're on the queue host), use `awsqe-host list` directly or
-`awsqe-client config unset queue-host` first.
+Resolution precedence per setting is **CLI flag > env var > config > error**.
+The legacy `awsqueueengine` CLI reads the same config, so `awsqueueengine list`
+with no flag routes to the configured queue host. To force a local read on
+the queue host itself, use `awsqe-host list` directly.
 
-For S3-backed payload submit you still need AWS credentials with write access
-to the bucket; the env vars `AWSQUEUEENGINE_S3_BUCKET` / `AWSQUEUEENGINE_S3_PREFIX`
-override the config when set.
+For S3-backed payload submit you also need AWS credentials with write
+access to the bucket configured locally (the usual `~/.aws/credentials`,
+env vars, or IAM role).
 
-Submit through the configured queue host:
+## Usage
+
+Most days you'll only need these:
 
 ```bash
+# Submit a job to the configured queue host:
 awsqe-client submit --payload ./my_payload "cd $PAYLOAD_DIR && bash run.sh"
+awsqe-client submit --queue fast-gpus "python train.py"
+awsqe-client submit --priority 25 "python train.py --epochs 10"
+awsqe-client submit --preempt --priority 999 "bash urgent-job.sh"
+
+# Inspect the queue host:
+awsqe-client list                  # queued jobs
+awsqe-client qstat                 # running jobs (elapsed HH:MM:SS each)
+awsqe-client deferred              # jobs that exceeded the submit-failure limit
+awsqe-client requeue-deferred --all
+awsqe-client enable-host           # show active host cooldowns (no args)
+awsqe-client enable-host eci17     # release a host from cooldown early
+
+# Worker-host operations from your laptop (SSHes to the worker directly):
+awsqe-client status                # ps probe of every host's MANAGER_TAG state
+awsqe-client tail eci17            # tail the most recent job log on a worker
+awsqe-client stop eci17            # kill managed job(s) on a worker
+awsqe-client where                 # probe scratch space on every worker
+awsqe-client info -p ./my_payload  # refresh run.info from queue-host state
+
+# Override config on a one-off command:
+awsqe-client submit --queue-host other-queue "python sweep.py"
 ```
 
-Or pass `--queue-host` explicitly to override the config:
+The legacy `awsqueueengine <subcommand>` still works for every command
+above. It will be deprecated in a later release; new scripts should use
+`awsqe-client`.
+
+`submit --high-priority` is still supported for backward compatibility and
+maps to priority `100`. If both `--priority` and `--high-priority` are
+supplied, `--priority` takes precedence.
+
+`--queue <name>` submits to a user queue. Jobs store the queue name, and
+the monitor assigns the concrete worker host at dispatch time from the
+current queue config. `--hosts` and `--host-set` remain for legacy
+scripts, but new submissions should prefer queues.
+
+`--preempt` allows a queued job to interrupt a currently running managed
+job when no free eligible host is available. The interrupted job is
+requeued and restarted.
+
+`requeue-running` kills monitor-tracked running job(s) and requeues them
+back to their original host with priority `100`, preserving the remote
+payload path.
+
+`qstat` lists monitor-tracked running jobs and elapsed runtime
+(`HH:MM:SS`). When jobs finish, the monitor appends completion records to
+`~/.awsqe/host/completed.json` with the `qstat` fields plus final duration
+and timestamps (`started_at`, `finished_at`).
+
+## Remote queue host setup
+
+Once installed per the queue-host instructions above, define your worker
+queues in a JSON file:
 
 ```bash
-awsqueueengine submit --queue-host queue-manager --payload ./my_payload "cd $PAYLOAD_DIR && bash run.sh"
-```
-
-### Remote queue host setup
-
-Install AWSQueueEngine on the queue host. This machine owns the queue files and
-should be the only place running the monitor:
-
-```bash
-pip install .
 cat > /home/ubuntu/awsqueueengine_queues.json <<'JSON'
 {
-  "default": ["eci1", "eci2", "eci3"],
+  "default":  ["eci1", "eci2", "eci3"],
   "fast-gpus": ["eci1", "eci2"],
   "large-mem": ["eci3"]
 }
 JSON
-export AWSQUEUEENGINE_QUEUES_FILE="/home/ubuntu/awsqueueengine_queues.json"
 ```
 
-Run the monitor as a systemd service (recommended):
+The queue config is the single source of truth for worker assignment.
+Edit this file at any time — the monitor reloads it once per poll cycle
+(~60s), no daemon restart needed. The journal will print
+`[INFO] Queue hosts updated from ...` when a change is picked up.
+
+For simple static setups you can skip the file and use one env var
+instead: `AWSQUEUEENGINE_QUEUES="default=eci1,eci2;fast-gpus=eci3"`.
+`AWSQUEUEENGINE_QUEUES_FILE` and `AWSQUEUEENGINE_QUEUES` are mutually
+exclusive.
+
+### Install the systemd service
 
 ```bash
 # System-wide unit (requires sudo). Writes /etc/systemd/system/awsqe-host.service,
-# runs daemon-reload, and enables --now. Runs as $SUDO_USER so the daemon owns
-# the same ~/.aws_slurm_like_*.json files you already have.
+# daemon-reloads, and enables --now. Runs as $SUDO_USER so the daemon owns
+# the same ~/.awsqe/host/ state files you migrated.
 sudo awsqe-host install
 sudo awsqe-host status
-sudo awsqe-host logs -f      # system journal usually needs sudo (or
-                             # membership in the systemd-journal / adm group)
+sudo awsqe-host logs -f       # system journal needs sudo or systemd-journal
+                              # group membership
 ```
 
-Per-user variant (no root; lives at `~/.config/systemd/user/awsqe-host.service`):
+Per-user variant if you can't or don't want to use sudo:
 
 ```bash
 awsqe-host install --user
-loginctl enable-linger $USER   # so the daemon survives logout
+loginctl enable-linger $USER  # so the daemon survives logout
 awsqe-host logs --user -f
 ```
 
-Other daemon verbs: `start | stop | restart | status | logs | uninstall`. All
-accept `--user` (for per-user units) and `--dry-run` (prints what would happen).
-If systemd isn't available, `awsqe-host start` falls back to a foreground run
-that you can Ctrl-C — no `nohup &` pattern needed.
+Other daemon verbs: `start | stop | restart | status | logs | uninstall`.
+All accept `--user` and `--dry-run`. If systemd isn't available,
+`awsqe-host start` falls back to a foreground run that you can Ctrl-C.
 
-Legacy `awsqueueengine start-monitor` still works for backward compatibility
-(foreground + pidfile) and is removed in a later release.
+Legacy `awsqueueengine start-monitor` still works for backward
+compatibility (foreground + pidfile) and is removed in a later release.
 
-The queue config is the single source of truth for worker assignment. Edit this
-file to move hosts between user queues; the monitor reloads it while running.
-For simple static setups, use one environment variable instead of a file:
+### Wiring config into the systemd unit
+
+The systemd service starts with a **clean environment** — it does NOT
+read your `~/.bashrc`. Tell it which queue config and Mailtrap creds to
+use via a drop-in at `/etc/systemd/system/awsqe-host.service.d/override.conf`.
 
 ```bash
-export AWSQUEUEENGINE_QUEUES="default=eci1,eci2,eci3;fast-gpus=eci1,eci2"
+sudo tee /etc/systemd/system/awsqe-host.service.d/override.conf >/dev/null <<'EOF'
+[Service]
+Environment="AWSQUEUEENGINE_QUEUES_FILE=/home/ubuntu/awsqueueengine_queues.json"
+Environment="AWSQUEUEENGINE_MAILTRAP_TOKEN=<your-mailtrap-token>"
+Environment="AWSQUEUEENGINE_MAILTRAP_SENDER_EMAIL=hello@piskulich.com"
+Environment="AWSQUEUEENGINE_MAILTRAP_SENDER_NAME=AWSQueueEngine"
+Environment="AWSQUEUEENGINE_MAILTRAP_CATEGORY=Queue Monitor"
+Environment="AWSQUEUEENGINE_ALERT_TO=you@example.com,team@example.com"
+EOF
+
+sudo systemctl daemon-reload
+sudo systemctl restart awsqe-host
+sudo systemctl show awsqe-host -p Environment
 ```
 
-### Worker host setup
+**Quote every `KEY=VALUE`** — systemd splits unquoted values on whitespace
+and silently drops everything after the first space. (`Queue Monitor`
+without quotes parses as `Queue` plus a junk `Monitor` token that systemd
+warns about and discards.)
 
-Each worker host must be reachable by SSH from the queue host and have scratch
-space under the configured scratch roots. For S3-backed payloads, workers also
-need the AWS CLI and IAM permissions to read the payload bucket/prefix:
+If you'd rather not have the Mailtrap token world-readable, put the
+secret-bearing vars in a separate root:root mode-600 file and reference
+it from the unit:
+
+```bash
+sudo tee /etc/awsqe-host.env >/dev/null <<'EOF'
+AWSQUEUEENGINE_MAILTRAP_TOKEN=<token>
+AWSQUEUEENGINE_MAILTRAP_SENDER_EMAIL=hello@piskulich.com
+AWSQUEUEENGINE_ALERT_TO=you@example.com,team@example.com
+EOF
+sudo chmod 600 /etc/awsqe-host.env
+
+# Then in /etc/systemd/system/awsqe-host.service.d/override.conf:
+#   [Service]
+#   Environment="AWSQUEUEENGINE_QUEUES_FILE=/home/ubuntu/awsqueueengine_queues.json"
+#   EnvironmentFile=/etc/awsqe-host.env
+```
+
+### State migration (one-shot, from Phase 5 onward)
+
+The queue host's state files moved from `~/.aws_slurm_like_*.json` to
+`~/.awsqe/host/`:
+
+```
+~/.awsqe/host/queue.json
+~/.awsqe/host/running.json
+~/.awsqe/host/completed.json
+~/.awsqe/host/deferred.json
+~/.awsqe/host/monitor_state.json
+~/.awsqe/host/lock
+~/.awsqe/host/pid
+```
+
+The daemon migrates them on first start. You can also run it explicitly:
+
+```bash
+awsqe-host migrate --dry-run     # preview what would move
+awsqe-host migrate               # actually move (idempotent)
+awsqe-host migrate --force       # re-run even if already migrated
+```
+
+For each legacy file the migration:
+1. Copies it (preserving mtime/perms) to its new home in `~/.awsqe/host/`.
+2. Renames the legacy file to `~/.aws_slurm_like_*.json.migrated.bak`.
+3. Stamps `migrated_at` in the new `monitor_state.json` so subsequent
+   runs are a no-op.
+
+If you need to roll back, move the `.migrated.bak` files back to their
+original names and remove the new `~/.awsqe/host/` directory:
+
+```bash
+for f in ~/.aws_slurm_like_*.migrated.bak; do mv "$f" "${f%.migrated.bak}"; done
+rm -rf ~/.awsqe/host
+```
+
+## Worker host setup
+
+Each worker host must be reachable by SSH from the queue host and have
+scratch space under the configured scratch roots. For S3-backed payloads,
+workers also need the AWS CLI and IAM permissions to read the payload
+bucket/prefix:
 
 ```bash
 aws s3 ls s3://my-queue-payload-bucket/awsqueueengine/payloads/
 ```
 
-## Usage
-
-After installation, use the CLI:
-
-```bash
-awsqueueengine status
-awsqueueengine submit --payload ./my_payload "cd $PAYLOAD_DIR && bash run.sh"
-awsqueueengine submit --queue-host queue-manager --payload ./my_payload "cd $PAYLOAD_DIR && bash run.sh"
-awsqueueengine submit --queue-host queue-manager --queue fast-gpus "python train.py"
-awsqueueengine submit --queue large-mem "python analyze.py"
-awsqueueengine submit --priority 25 "python train.py --epochs 10"
-awsqueueengine submit --preempt --priority 999 "bash urgent-job.sh"
-awsqueueengine requeue-running --hosts eci17
-awsqueueengine requeue-running --all
-awsqueueengine list
-awsqueueengine qstat
-awsqueueengine qdel 2
-awsqueueengine qdel 1 3
-awsqe-host start              # systemctl-aware; foreground fallback if no systemd
-awsqe-host status
-awsqe-host stop
-awsqe-host logs -f            # tail journal — add --user for user units,
-                              # or run with sudo for system units
-awsqueueengine tail eci3
-awsqueueengine stop eci3
-awsqueueengine clear
-awsqueueengine --test-email-connection
-```
-
-`submit --high-priority` is still supported for backward compatibility and maps to
-priority `100`. If both `--priority` and `--high-priority` are supplied, `--priority`
-takes precedence.
-Use `--queue <name>` to submit to a user queue. Jobs store the queue name, and
-the monitor assigns the concrete worker host at dispatch time from the current
-queue config. `--hosts` and `--host-set` remain for legacy scripts, but new
-remote behavior should prefer queues.
-Use `--preempt` to allow a queued job to interrupt a currently running managed job
-when no free eligible host is available. The interrupted job is requeued and restarted.
-Use `requeue-running` to kill monitor-tracked running job(s) and requeue them back to
-their original host with priority `100`, preserving the remote payload path.
-`qstat` lists monitor-tracked running jobs and elapsed runtime (`HH:MM:SS`).
-When jobs finish, the monitor appends completion records to
-`~/.aws_slurm_like_completed.json` with the `qstat` fields plus final duration
-and timestamps (`started_at`, `finished_at`).
-
 ## Remote submit with S3 payloads
 
-`submit --queue-host <host>` lets you run the CLI locally while enqueueing on a
-remote queue-manager machine. With `--payload`, the local CLI archives the payload
-directory, uploads it to S3, then SSHes to the queue host to enqueue a job that
-contains the S3 payload URI. The monitor on the queue host later asks the selected
-worker to download and extract that archive before running the job.
+`awsqe-client submit --payload <dir>` archives the directory locally,
+uploads it to S3, then asks the queue host to enqueue a job that
+references the S3 URI. The monitor on the queue host later asks the
+selected worker to download and extract that archive before running the
+job.
 
-Local submitter requirements:
-
-```bash
-export AWSQUEUEENGINE_S3_BUCKET="my-queue-payload-bucket"
-export AWSQUEUEENGINE_S3_PREFIX="awsqueueengine/payloads"  # optional
-awsqueueengine submit --queue-host queue-manager --payload ./my_payload "cd $PAYLOAD_DIR && bash run.sh"
-```
-
-The local submitter needs AWS credentials with write access to the bucket/prefix.
-Worker hosts need the AWS CLI and read access to the same bucket/prefix. The queue
-host should run the monitor and own the queue files. Queue validation happens on
-the queue host against `AWSQUEUEENGINE_QUEUES_FILE` or `AWSQUEUEENGINE_QUEUES`.
-Configure an S3 lifecycle rule for the payload prefix to clean up uploaded archives.
-
-### User queues
-
-User queues let users submit to predetermined host pools while still using the
-same job queue and monitor. Define them on the queue host, then submit with
-`--queue <name>`:
+Submitter requirements (one-time setup):
 
 ```bash
-export AWSQUEUEENGINE_QUEUES_FILE="/home/ubuntu/awsqueueengine_queues.json"
+awsqe-client config set s3.bucket  my-queue-payload-bucket
+awsqe-client config set s3.prefix  awsqueueengine/payloads   # optional
 
-awsqueueengine submit --queue-host queue-manager --queue fast-gpus "python train.py"
+# Then:
+awsqe-client submit --payload ./my_payload "cd $PAYLOAD_DIR && bash run.sh"
 ```
 
-`AWSQUEUEENGINE_QUEUES_FILE` and `AWSQUEUEENGINE_QUEUES` are mutually exclusive.
-The file form is preferred for live changes because the monitor reloads it each
-poll; environment variables are read from the running process environment.
+The submitter needs AWS credentials with write access to the
+bucket/prefix. Worker hosts need read access to the same prefix. The
+queue host validates the queue name against
+`AWSQUEUEENGINE_QUEUES_FILE` or `AWSQUEUEENGINE_QUEUES` configured on it.
+Configure an S3 lifecycle rule for the payload prefix to clean up old
+archives.
 
-
-Suggested to run with systemd (see "Remote queue host setup" above):
-
-```bash
-sudo awsqe-host install
-sudo awsqe-host logs -f
-```
-
-For development you can run the monitor in the foreground (Ctrl-C to stop):
-
-```bash
-awsqe-host monitor
-```
+`AWSQUEUEENGINE_S3_BUCKET` and `AWSQUEUEENGINE_S3_PREFIX` env vars still
+work and override the config when set, mostly useful for one-off
+overrides in CI.
 
 ## Email Alerts (Mailtrap API)
 
-Set these environment variables before starting the monitor:
+Configure the Mailtrap creds via the systemd unit drop-in shown above
+(see "Wiring config into the systemd unit"). The relevant vars:
 
-```bash
-export AWSQUEUEENGINE_MAILTRAP_TOKEN="<your-mailtrap-token>"
-export AWSQUEUEENGINE_MAILTRAP_SENDER_EMAIL="hello@piskulich.com"
-export AWSQUEUEENGINE_MAILTRAP_SENDER_NAME="Queue Monitor"
-export AWSQUEUEENGINE_MAILTRAP_CATEGORY="Integration Test"
-export AWSQUEUEENGINE_ALERT_TO="you@example.com,team@example.com"
-export AWSQUEUEENGINE_ALERT_DAILY_EMAIL_LIMIT="150"
-export AWSQUEUEENGINE_JOB_FAIL_ALERT_COOLDOWN_SECONDS="900"
+```
+AWSQUEUEENGINE_MAILTRAP_TOKEN              # required for any email to send
+AWSQUEUEENGINE_MAILTRAP_SENDER_EMAIL       # required; the From address
+AWSQUEUEENGINE_MAILTRAP_SENDER_NAME        # optional; display name in From header
+AWSQUEUEENGINE_MAILTRAP_CATEGORY           # optional; tags emails on the Mailtrap side
+AWSQUEUEENGINE_ALERT_TO                    # comma-separated recipients
+AWSQUEUEENGINE_ALERT_DAILY_EMAIL_LIMIT     # default 150
+AWSQUEUEENGINE_JOB_FAIL_ALERT_COOLDOWN_SECONDS  # default 900
 ```
 
 When configured, the monitor sends email:
@@ -234,29 +339,29 @@ When configured, the monitor sends email:
 2. Once when queue depth drops below 10 (fires on transition into low-queue state).
 3. Once when queue depth reaches 0 (fires on transition into empty state).
 4. Once per calendar day when the monitor detects a new date, with a status summary.
+5. When a host gets placed in cooldown (storage or transport failure).
 
-Email protection:
-- Total outgoing emails are capped per day (`AWSQUEUEENGINE_ALERT_DAILY_EMAIL_LIMIT`, default `150`).
-- Job-failure emails are rate-limited with a cooldown (`AWSQUEUEENGINE_JOB_FAIL_ALERT_COOLDOWN_SECONDS`, default `900` seconds).
+Email rate limits:
+- Total outgoing emails are capped per day (`AWSQUEUEENGINE_ALERT_DAILY_EMAIL_LIMIT`).
+- Job-failure emails are rate-limited with a cooldown (`AWSQUEUEENGINE_JOB_FAIL_ALERT_COOLDOWN_SECONDS`).
 
+To smoke-test the credentials from the queue host:
 
+```bash
+awsqe-host --test-email-connection
+```
+
+(This reads creds from the calling shell's environment, not from the
+systemd unit. To verify the systemd unit's view, look at
+`sudo systemctl show awsqe-host -p Environment` and let the daemon's
+next alert-eligible event actually fire.)
 
 ## Project Structure
 
-- `src/` - Main package modules
-- `docs/` - Sphinx documentation source and build helpers
-- `setup.py` - Packaging script
-- `README.md` - This file
-
-## Documentation
-
-Build the Sphinx HTML documentation from the project root with:
-
-```bash
-pip install -r docs/requirements.txt
-sphinx-build -b html docs docs/_build/html
-```
-
-The generated site will be written to `docs/_build/html/index.html`.
-# AWSQueueEngine
-A simple queue engine for AWS Resources.
+- `src/awsqueueengine/shared/` — data models, protocol/RPC, paths used by both sides
+- `src/awsqueueengine/client/` — `awsqe-client` CLI, submit, run.info, RPC transport
+- `src/awsqueueengine/host/` — `awsqe-host` CLI, monitor, job control, migration, daemon
+- `src/awsqueueengine/cli.py` — legacy `awsqueueengine` shim that dispatches to one of the two
+- `scripts/` — local-only utilities (smoke tests for remote queue host validation)
+- `tests/` — unit + subprocess tests
+- `setup.py` — packaging

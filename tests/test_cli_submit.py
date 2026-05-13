@@ -10,8 +10,10 @@ from unittest.mock import patch
 
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
-QUEUE_FILE_NAME = ".aws_slurm_like_queue.json"
-RUNNING_FILE_NAME = ".aws_slurm_like_running.json"
+# Phase 5 moved state files under ~/.awsqe/host/. The subprocess tests below
+# point HOME at a tempdir, so the daemon writes/reads them at <tempdir>/.awsqe/host/.
+QUEUE_FILE_REL = Path(".awsqe") / "host" / "queue.json"
+RUNNING_FILE_REL = Path(".awsqe") / "host" / "running.json"
 
 
 class CliSubmitTests(unittest.TestCase):
@@ -86,13 +88,14 @@ class CliSubmitTests(unittest.TestCase):
         return subprocess.run(cmd, cwd=str(REPO_ROOT), env=env, capture_output=True, text=True)
 
     def _read_queue(self):
-        queue_file = self.home_path / QUEUE_FILE_NAME
+        queue_file = self.home_path / QUEUE_FILE_REL
         if not queue_file.exists():
             return []
         return json.loads(queue_file.read_text())
 
     def _write_running(self, payload):
-        running_file = self.home_path / RUNNING_FILE_NAME
+        running_file = self.home_path / RUNNING_FILE_REL
+        running_file.parent.mkdir(parents=True, exist_ok=True)
         running_file.write_text(json.dumps(payload, indent=2))
 
     def _make_fake_ssh(self, exit_code=0):

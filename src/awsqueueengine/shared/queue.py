@@ -23,6 +23,7 @@ def load_queue():
 
 
 def save_queue(q):
+    QUEUE_FILE.parent.mkdir(parents=True, exist_ok=True)
     QUEUE_FILE.write_text(json.dumps(q, indent=2))
 
 

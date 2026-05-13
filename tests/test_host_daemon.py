@@ -272,7 +272,7 @@ class LogsTests(unittest.TestCase):
              patch("awsqueueengine.host.daemon.subprocess.run", side_effect=fake_run):
             rc = daemon.logs(user_mode=False, follow=True, lines=50, dry_run=False)
         self.assertEqual(rc, 0)
-        self.assertEqual(captured["argv"], ["journalctl", "-u", "awsqe-host", "-f", "-n", "50"])
+        self.assertEqual(captured["argv"], ["journalctl", "-u", "awsqe-host", "--no-pager", "-f", "-n", "50"])
 
     def test_logs_user_mode_passes_user_flag(self):
         captured = {}
@@ -297,6 +297,19 @@ class LogsTests(unittest.TestCase):
                 rc = daemon.logs(user_mode=False, follow=False, lines=None, dry_run=False)
         self.assertEqual(rc, 1)
         self.assertIn("journalctl not available", buf.getvalue())
+
+    def test_logs_ctrl_c_during_follow_exits_cleanly_with_130(self):
+        # `awsqe-host logs -f` blocks waiting on journalctl; Ctrl-C in the
+        # outer shell raises KeyboardInterrupt out of subprocess.run. Without
+        # the catch, the user gets a multi-line traceback for what should be
+        # a silent exit.
+        def fake_run_raises_kbd(argv):
+            raise KeyboardInterrupt()
+
+        with patch("awsqueueengine.host.daemon.shutil.which", side_effect=lambda n: f"/usr/bin/{n}"), \
+             patch("awsqueueengine.host.daemon.subprocess.run", side_effect=fake_run_raises_kbd):
+            rc = daemon.logs(user_mode=False, follow=True, lines=None, dry_run=False)
+        self.assertEqual(rc, 130)  # 128 + SIGINT(2)
 
 
 if __name__ == "__main__":

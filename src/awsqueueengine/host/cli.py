@@ -18,6 +18,7 @@ from ..shared.cli_utils import join_command_argv
 from ..shared.config import HOSTS, HOSTS_FILE
 from ..shared.deferred_state import load_deferred_jobs, pop_all_deferred, pop_deferred_by_indices
 from ..shared.job_lookup import lookup_job_state
+from ..shared.paths import PIDFILE
 from ..shared.queue import (
     build_resume_item,
     enqueue_item,
@@ -45,14 +46,13 @@ from .monitor import (
 from .notifications import parse_email_recipients, send_email
 
 
-PIDFILE = Path.home() / "awsqueueengine.pid"
-
 stop_event = threading.Event()
 
 
 # ---------- pidfile + daemon helpers ----------
 
 def write_pidfile():
+    PIDFILE.parent.mkdir(parents=True, exist_ok=True)
     PIDFILE.write_text(str(os.getpid()))
 
 
@@ -449,6 +449,16 @@ def cmd_monitor(args):
     """Foreground monitor runner. Called by `awsqe-host monitor` (and by
     the systemd unit's ExecStart), and used by the legacy
     `awsqueueengine start-monitor` shim for backward compat."""
+    # First-restart-after-upgrade: pick up any legacy ~/.aws_slurm_like_*.json
+    # before the monitor loop starts reading state. Idempotent after that.
+    from . import migration
+    auto_result = migration.auto_migrate_if_needed()
+    if auto_result and auto_result.moved:
+        print(
+            f"[migration] moved {len(auto_result.moved)} legacy state file(s) "
+            f"into {auto_result.moved[0][1].parent}",
+            flush=True,
+        )
     pid = read_pidfile()
     if pid and pid_is_running(pid):
         print(f"Monitor already running (pid={pid})", flush=True)
@@ -612,6 +622,13 @@ def build_parser():
     p_job_info.add_argument("job_id")
     _add_monitor_subparser(sub)
 
+    p_migrate = sub.add_parser(
+        "migrate",
+        help="One-shot move of legacy ~/.aws_slurm_like_*.json state into ~/.awsqe/host/.",
+    )
+    p_migrate.add_argument("--dry-run", action="store_true", help="Print what would happen; touch nothing.")
+    p_migrate.add_argument("--force", action="store_true", help="Re-run migration even if it already completed.")
+
     # systemd-style daemon verbs
     p_install = _add_daemon_subparser(sub, "install", "Install the systemd unit and enable --now.")
     p_install.add_argument("--force", action="store_true", help="Overwrite an existing unit file.")
@@ -678,6 +695,11 @@ def dispatch(args, parser=None):
         cmd_job_info(args)
     elif cmd == "monitor":
         cmd_monitor(args)
+    elif cmd == "migrate":
+        from . import migration
+        result = migration.migrate(dry_run=bool(args.dry_run), force=bool(args.force))
+        print(migration.render_summary(result, dry_run=bool(args.dry_run)), flush=True)
+        sys.exit(0)
     elif cmd in {"install", "uninstall", "start", "stop", "restart", "status", "logs"}:
         from . import daemon as daemon_mod
         user_mode = bool(getattr(args, "user", False))
