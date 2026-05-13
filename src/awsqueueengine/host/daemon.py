@@ -205,7 +205,9 @@ def install(*, user_mode: bool, force: bool, dry_run: bool) -> int:
     _run([*plan.systemctl_args, "daemon-reload"], dry_run=dry_run)
     _run([*plan.systemctl_args, "enable", "--now", SERVICE_NAME], dry_run=dry_run)
     location = "user" if plan.user_mode else "system"
-    print(f"Installed {location} unit at {plan.unit_path} and started {SERVICE_NAME}.", flush=True)
+    prefix = "[dry-run] would install" if dry_run else "Installed"
+    suffix = "" if dry_run else f" and started {SERVICE_NAME}"
+    print(f"{prefix} {location} unit at {plan.unit_path}{suffix}.", flush=True)
     if plan.user_mode:
         print(
             "Tip: run `loginctl enable-linger $USER` to keep the daemon running "
@@ -225,7 +227,9 @@ def uninstall(*, user_mode: bool, dry_run: bool) -> int:
     removed = _remove_unit(plan, dry_run=dry_run)
     if systemctl_available():
         _run([*plan.systemctl_args, "daemon-reload"], dry_run=dry_run)
-    if removed or dry_run:
+    if dry_run:
+        print(f"[dry-run] would remove {plan.unit_path}.", flush=True)
+    elif removed:
         print(f"Removed {plan.unit_path}.", flush=True)
     else:
         print(f"No unit at {plan.unit_path}; nothing to remove.", flush=True)

@@ -173,6 +173,31 @@ class DryRunInstallTests(unittest.TestCase):
         self.assertEqual(rc, 0)
         self.assertIn("[dry-run] write unit", out)
 
+    def test_dry_run_summary_says_would_install_not_installed(self):
+        """Under --dry-run nothing actually happened, so the final summary must
+        not falsely claim 'Installed ... and started ...'."""
+        with patch("awsqueueengine.host.daemon.systemctl_available", return_value=True):
+            rc, out = self._install(user_mode=True, force=False)
+        self.assertEqual(rc, 0)
+        self.assertIn("[dry-run] would install", out)
+        self.assertNotIn("and started", out)
+
+    def test_real_install_summary_says_installed_and_started(self):
+        """Sanity check the non-dry-run summary still mentions 'Installed' and
+        'started' so we don't accidentally regress the real-mode wording."""
+        captured = io.StringIO()
+        with patch("awsqueueengine.host.daemon.systemctl_available", return_value=True), \
+             patch("awsqueueengine.host.daemon._write_unit"), \
+             patch("awsqueueengine.host.daemon._run"), \
+             patch("pathlib.Path.exists", return_value=False), \
+             contextlib.redirect_stdout(captured):
+            rc = daemon.install(user_mode=True, force=False, dry_run=False)
+        out = captured.getvalue()
+        self.assertEqual(rc, 0)
+        self.assertIn("Installed", out)
+        self.assertIn("and started", out)
+        self.assertNotIn("[dry-run]", out)
+
 
 class DryRunUninstallTests(unittest.TestCase):
     def test_uninstall_user_dry_run_disables_and_removes_unit(self):
@@ -186,6 +211,19 @@ class DryRunUninstallTests(unittest.TestCase):
         self.assertIn("systemctl --user disable --now awsqe-host", out)
         self.assertIn("[dry-run] rm", out)
         self.assertIn("systemctl --user daemon-reload", out)
+
+    def test_dry_run_summary_says_would_remove_not_removed(self):
+        """Under --dry-run the summary must not claim the unit was removed."""
+        buf = io.StringIO()
+        with patch("awsqueueengine.host.daemon.systemctl_available", return_value=True), \
+             patch("pathlib.Path.exists", return_value=True), \
+             contextlib.redirect_stdout(buf):
+            daemon.uninstall(user_mode=True, dry_run=True)
+        out = buf.getvalue()
+        self.assertIn("[dry-run] would remove", out)
+        # The bare 'Removed <path>.' line (without the [dry-run] prefix) must not appear.
+        for line in out.splitlines():
+            self.assertNotRegex(line, r"^Removed ")
 
 
 class StatusAndStartFallbackTests(unittest.TestCase):
