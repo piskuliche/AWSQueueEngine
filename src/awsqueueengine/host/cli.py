@@ -14,6 +14,7 @@ import time
 from datetime import datetime
 from pathlib import Path
 
+from ..shared.cli_utils import join_command_argv
 from ..shared.config import HOSTS, HOSTS_FILE
 from ..shared.deferred_state import load_deferred_jobs, pop_all_deferred, pop_deferred_by_indices
 from ..shared.job_lookup import lookup_job_state
@@ -444,7 +445,10 @@ def cmd_job_info(args):
     print(json.dumps(state if state is not None else {}), flush=True)
 
 
-def cmd_start_monitor(args):
+def cmd_monitor(args):
+    """Foreground monitor runner. Called by `awsqe-host monitor` (and by
+    the systemd unit's ExecStart), and used by the legacy
+    `awsqueueengine start-monitor` shim for backward compat."""
     pid = read_pidfile()
     if pid and pid_is_running(pid):
         print(f"Monitor already running (pid={pid})", flush=True)
@@ -473,31 +477,38 @@ def cmd_start_monitor(args):
         release_monitor_lock(fd)
 
 
-def cmd_stop_monitor(args):
+def cmd_stop_monitor(args) -> int:
+    """Send SIGTERM to the pidfile-tracked monitor. Returns 0 on success, 1 on
+    'nothing to stop'. Returns int instead of sys.exiting so callers (the
+    daemon module's fallback, the legacy shim) can route the exit code themselves."""
     pid = read_pidfile()
     if not pid:
         print("Monitor not running (no pidfile).", flush=True)
-        sys.exit(1)
+        return 1
 
     if not pid_is_running(pid):
         print(f"Stale pidfile found (pid={pid}); cleaning up.", flush=True)
         remove_pidfile()
-        sys.exit(1)
+        return 1
 
     print(f"Stopping monitor (pid={pid})...", flush=True)
     os.kill(pid, signal.SIGTERM)
+    return 0
 
 
-def cmd_status_monitor(args):
+def cmd_status_monitor(args) -> int:
+    """Report monitor running/not-running. Returns 0 if running, 1 otherwise,
+    so the exit code is scriptable from CI / health checks."""
     pid = read_pidfile()
     if not pid:
         print("Monitor not running.", flush=True)
-        return
+        return 1
 
     if pid_is_running(pid):
         print(f"Monitor running (pid={pid})", flush=True)
-    else:
-        print(f"Monitor NOT running (stale pidfile pid={pid})", flush=True)
+        return 0
+    print(f"Monitor NOT running (stale pidfile pid={pid})", flush=True)
+    return 1
 
 
 def cmd_test_email():
@@ -567,9 +578,19 @@ def _add_enable_host_subparser(sub):
     return p
 
 
-def _add_start_monitor_subparser(sub):
-    p = sub.add_parser("start-monitor", help="Start the monitor loop (foreground; Phase 4 replaces with systemd)")
+def _add_monitor_subparser(sub):
+    p = sub.add_parser(
+        "monitor",
+        help="Run the monitor loop in the foreground (used as systemd ExecStart).",
+    )
     p.add_argument("--hosts-file", default=None)
+    return p
+
+
+def _add_daemon_subparser(sub, name, help_text):
+    p = sub.add_parser(name, help=help_text)
+    p.add_argument("--user", action="store_true", help="Operate on the per-user unit instead of the system unit.")
+    p.add_argument("--dry-run", action="store_true", help="Print what would happen; don't run anything.")
     return p
 
 
@@ -589,9 +610,20 @@ def build_parser():
     _add_enable_host_subparser(sub)
     p_job_info = sub.add_parser("job-info", help="Emit JSON state for a job_id")
     p_job_info.add_argument("job_id")
-    _add_start_monitor_subparser(sub)
-    sub.add_parser("stop-monitor", help="Stop the running monitor loop")
-    sub.add_parser("status-monitor", help="Show monitor status")
+    _add_monitor_subparser(sub)
+
+    # systemd-style daemon verbs
+    p_install = _add_daemon_subparser(sub, "install", "Install the systemd unit and enable --now.")
+    p_install.add_argument("--force", action="store_true", help="Overwrite an existing unit file.")
+    _add_daemon_subparser(sub, "uninstall", "Disable + remove the systemd unit.")
+    _add_daemon_subparser(sub, "start", "Start the daemon (systemctl start; foreground fallback).")
+    _add_daemon_subparser(sub, "stop", "Stop the daemon (systemctl stop; pidfile fallback).")
+    _add_daemon_subparser(sub, "restart", "Restart the daemon (systemctl restart).")
+    _add_daemon_subparser(sub, "status", "Show daemon status (systemctl status; pidfile fallback).")
+    p_logs = _add_daemon_subparser(sub, "logs", "Tail journal logs for the daemon.")
+    p_logs.add_argument("-f", "--follow", action="store_true", help="Follow new entries.")
+    p_logs.add_argument("-n", "--lines", type=int, default=None, help="Show the last N lines.")
+
     sub.add_parser("rpc", help="Read one JSON RPC request from stdin and write a response to stdout")
 
     return parser
@@ -607,7 +639,7 @@ def dispatch(args, parser=None):
         if not args.command:
             print("No command provided.", flush=True)
             sys.exit(1)
-        command = " ".join(args.command).strip()
+        command = join_command_argv(args.command)
         if not command:
             print("No command provided.", flush=True)
             sys.exit(1)
@@ -644,12 +676,31 @@ def dispatch(args, parser=None):
         cmd_enable_host(args)
     elif cmd == "job-info":
         cmd_job_info(args)
-    elif cmd == "start-monitor":
-        cmd_start_monitor(args)
-    elif cmd == "stop-monitor":
-        cmd_stop_monitor(args)
-    elif cmd == "status-monitor":
-        cmd_status_monitor(args)
+    elif cmd == "monitor":
+        cmd_monitor(args)
+    elif cmd in {"install", "uninstall", "start", "stop", "restart", "status", "logs"}:
+        from . import daemon as daemon_mod
+        user_mode = bool(getattr(args, "user", False))
+        dry_run = bool(getattr(args, "dry_run", False))
+        if cmd == "install":
+            sys.exit(daemon_mod.install(user_mode=user_mode, force=bool(args.force), dry_run=dry_run))
+        if cmd == "uninstall":
+            sys.exit(daemon_mod.uninstall(user_mode=user_mode, dry_run=dry_run))
+        if cmd == "start":
+            sys.exit(daemon_mod.start(user_mode=user_mode, dry_run=dry_run))
+        if cmd == "stop":
+            sys.exit(daemon_mod.stop(user_mode=user_mode, dry_run=dry_run))
+        if cmd == "restart":
+            sys.exit(daemon_mod.restart(user_mode=user_mode, dry_run=dry_run))
+        if cmd == "status":
+            sys.exit(daemon_mod.status(user_mode=user_mode, dry_run=dry_run))
+        if cmd == "logs":
+            sys.exit(daemon_mod.logs(
+                user_mode=user_mode,
+                follow=bool(args.follow),
+                lines=args.lines,
+                dry_run=dry_run,
+            ))
     elif cmd == "rpc":
         from . import rpc as rpc_module
         sys.exit(rpc_module.run_rpc_stdin_stdout())

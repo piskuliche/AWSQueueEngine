@@ -16,6 +16,7 @@ from pathlib import Path
 from .client import cli as client_cli
 from .client.config import effective_queue_host
 from .host import cli as host_cli
+from .shared.cli_utils import join_command_argv
 
 
 def _build_parser():
@@ -148,14 +149,12 @@ def main():
         host_cli.cmd_job_info(args)
         return
     if cmd == "start-monitor":
-        host_cli.cmd_start_monitor(args)
+        host_cli.cmd_monitor(args)
         return
     if cmd == "stop-monitor":
-        host_cli.cmd_stop_monitor(args)
-        return
+        sys.exit(host_cli.cmd_stop_monitor(args))
     if cmd == "status-monitor":
-        host_cli.cmd_status_monitor(args)
-        return
+        sys.exit(host_cli.cmd_status_monitor(args))
 
     # DUAL subcommands: --queue-host routes to client; otherwise host.
     if cmd == "submit":
@@ -174,7 +173,7 @@ def main():
         if args.queue and args.hosts:
             print("--queue and --hosts cannot be used together.", flush=True)
             sys.exit(1)
-        command = " ".join(args.command).strip()
+        command = join_command_argv(args.command)
         if not command:
             print("No command provided.", flush=True)
             sys.exit(1)
