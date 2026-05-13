@@ -592,6 +592,7 @@ def build_parser():
     _add_start_monitor_subparser(sub)
     sub.add_parser("stop-monitor", help="Stop the running monitor loop")
     sub.add_parser("status-monitor", help="Show monitor status")
+    sub.add_parser("rpc", help="Read one JSON RPC request from stdin and write a response to stdout")
 
     return parser
 
@@ -649,6 +650,9 @@ def dispatch(args, parser=None):
         cmd_stop_monitor(args)
     elif cmd == "status-monitor":
         cmd_status_monitor(args)
+    elif cmd == "rpc":
+        from . import rpc as rpc_module
+        sys.exit(rpc_module.run_rpc_stdin_stdout())
     else:
         if parser is not None:
             parser.print_help()

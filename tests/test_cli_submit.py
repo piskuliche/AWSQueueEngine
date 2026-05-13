@@ -116,6 +116,22 @@ class CliSubmitTests(unittest.TestCase):
         ssh_path.chmod(0o755)
         return bin_dir
 
+    def _make_fake_ssh_rpc(self, capture_path, stdin_path, result):
+        """Fake `ssh <host> awsqe-host rpc` that captures argv + stdin and returns a JSON response."""
+        bin_dir = self.home_path / "bin"
+        bin_dir.mkdir(exist_ok=True)
+        ssh_path = bin_dir / "ssh"
+        response = json.dumps({"version": 1, "ok": True, "result": result})
+        ssh_path.write_text(
+            "#!/bin/sh\n"
+            f"printf '%s\\n' \"$@\" > {str(capture_path)!r}\n"
+            f"cat > {str(stdin_path)!r}\n"
+            f"printf '%s' {response!r}\n"
+            "exit 0\n"
+        )
+        ssh_path.chmod(0o755)
+        return bin_dir
+
     def _write_hosts_file(self, content):
         hosts_file = self.home_path / "hosts.txt"
         hosts_file.write_text(content)
@@ -300,7 +316,12 @@ class CliSubmitTests(unittest.TestCase):
 
     def test_remote_submit_without_payload_forwards_over_ssh_and_does_not_write_local_queue(self):
         capture_path = self.home_path / "ssh_args.txt"
-        fake_ssh_dir = self._make_fake_ssh_capture(capture_path)
+        stdin_path = self.home_path / "ssh_stdin.txt"
+        fake_ssh_dir = self._make_fake_ssh_rpc(
+            capture_path,
+            stdin_path,
+            result={"job_id": "JOB", "queue": "default", "hosts": ["eci17"]},
+        )
 
         res = self._run_cli_with_path_prefix(
             fake_ssh_dir,
@@ -316,14 +337,19 @@ class CliSubmitTests(unittest.TestCase):
         )
 
         self.assertEqual(res.returncode, 0)
-        self.assertIn("remote ok", res.stdout)
+        self.assertIn("Submitted ", res.stdout)
         self.assertEqual(self._read_queue(), [])
         captured = capture_path.read_text().splitlines()
         self.assertEqual(captured[0], "queuebox")
-        self.assertIn("awsqueueengine submit", captured[1])
-        self.assertIn("--hosts eci17", captured[1])
-        self.assertIn("--priority 5", captured[1])
-        self.assertIn("'echo hello world'", captured[1])
+        self.assertEqual(captured[1], "awsqe-host")
+        self.assertEqual(captured[2], "rpc")
+        request = json.loads(stdin_path.read_text())
+        self.assertEqual(request["version"], 1)
+        self.assertEqual(request["method"], "enqueue")
+        params = request["params"]
+        self.assertEqual(params["cmd"], "echo hello world")
+        self.assertEqual(params["hosts"], ["eci17"])
+        self.assertEqual(params["priority"], 5)
 
     def test_remote_submit_rejects_host_set_with_hosts(self):
         res = self._run_cli(
@@ -344,7 +370,12 @@ class CliSubmitTests(unittest.TestCase):
 
     def test_remote_submit_with_host_set_forwards_name_to_queue_host(self):
         capture_path = self.home_path / "ssh_args.txt"
-        fake_ssh_dir = self._make_fake_ssh_capture(capture_path)
+        stdin_path = self.home_path / "ssh_stdin.txt"
+        fake_ssh_dir = self._make_fake_ssh_rpc(
+            capture_path,
+            stdin_path,
+            result={"job_id": "JOB", "queue": "fast", "hosts": None},
+        )
 
         res = self._run_cli_with_path_prefix(
             fake_ssh_dir,
@@ -360,14 +391,18 @@ class CliSubmitTests(unittest.TestCase):
         )
 
         self.assertEqual(res.returncode, 0)
-        self.assertIn("remote ok", res.stdout)
+        self.assertIn("Submitted ", res.stdout)
         self.assertEqual(self._read_queue(), [])
         captured = capture_path.read_text().splitlines()
         self.assertEqual(captured[0], "queuebox")
-        self.assertIn("awsqueueengine submit", captured[1])
-        self.assertIn("--queue fast", captured[1])
-        self.assertIn("--priority 5", captured[1])
-        self.assertIn("'echo hello world'", captured[1])
+        self.assertEqual(captured[1], "awsqe-host")
+        self.assertEqual(captured[2], "rpc")
+        request = json.loads(stdin_path.read_text())
+        self.assertEqual(request["method"], "enqueue")
+        params = request["params"]
+        self.assertEqual(params["queue"], "fast")
+        self.assertEqual(params["priority"], 5)
+        self.assertEqual(params["cmd"], "echo hello world")
 
     def test_remote_submit_rejects_local_hosts_file(self):
         hosts_file = self._write_hosts_file("eci1\n")
@@ -388,38 +423,37 @@ class CliSubmitTests(unittest.TestCase):
             hosts_file = None
             payload = str(payload_dir)
             host_set = None
+            queue = None
             hosts = ["eci17"]
             priority = None
             high_priority = True
             preempt = True
+            job_id = None
 
         captured = {}
 
-        def fake_run_remote_submit(queue_host, remote_argv):
-            captured["queue_host"] = queue_host
-            captured["remote_argv"] = remote_argv
-
-            class Result:
-                returncode = 0
-                stdout = "remote enqueued\n"
-                stderr = ""
-
-            return Result()
+        def fake_rpc_call(host, method, params, **kwargs):
+            captured["queue_host"] = host
+            captured["method"] = method
+            captured["params"] = params
+            return {"job_id": params.get("job_id"), "queue": params.get("queue"), "hosts": params.get("hosts")}
 
         from awsqueueengine.client import cli as client_cli
 
         with patch("awsqueueengine.client.cli.upload_payload_archive_to_s3", return_value="s3://bucket/key.tar.gz") as upload, patch(
-            "awsqueueengine.client.cli.run_remote_submit", side_effect=fake_run_remote_submit
+            "awsqueueengine.client.cli.rpc_call", side_effect=fake_rpc_call
         ):
             client_cli.cmd_submit_remote(Args(), "bash run.sh")
 
         upload.assert_called_once()
         self.assertEqual(captured["queue_host"], "queuebox")
-        self.assertIn("--payload-s3-uri", captured["remote_argv"])
-        self.assertIn("s3://bucket/key.tar.gz", captured["remote_argv"])
-        self.assertIn("--payload-size-bytes", captured["remote_argv"])
-        self.assertIn("--high-priority", captured["remote_argv"])
-        self.assertIn("--preempt", captured["remote_argv"])
+        self.assertEqual(captured["method"], "enqueue")
+        params = captured["params"]
+        self.assertEqual(params["payload_s3_uri"], "s3://bucket/key.tar.gz")
+        self.assertIn("payload_size_bytes", params)
+        self.assertTrue(params.get("high_priority"))
+        self.assertTrue(params.get("preempt"))
+        self.assertEqual(params["hosts"], ["eci17"])
 
     def test_requeue_running_requeues_even_when_kill_fails(self):
         fake_ssh_dir = self._make_fake_ssh(exit_code=1)
