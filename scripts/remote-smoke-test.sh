@@ -13,7 +13,7 @@
 #      queue host
 #      — Runs the same code systemd's ExecStart would run, but with:
 #         * HOME pointed at a tempdir (so state files like
-#           ~/.aws_slurm_like_queue.json are read/written under /tmp, not
+#           ~/.awsqe/host/queue.json are read/written under /tmp, not
 #           your production home),
 #         * AWSQUEUEENGINE_QUEUES pointed at a non-resolvable hostname (so
 #           the monitor's SSH polls fail cleanly instead of touching real
@@ -100,8 +100,8 @@ echo "monitor rc=$RC (124 = timeout killed it after grace; 143 = exited via SIGT
 echo
 
 echo "--- 3. state files created under the sandbox ---"
-if ls -la "$SANDBOX"/.aws_slurm_like_* 2>/dev/null; then
-    echo "  (these are sandbox-only; the prod ~/.aws_slurm_like_*.json was NOT touched)"
+if ls -la "$SANDBOX"/.awsqe/host/ 2>/dev/null; then
+    echo "  (these are sandbox-only; the prod ~/.awsqe/host/ was NOT touched)"
 else
     echo "  (none — expected when the queue stays empty)"
 fi
@@ -112,7 +112,12 @@ rm -rf "$SANDBOX"
 echo "removed $SANDBOX"
 echo
 echo "--- 5. confirm prod state files are untouched ---"
-ls -la ~/.aws_slurm_like_*.json 2>/dev/null | head -5 || echo "  (no prod state files in home — interesting; check if daemon runs elsewhere)"
+# Phase 5+ daemons keep state under ~/.awsqe/host/; legacy installs may
+# still have the old ~/.aws_slurm_like_*.json files (or *.migrated.bak
+# leftovers from a prior `awsqe-host migrate`).
+ls -la ~/.awsqe/host/ 2>/dev/null | head -10 || echo "  (no ~/.awsqe/host/; either fresh AMI or daemon never ran)"
+echo "--- legacy files (if any):"
+ls -la ~/.aws_slurm_like_* 2>/dev/null | head -10 || echo "  (none)"
 EOF
 
 echo

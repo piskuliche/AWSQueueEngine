@@ -50,6 +50,7 @@ def load_running_jobs():
 
 
 def save_running_jobs(running_jobs):
+    RUNNING_FILE.parent.mkdir(parents=True, exist_ok=True)
     if not isinstance(running_jobs, dict):
         RUNNING_FILE.write_text("{}")
         return

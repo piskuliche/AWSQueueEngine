@@ -235,12 +235,14 @@ section "clear sandbox env"
 systemctl --user unset-environment AWSQUEUEENGINE_QUEUES
 systemctl --user show-environment | grep AWSQUEUEENGINE_QUEUES || echo "(QUEUES env cleared)"
 
-section "state files in remote ~/ "
-ls -la ~/.aws_slurm_like_* 2>/dev/null | head
+section "state files in remote ~/.awsqe/host/"
+ls -la ~/.awsqe/host/ 2>/dev/null | head
 echo "--- queue contents (should be empty list after 'awsqe-host clear'):"
-cat ~/.aws_slurm_like_queue.json 2>/dev/null || echo "(no queue file)"
+cat ~/.awsqe/host/queue.json 2>/dev/null || echo "(no queue file)"
 echo "--- running jobs:"
-cat ~/.aws_slurm_like_running.json 2>/dev/null || echo "(no running file)"
+cat ~/.awsqe/host/running.json 2>/dev/null || echo "(no running file)"
+echo "--- legacy *.migrated.bak files (should be empty on a fresh AMI):"
+ls -la ~/.aws_slurm_like_*.migrated.bak 2>/dev/null || echo "(none — expected on fresh instance)"
 
 section "done"
 EOF
@@ -248,4 +250,4 @@ EOF
 echo
 echo "=== fresh-instance test complete on ${REMOTE_HOST} ==="
 echo "Source tree is left at ~/${REMOTE_REPO} on the remote for further poking."
-echo "To fully clean up: ssh ${REMOTE_HOST} 'rm -rf ~/AWSQueueEngine ~/.aws_slurm_like_*.json'"
+echo "To fully clean up: ssh ${REMOTE_HOST} 'rm -rf ~/AWSQueueEngine ~/.awsqe ~/.aws_slurm_like_*'"

@@ -1,10 +1,10 @@
-"""Host-only configuration: monitor state, alert settings, Mailtrap."""
+"""Host-only configuration: alert settings, Mailtrap.
+
+The monitor-state path moved to :mod:`awsqueueengine.shared.paths` in Phase 5.
+"""
 import os
-from pathlib import Path
 
 CHECK_INTERVAL = 60  # monitor poll interval, seconds
-
-MONITOR_STATE_FILE = Path.home() / ".aws_slurm_like_monitor_state.json"
 
 MAILTRAP_TOKEN = os.getenv("AWSQUEUEENGINE_MAILTRAP_TOKEN", "").strip()
 MAILTRAP_SENDER_EMAIL = os.getenv("AWSQUEUEENGINE_MAILTRAP_SENDER_EMAIL", "").strip()

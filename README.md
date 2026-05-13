@@ -76,7 +76,8 @@ Run the monitor as a systemd service (recommended):
 ```bash
 # System-wide unit (requires sudo). Writes /etc/systemd/system/awsqe-host.service,
 # runs daemon-reload, and enables --now. Runs as $SUDO_USER so the daemon owns
-# the same ~/.aws_slurm_like_*.json files you already have.
+# the same queue-host state files you already have (after Phase 5 the
+# daemon stores them under ~/.awsqe/host/; see "State migration" below).
 sudo awsqe-host install
 sudo awsqe-host status
 sudo awsqe-host logs -f      # system journal usually needs sudo (or
@@ -98,6 +99,44 @@ that you can Ctrl-C — no `nohup &` pattern needed.
 
 Legacy `awsqueueengine start-monitor` still works for backward compatibility
 (foreground + pidfile) and is removed in a later release.
+
+### State migration (one-shot, from Phase 5 onward)
+
+The queue host's state files moved from `~/.aws_slurm_like_*.json` to
+`~/.awsqe/host/`:
+
+```
+~/.awsqe/host/queue.json
+~/.awsqe/host/running.json
+~/.awsqe/host/completed.json
+~/.awsqe/host/deferred.json
+~/.awsqe/host/monitor_state.json
+~/.awsqe/host/lock
+~/.awsqe/host/pid
+```
+
+The daemon migrates them on first start; you can also run it explicitly:
+
+```bash
+awsqe-host migrate --dry-run     # preview what would move
+awsqe-host migrate               # actually move (idempotent)
+awsqe-host migrate --force       # re-run even if already migrated
+```
+
+For each legacy file the migration:
+1. Copies it (preserving mtime/perms) to its new home in `~/.awsqe/host/`.
+2. Renames the legacy file to `~/.aws_slurm_like_*.json.migrated.bak`.
+3. Stamps `migrated_at` in the new `monitor_state.json` so subsequent
+   runs are a no-op.
+
+If something goes wrong and you need to roll back, move the `.migrated.bak`
+files back to their original names and remove the new `~/.awsqe/host/`
+directory:
+
+```bash
+for f in ~/.aws_slurm_like_*.migrated.bak; do mv "$f" "${f%.migrated.bak}"; done
+rm -rf ~/.awsqe/host
+```
 
 The queue config is the single source of truth for worker assignment. Edit this
 file to move hosts between user queues; the monitor reloads it while running.
@@ -159,7 +198,7 @@ Use `requeue-running` to kill monitor-tracked running job(s) and requeue them ba
 their original host with priority `100`, preserving the remote payload path.
 `qstat` lists monitor-tracked running jobs and elapsed runtime (`HH:MM:SS`).
 When jobs finish, the monitor appends completion records to
-`~/.aws_slurm_like_completed.json` with the `qstat` fields plus final duration
+`~/.awsqe/host/completed.json` with the `qstat` fields plus final duration
 and timestamps (`started_at`, `finished_at`).
 
 ## Remote submit with S3 payloads
