@@ -1,9 +1,10 @@
 """Client-side CLI: `awsqe-client`.
 
 Runs on a user's machine. Drives the queue host through the JSON-over-SSH
-RPC defined in :mod:`awsqueueengine.shared.protocol`. Phase 3 will add a
-persisted `queue_host` setting at `~/.awsqe/client/config.toml`; until
-then, every command that needs a queue host requires `--queue-host`.
+RPC defined in :mod:`awsqueueengine.shared.protocol`. The queue host and
+S3 settings come from ``~/.awsqe/client/config.toml`` (managed via
+``awsqe-client config set ...``) when not provided on the command line.
+Resolution precedence is **CLI flag > env var > config > error**.
 """
 import argparse
 import os
@@ -30,6 +31,19 @@ from ..shared.run_info import (
     write_run_info_file,
 )
 from ..shared.worker_actions import kill_managed_on_host, new_job_tag, tail_remote_log
+from . import config as client_config
+from .config import (
+    CONFIG_PATH,
+    KEY_SCHEMA,
+    effective_queue_host,
+    effective_s3_bucket,
+    effective_s3_prefix,
+    load_config,
+    normalize_key,
+    save_config,
+    set_value,
+    unset_value,
+)
 from .staging import sizeof_local_path_bytes, where_is_next_submit
 from .submit import archive_payload_to_temp, upload_payload_archive_to_s3
 
@@ -116,6 +130,20 @@ def _resolve_queue_hosts_for_cli(hosts_file=None):
 
 def _payload_display_text(item):
     return item.get("payload_remote_path") or item.get("payload_s3_uri") or item.get("payload") or "-"
+
+
+def _resolve_queue_host(args, command):
+    """Resolve queue_host from CLI flag > config; exit with a clear pointer on miss."""
+    host = effective_queue_host(getattr(args, "queue_host", None))
+    if not host:
+        print(
+            f"awsqe-client {command} needs a queue host. Pass --queue-host <host> "
+            f"or run `awsqe-client config set queue-host <host>`.",
+            flush=True,
+        )
+        sys.exit(2)
+    args.queue_host = host
+    return host
 
 
 def _rpc(args, method, params=None):
@@ -237,11 +265,16 @@ def cmd_submit_remote(args, command):
     payload_size_bytes = None
     archive_path = None
     if args.payload:
+        client_cfg = load_config()
+        bucket = effective_s3_bucket(client_cfg)
+        prefix = effective_s3_prefix(client_cfg)
         payload_path = Path(args.payload).expanduser()
         payload_size_bytes = sizeof_local_path_bytes(payload_path)
         try:
             archive_path = archive_payload_to_temp(payload_path)
-            payload_s3_uri = upload_payload_archive_to_s3(archive_path, payload_path.name)
+            payload_s3_uri = upload_payload_archive_to_s3(
+                archive_path, payload_path.name, bucket=bucket, prefix=prefix,
+            )
         except Exception as exc:
             print(f"Remote submit payload upload failed: {exc}", flush=True)
             sys.exit(1)
@@ -325,7 +358,13 @@ def cmd_info(args):
     if not job_id:
         print(f"No job_id in {info_path}", flush=True)
         sys.exit(1)
-    queue_host = args.queue_host or existing.get("queue_host") or "local"
+    # Precedence: CLI flag > run.info > config > "local" (do lookup locally).
+    queue_host = (
+        args.queue_host
+        or existing.get("queue_host")
+        or effective_queue_host(None)
+        or "local"
+    )
     if queue_host == "local":
         state = lookup_job_state(job_id)
     else:
@@ -399,6 +438,58 @@ def cmd_requeue_deferred_remote(args):
     print(f"{action_label} {len(moved)} deferred job(s).", flush=True)
 
 
+# ---------- config subcommand handlers ----------
+
+def cmd_config_show(args):
+    cfg = load_config()
+    print(f"# {CONFIG_PATH}", flush=True)
+    rows = [
+        ("queue_host", cfg.queue_host),
+        ("s3.bucket", cfg.s3_bucket),
+        ("s3.prefix", cfg.s3_prefix),
+    ]
+    for key, value in rows:
+        display = value if value is not None else "(unset)"
+        print(f"{key} = {display}", flush=True)
+
+
+def cmd_config_get(args):
+    try:
+        key = normalize_key(args.key)
+    except ValueError as exc:
+        print(str(exc), flush=True)
+        sys.exit(1)
+    cfg = load_config()
+    value = client_config.get_value(cfg, key)
+    if value is None:
+        sys.exit(1)
+    print(value, flush=True)
+
+
+def cmd_config_set(args):
+    try:
+        key = normalize_key(args.key)
+    except ValueError as exc:
+        print(str(exc), flush=True)
+        sys.exit(1)
+    cfg = load_config()
+    set_value(cfg, key, args.value)
+    path = save_config(cfg)
+    print(f"Set {key} = {args.value!r} in {path}", flush=True)
+
+
+def cmd_config_unset(args):
+    try:
+        key = normalize_key(args.key)
+    except ValueError as exc:
+        print(str(exc), flush=True)
+        sys.exit(1)
+    cfg = load_config()
+    unset_value(cfg, key)
+    path = save_config(cfg)
+    print(f"Unset {key} in {path}", flush=True)
+
+
 def cmd_enable_host_remote(args):
     if args.all and args.hosts:
         print("--all cannot be combined with explicit host names.", flush=True)
@@ -437,16 +528,6 @@ def cmd_enable_host_remote(args):
 
 
 # ---------- argparse wiring ----------
-
-def _require_queue_host(args, command):
-    if not args.queue_host:
-        print(
-            f"awsqe-client {command} requires --queue-host (Phase 3 will read it from "
-            f"~/.awsqe/client/config.toml).",
-            flush=True,
-        )
-        sys.exit(2)
-
 
 def build_parser():
     parser = argparse.ArgumentParser(prog="awsqe-client", description="AWSQueueEngine client (submitter) CLI")
@@ -500,6 +581,21 @@ def build_parser():
     p_enable_host.add_argument("--all", "-all", action="store_true")
     p_enable_host.add_argument("--queue-host", default=None)
 
+    valid_keys = sorted(KEY_SCHEMA)
+    p_config = sub.add_parser(
+        "config",
+        help="Manage ~/.awsqe/client/config.toml (persistent client settings).",
+    )
+    config_sub = p_config.add_subparsers(dest="config_cmd")
+    config_sub.add_parser("show", help="Show all configured values")
+    p_cfg_get = config_sub.add_parser("get", help=f"Print one value. Keys: {', '.join(valid_keys)}")
+    p_cfg_get.add_argument("key")
+    p_cfg_set = config_sub.add_parser("set", help=f"Set one value. Keys: {', '.join(valid_keys)}")
+    p_cfg_set.add_argument("key")
+    p_cfg_set.add_argument("value")
+    p_cfg_unset = config_sub.add_parser("unset", help=f"Clear one value. Keys: {', '.join(valid_keys)}")
+    p_cfg_unset.add_argument("key")
+
     return parser
 
 
@@ -520,7 +616,7 @@ def dispatch(args, parser=None):
             if not payload_path.exists():
                 print(f"Payload not found on local filesystem: {payload_path}", flush=True)
                 sys.exit(1)
-        _require_queue_host(args, "submit")
+        _resolve_queue_host(args, "submit")
         cmd_submit_remote(args, command)
     elif cmd == "tail":
         cmd_tail(args)
@@ -531,20 +627,33 @@ def dispatch(args, parser=None):
     elif cmd == "info":
         cmd_info(args)
     elif cmd == "list":
-        _require_queue_host(args, "list")
+        _resolve_queue_host(args, "list")
         cmd_list_remote(args)
     elif cmd == "qstat":
-        _require_queue_host(args, "qstat")
+        _resolve_queue_host(args, "qstat")
         cmd_qstat_remote(args)
     elif cmd == "deferred":
-        _require_queue_host(args, "deferred")
+        _resolve_queue_host(args, "deferred")
         cmd_deferred_remote(args)
     elif cmd == "requeue-deferred":
-        _require_queue_host(args, "requeue-deferred")
+        _resolve_queue_host(args, "requeue-deferred")
         cmd_requeue_deferred_remote(args)
     elif cmd == "enable-host":
-        _require_queue_host(args, "enable-host")
+        _resolve_queue_host(args, "enable-host")
         cmd_enable_host_remote(args)
+    elif cmd == "config":
+        config_cmd = getattr(args, "config_cmd", None)
+        if config_cmd == "show" or config_cmd is None:
+            cmd_config_show(args)
+        elif config_cmd == "get":
+            cmd_config_get(args)
+        elif config_cmd == "set":
+            cmd_config_set(args)
+        elif config_cmd == "unset":
+            cmd_config_unset(args)
+        else:
+            print(f"Unknown config subcommand: {config_cmd}", flush=True)
+            sys.exit(2)
     else:
         if parser is not None:
             parser.print_help()
