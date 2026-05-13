@@ -32,12 +32,10 @@ from ..shared.queue import (
 from ..shared.queue_config import (
     DEFAULT_QUEUE,
     QueueConfigSource,
-    get_configured_queue_source,
     normalize_queue_name,
 )
 from ..shared.running_state import load_running_jobs
 from ..shared.worker_actions import new_job_tag
-from .config import MONITOR_STATE_FILE  # noqa: F401  (intentionally not used here; monitor owns it)
 from .monitor import clear_host_cooldowns, get_host_cooldowns
 
 
