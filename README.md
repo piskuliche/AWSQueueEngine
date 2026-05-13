@@ -73,8 +73,8 @@ flags on every command. Settings live in `~/.awsqe/client/config.toml`:
 
 ```bash
 awsqe-client config set queue-host queue-manager
-awsqe-client config set s3.bucket   my-queue-payload-bucket
-awsqe-client config set s3.prefix   awsqueueengine/payloads   # optional; defaults to this
+awsqe-client config set s3.bucket   amberflow-default
+awsqe-client config set s3.prefix   jobs   
 awsqe-client config show                                       # inspect what's set
 awsqe-client config unset queue-host                           # clear one key
 ```
