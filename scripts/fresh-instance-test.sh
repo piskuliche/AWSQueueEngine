@@ -72,8 +72,30 @@ echo "commit:    $(git rev-parse --short HEAD 2>/dev/null || echo '?')"
 echo "python:    $(python3 --version 2>&1)"
 echo "systemctl: $(systemctl --version | head -1)"
 
+section "ensure pip is installed"
+if ! python3 -m pip --version >/dev/null 2>&1; then
+    echo "(pip not present; installing python3-pip via apt)"
+    sudo apt-get update -qq
+    sudo apt-get install -y python3-pip python3-venv
+fi
+python3 -m pip --version
+
 section "install package (--user, editable)"
-python3 -m pip install --user -e . 2>&1 | tail -6
+# Some Ubuntu releases mark the system Python as PEP-668-protected; in that
+# case pip --user errors with "externally-managed-environment". Retry with
+# --break-system-packages, which is safe here because patocontrol is a
+# throwaway test instance and the script removes everything in cleanup.
+PIP_OUT=$(python3 -m pip install --user -e . 2>&1) && PIP_RC=0 || PIP_RC=$?
+if [[ $PIP_RC -ne 0 ]] && echo "$PIP_OUT" | grep -q "externally-managed-environment"; then
+    echo "(externally-managed-environment detected; retrying with --break-system-packages)"
+    python3 -m pip install --user --break-system-packages -e . 2>&1 | tail -6
+elif [[ $PIP_RC -ne 0 ]]; then
+    echo "$PIP_OUT" | tail -20
+    echo "[FAIL] pip install failed for a reason other than PEP 668"
+    exit 1
+else
+    echo "$PIP_OUT" | tail -6
+fi
 # Make sure pip user bin dir is on PATH for this shell.
 export PATH="$HOME/.local/bin:$PATH"
 echo "awsqe-host -> $(command -v awsqe-host || echo NOT FOUND)"
