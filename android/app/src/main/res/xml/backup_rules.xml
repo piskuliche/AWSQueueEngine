@@ -1,0 +1,5 @@
+<?xml version="1.0" encoding="utf-8"?>
+<full-backup-content>
+    <!-- The encrypted prefs contain a private key. Exclude from cloud backup. -->
+    <exclude domain="sharedpref" path="awsqe_settings.xml" />
+</full-backup-content>
