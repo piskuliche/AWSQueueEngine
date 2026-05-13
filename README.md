@@ -78,7 +78,9 @@ Run the monitor as a systemd service (recommended):
 # runs daemon-reload, and enables --now. Runs as $SUDO_USER so the daemon owns
 # the same ~/.aws_slurm_like_*.json files you already have.
 sudo awsqe-host install
-sudo awsqe-host status       # or `awsqe-host logs -f` to tail the journal
+sudo awsqe-host status
+sudo awsqe-host logs -f      # system journal usually needs sudo (or
+                             # membership in the systemd-journal / adm group)
 ```
 
 Per-user variant (no root; lives at `~/.config/systemd/user/awsqe-host.service`):
@@ -136,7 +138,8 @@ awsqueueengine qdel 1 3
 awsqe-host start              # systemctl-aware; foreground fallback if no systemd
 awsqe-host status
 awsqe-host stop
-awsqe-host logs -f            # tail the daemon's journal
+awsqe-host logs -f            # tail journal — add --user for user units,
+                              # or run with sudo for system units
 awsqueueengine tail eci3
 awsqueueengine stop eci3
 awsqueueengine clear
