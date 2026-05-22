@@ -2,7 +2,7 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from awsqueueengine import running_state
+from awsqueueengine.shared import running_state
 
 
 class RunningStateTests(unittest.TestCase):

@@ -1,6 +1,6 @@
 # Queue management helpers
 import json
-from .config import QUEUE_FILE
+from .paths import QUEUE_FILE
 from .queue_config import DEFAULT_QUEUE, host_is_eligible_for_item, normalize_queue_name
 
 DEFAULT_PRIORITY = 0
@@ -23,6 +23,7 @@ def load_queue():
 
 
 def save_queue(q):
+    QUEUE_FILE.parent.mkdir(parents=True, exist_ok=True)
     QUEUE_FILE.write_text(json.dumps(q, indent=2))
 
 

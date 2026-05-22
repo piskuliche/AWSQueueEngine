@@ -4,7 +4,7 @@ from pathlib import Path
 import tempfile
 from unittest.mock import patch
 
-from awsqueueengine.monitor import (
+from awsqueueengine.host.monitor import (
     _build_job_fail_alert_body,
     _build_completed_job_record,
     _initial_alert_runtime_state,
@@ -47,7 +47,7 @@ class MonitorRunningStatePruneTests(unittest.TestCase):
             {"host": "eci6", "reachable": True, "pid": "123"},
         ]
 
-        with patch("awsqueueengine.monitor.time.time", return_value=160.0):
+        with patch("awsqueueengine.host.monitor.time.time", return_value=160.0):
             changed, completed_records = _prune_running_jobs_for_status(running_jobs, status_rows)
 
         self.assertTrue(changed)
@@ -265,32 +265,36 @@ class MonitorHostSourceTests(unittest.TestCase):
             def fake_launch_job_on_host(host, _job_item, running_jobs):
                 running_jobs[host] = {"cmd": "echo run-once"}
                 launched_hosts.append(host)
-                return True
+                # The real _launch_job_on_host returns a dict; monitor_loop reads
+                # `.get("launched")` on it. Returning a bare True (as this fake
+                # used to) crashed the loop with AttributeError mid-iteration,
+                # which is why this test was flaking.
+                return {"launched": True}
 
-            with patch("awsqueueengine.monitor.load_running_jobs", return_value={}), patch(
-                "awsqueueengine.monitor.parse_email_recipients", return_value=[]
-            ), patch("awsqueueengine.monitor._load_last_daily_summary_date", return_value=date(2026, 3, 10)), patch(
-                "awsqueueengine.monitor.status_all", side_effect=fake_status_all
+            with patch("awsqueueengine.host.monitor.load_running_jobs", return_value={}), patch(
+                "awsqueueengine.host.monitor.parse_email_recipients", return_value=[]
+            ), patch("awsqueueengine.host.monitor._load_last_daily_summary_date", return_value=date(2026, 3, 10)), patch(
+                "awsqueueengine.host.monitor.status_all", side_effect=fake_status_all
             ), patch(
-                "awsqueueengine.monitor.dequeue_for_host", side_effect=fake_dequeue_for_host
+                "awsqueueengine.host.monitor.dequeue_for_host", side_effect=fake_dequeue_for_host
             ), patch(
-                "awsqueueengine.monitor._launch_job_on_host", side_effect=fake_launch_job_on_host
+                "awsqueueengine.host.monitor._launch_job_on_host", side_effect=fake_launch_job_on_host
             ), patch(
-                "awsqueueengine.monitor._prune_running_jobs_for_status", return_value=(False, [])
+                "awsqueueengine.host.monitor._prune_running_jobs_for_status", return_value=(False, [])
             ), patch(
-                "awsqueueengine.monitor._select_preempt_target", return_value=(None, None, None)
+                "awsqueueengine.host.monitor._select_preempt_target", return_value=(None, None, None)
             ), patch(
-                "awsqueueengine.monitor.load_queue", return_value=[]
+                "awsqueueengine.host.monitor.load_queue", return_value=[]
             ), patch(
-                "awsqueueengine.monitor.save_queue"
+                "awsqueueengine.host.monitor.save_queue"
             ), patch(
-                "awsqueueengine.monitor.save_running_jobs"
+                "awsqueueengine.host.monitor.save_running_jobs"
             ), patch(
-                "awsqueueengine.monitor.append_completed_records"
+                "awsqueueengine.host.monitor.append_completed_records"
             ), patch(
-                "awsqueueengine.monitor._send_alert_email_with_limits", return_value=True
+                "awsqueueengine.host.monitor._send_alert_email_with_limits", return_value=True
             ), patch(
-                "awsqueueengine.monitor._save_last_daily_summary_date"
+                "awsqueueengine.host.monitor._save_last_daily_summary_date"
             ):
                 monitor_loop(
                     ["eci1", "eci2"],

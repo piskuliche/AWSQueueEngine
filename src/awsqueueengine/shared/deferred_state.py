@@ -1,7 +1,7 @@
 import json
 import time
 
-from .config import DEFERRED_FILE
+from .paths import DEFERRED_FILE
 from .queue import normalize_job_item
 
 
@@ -16,6 +16,7 @@ def load_deferred_jobs():
 
 
 def save_deferred_jobs(jobs):
+    DEFERRED_FILE.parent.mkdir(parents=True, exist_ok=True)
     DEFERRED_FILE.write_text(json.dumps(jobs, indent=2))
 
 

@@ -1,13 +1,44 @@
+"""Queue-host configuration: where the host learns which workers serve which queues.
+
+Discovery precedence used by :func:`get_configured_queue_source`:
+
+1. ``AWSQUEUEENGINE_QUEUES_FILE`` — explicit path to a queues JSON file.
+2. ``AWSQUEUEENGINE_QUEUES`` — inline config in the env var itself.
+3. ``~/.awsqe/host/queues.json`` — canonical disk location (preferred).
+4. ``~/awsqueueengine_queues.json`` — legacy home-dir location (backward compat).
+5. Built-in ``HOSTS`` constant — single ``default`` queue with ``eci1..eci20``.
+
+Steps 3 and 4 exist because the daemon is typically started via systemd with
+the env var set, but ad-hoc ``awsqe-host rpc`` invocations over non-interactive
+SSH don't inherit that env. Without a disk fallback, daemon and RPC subprocess
+would disagree about the queue config, and clients (Android viewer, desktop
+``awsqe-client`` on a third machine, etc.) would silently see the hardcoded
+defaults instead of the real config.
+
+(1) and (2) are mutually exclusive — setting both raises ``ValueError``.
+"""
 import json
 import os
+import sys
 from pathlib import Path
 
 from .config import HOSTS
+from .paths import HOST_STATE_DIR
 
 
 DEFAULT_QUEUE = "default"
 QUEUES_FILE_ENV = "AWSQUEUEENGINE_QUEUES_FILE"
 QUEUES_ENV = "AWSQUEUEENGINE_QUEUES"
+
+# Default discovery paths used when neither QUEUES_FILE_ENV nor QUEUES_ENV is
+# set. Searched in order; first existing file wins. This exists so that the
+# daemon (started via systemd with the env var) and ad-hoc `awsqe-host rpc`
+# invocations over non-interactive SSH (where the env var is usually absent)
+# converge on the same queue config without operator action.
+DEFAULT_QUEUES_CONFIG_PATHS = (
+    HOST_STATE_DIR / "queues.json",
+    Path.home() / "awsqueueengine_queues.json",
+)
 
 
 def normalize_queue_name(value):
@@ -127,6 +158,14 @@ def get_configured_queue_source():
         return "file", queues_file
     if queues_env:
         return "env", queues_env
+    # Neither env var set — try canonical disk paths so the daemon and the
+    # ad-hoc RPC subprocess (which may not inherit the env) agree.
+    for path in DEFAULT_QUEUES_CONFIG_PATHS:
+        try:
+            if path.is_file():
+                return "file", str(path)
+        except OSError:
+            continue
     return None, None
 
 
@@ -180,9 +219,13 @@ class QueueConfigSource:
             file_stamp = self._compute_file_stamp(active_file)
             if file_stamp is None:
                 if not self._missing_file_warned:
+                    # stderr, not stdout — `awsqe-host rpc` writes its JSON response
+                    # to stdout, and any text mixed in breaks the protocol on the
+                    # client side. Systemd still captures stderr to journald.
                     print(
                         f"[WARN] Queue hosts file not found: {active_file}. "
                         f"Keeping previous queue config ({len(self.all_hosts())} host(s)).",
+                        file=sys.stderr,
                         flush=True,
                     )
                     self._missing_file_warned = True
@@ -200,6 +243,7 @@ class QueueConfigSource:
                 print(
                     f"[WARN] Failed to read queue hosts file {active_file}: {exc}. "
                     f"Keeping previous queue config ({len(self.all_hosts())} host(s)).",
+                    file=sys.stderr,
                     flush=True,
                 )
                 self._last_file_stamp = file_stamp
@@ -209,6 +253,7 @@ class QueueConfigSource:
                 print(
                     f"[INFO] Queue hosts updated from {active_file}: "
                     f"{len(next_queues)} queue(s), {len(_all_hosts(next_queues))} host(s)",
+                    file=sys.stderr,
                     flush=True,
                 )
                 self._queues = next_queues

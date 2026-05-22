@@ -1,6 +1,6 @@
 import json
 
-from .config import COMPLETED_FILE
+from .paths import COMPLETED_FILE
 
 
 def load_completed_jobs():
@@ -14,6 +14,7 @@ def load_completed_jobs():
 
 
 def save_completed_jobs(records):
+    COMPLETED_FILE.parent.mkdir(parents=True, exist_ok=True)
     if not isinstance(records, list):
         COMPLETED_FILE.write_text("[]")
         return
