@@ -407,6 +407,30 @@ def cmd_deferred_remote(args):
     _render_deferred_jobs(result.get("jobs") or [])
 
 
+def cmd_qdel_remote(args):
+    if not args.indices:
+        print("Provide one or more queue index(es) to delete.", flush=True)
+        sys.exit(1)
+    result = _rpc(args, "qdel", {"indices": list(args.indices)})
+    removed = result.get("removed") or []
+    if not removed:
+        print("No jobs removed.", flush=True)
+        return
+    # Match the host CLI's qdel output so users moving between the two see the same thing.
+    for entry in removed:
+        idx = entry.get("index", 0)
+        item = entry.get("item") or {}
+        hosts_text = ",".join(item.get("hosts") or []) if item.get("hosts") else "-"
+        payload_text = _payload_display_text(item)
+        print(
+            f"  {idx:3d}. [job={item.get('job_id') or '-'}] [priority={item.get('priority', 0)}] "
+            f"[queue={item.get('queue', 'default')}] [hosts={hosts_text}] "
+            f"cmd={item.get('cmd')!r} payload={payload_text!r}",
+            flush=True,
+        )
+    print(f"Removed {len(removed)} job(s).", flush=True)
+
+
 def cmd_requeue_deferred_remote(args):
     if args.all and args.indices:
         print("--all cannot be combined with explicit indices.", flush=True)
@@ -574,6 +598,10 @@ def build_parser():
     p_deferred = sub.add_parser("deferred", help="Show deferred jobs on the queue host")
     p_deferred.add_argument("--queue-host", default=None)
 
+    p_qdel = sub.add_parser("qdel", help="Delete queued job(s) by list index")
+    p_qdel.add_argument("indices", nargs="+", type=int, metavar="INDEX")
+    p_qdel.add_argument("--queue-host", default=None)
+
     p_requeue_deferred = sub.add_parser("requeue-deferred", help="Requeue deferred job(s) on the queue host")
     p_requeue_deferred.add_argument("indices", nargs="*", type=int, default=[])
     p_requeue_deferred.add_argument("--all", "-all", action="store_true")
@@ -639,6 +667,9 @@ def dispatch(args, parser=None):
     elif cmd == "deferred":
         _resolve_queue_host(args, "deferred")
         cmd_deferred_remote(args)
+    elif cmd == "qdel":
+        _resolve_queue_host(args, "qdel")
+        cmd_qdel_remote(args)
     elif cmd == "requeue-deferred":
         _resolve_queue_host(args, "requeue-deferred")
         cmd_requeue_deferred_remote(args)

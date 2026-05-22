@@ -558,6 +558,48 @@ class CliSubmitTests(unittest.TestCase):
         items = self._read_queue()
         self.assertEqual([item["cmd"] for item in items], ["echo one", "echo two"])
 
+    def test_remote_qdel_forwards_indices_over_ssh(self):
+        # Mirrors the test_remote_submit pattern: stub rpc_call and verify the
+        # client builds the right RPC envelope rather than dispatching locally.
+        class Args:
+            queue_host = "queuebox"
+            indices = [1, 3]
+
+        captured = {}
+
+        def fake_rpc_call(host, method, params, **kwargs):
+            captured["queue_host"] = host
+            captured["method"] = method
+            captured["params"] = params
+            return {
+                "removed": [
+                    {"index": 1, "item": {"job_id": "JOB-A", "cmd": "echo a", "priority": 0,
+                                          "queue": "default", "hosts": None}},
+                    {"index": 3, "item": {"job_id": "JOB-C", "cmd": "echo c", "priority": 5,
+                                          "queue": "fast", "hosts": ["eci2"]}},
+                ]
+            }
+
+        from awsqueueengine.client import cli as client_cli
+        with patch("awsqueueengine.client.cli.rpc_call", side_effect=fake_rpc_call):
+            client_cli.cmd_qdel_remote(Args())
+
+        self.assertEqual(captured["queue_host"], "queuebox")
+        self.assertEqual(captured["method"], "qdel")
+        self.assertEqual(captured["params"], {"indices": [1, 3]})
+
+    def test_remote_qdel_rejects_empty_indices(self):
+        class Args:
+            queue_host = "queuebox"
+            indices = []
+
+        from awsqueueengine.client import cli as client_cli
+        with patch("awsqueueengine.client.cli.rpc_call") as rpc_mock:
+            with self.assertRaises(SystemExit) as cm:
+                client_cli.cmd_qdel_remote(Args())
+        self.assertEqual(cm.exception.code, 1)
+        rpc_mock.assert_not_called()
+
     def test_qstat_lists_running_jobs(self):
         self._write_running(
             {
