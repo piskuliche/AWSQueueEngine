@@ -189,6 +189,20 @@ class QueuePriorityTests(unittest.TestCase):
         self.assertEqual(resume_item["resume_host"], "eci7")
         self.assertEqual(resume_item["submit_failures"], 0)
 
+    def test_build_resume_item_preserves_mps_by_default(self):
+        on = queue.build_resume_item({"cmd": "x", "mps": True}, "eci7")
+        off = queue.build_resume_item({"cmd": "x", "mps": False}, "eci7")
+        absent = queue.build_resume_item({"cmd": "x"}, "eci7")
+        self.assertTrue(on["mps"])
+        self.assertFalse(off["mps"])
+        self.assertFalse(absent["mps"])
+
+    def test_build_resume_item_mps_override_forces_value(self):
+        forced_on = queue.build_resume_item({"cmd": "x", "mps": False}, "eci7", mps=True)
+        forced_off = queue.build_resume_item({"cmd": "x", "mps": True}, "eci7", mps=False)
+        self.assertTrue(forced_on["mps"])
+        self.assertFalse(forced_off["mps"])
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -53,6 +53,11 @@ def _build_parser():
 
     p_requeue = sub.add_parser("requeue-running", help="Kill running managed job(s) and requeue at priority 100")
     p_requeue.add_argument("--hosts-file", default=None)
+    p_requeue.add_argument(
+        "--mps",
+        action="store_true",
+        help="Force the NVIDIA MPS wrapper on the requeued job(s) (default: keep each job's current setting).",
+    )
     target = p_requeue.add_mutually_exclusive_group(required=True)
     target.add_argument("--hosts", action="append", default=None)
     target.add_argument("--all", "-all", action="store_true")

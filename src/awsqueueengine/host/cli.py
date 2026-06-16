@@ -380,6 +380,9 @@ def cmd_requeue_running(args):
         print("No target hosts found for requeue-running.", flush=True)
         return
 
+    # --mps forces the wrapper on; without it each job keeps its current setting.
+    mps_override = True if getattr(args, "mps", False) else None
+
     requeued_count = 0
     for host in target_hosts:
         running_item = running_jobs.get(host)
@@ -387,13 +390,14 @@ def cmd_requeue_running(args):
             print(f"No tracked running job on {host}; skipping requeue.", flush=True)
             continue
 
-        resume_item = build_resume_item(running_item, host, priority=100)
+        resume_item = build_resume_item(running_item, host, priority=100, mps=mps_override)
         q = load_queue()
         q.insert(0, resume_item)
         save_queue(q)
         requeued_count += 1
+        mps_note = " with MPS enabled" if resume_item.get("mps") else ""
         print(
-            f"Requeued running job for {host} at priority 100: "
+            f"Requeued running job for {host} at priority 100{mps_note}: "
             f"{str(resume_item.get('cmd') or '')[:120]}",
             flush=True,
         )
@@ -564,6 +568,11 @@ def _add_submit_subparser(sub):
 def _add_requeue_running_subparser(sub):
     p = sub.add_parser("requeue-running", help="Kill running managed job(s) and requeue at priority 100")
     p.add_argument("--hosts-file", default=None)
+    p.add_argument(
+        "--mps",
+        action="store_true",
+        help="Force the NVIDIA MPS wrapper on the requeued job(s) (default: keep each job's current setting).",
+    )
     target = p.add_mutually_exclusive_group(required=True)
     target.add_argument("--hosts", action="append", default=None)
     target.add_argument("--all", "-all", action="store_true")

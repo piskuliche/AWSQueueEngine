@@ -526,6 +526,47 @@ class CliSubmitTests(unittest.TestCase):
         self.assertTrue(items[0]["resume_first"])
         self.assertEqual(items[0]["resume_host"], "eci5")
 
+    def test_requeue_running_mps_flag_forces_wrapper_on_requeued_job(self):
+        fake_ssh_dir = self._make_fake_ssh(exit_code=0)
+        self._write_running(
+            {
+                "eci5": {
+                    "cmd": "bash run.sh",
+                    "payload_remote_path": "/remote/payload",
+                    "priority": 7,
+                    "hosts": ["eci5"],
+                    "started_at": 1,
+                }
+            }
+        )
+
+        res = self._run_cli_with_path_prefix(fake_ssh_dir, "requeue-running", "--hosts", "eci5", "--mps")
+
+        self.assertEqual(res.returncode, 0)
+        self.assertIn("with MPS enabled", res.stdout)
+        items = self._read_queue()
+        self.assertEqual(len(items), 1)
+        self.assertTrue(items[0]["mps"])
+        # In-place resume metadata is preserved (no re-stage of the payload).
+        self.assertEqual(items[0]["payload_remote_path"], "/remote/payload")
+        self.assertTrue(items[0]["resume_first"])
+
+    def test_requeue_running_without_mps_preserves_existing_setting(self):
+        fake_ssh_dir = self._make_fake_ssh(exit_code=0)
+        self._write_running(
+            {
+                "eci5": {"cmd": "a", "mps": True, "hosts": ["eci5"], "started_at": 1},
+                "eci7": {"cmd": "b", "mps": False, "hosts": ["eci7"], "started_at": 1},
+            }
+        )
+
+        res = self._run_cli_with_path_prefix(fake_ssh_dir, "requeue-running", "--all")
+
+        self.assertEqual(res.returncode, 0)
+        by_cmd = {item["cmd"]: item for item in self._read_queue()}
+        self.assertTrue(by_cmd["a"]["mps"])
+        self.assertFalse(by_cmd["b"]["mps"])
+
     def test_requeue_running_all_targets_all_tracked_running_hosts(self):
         fake_ssh_dir = self._make_fake_ssh(exit_code=0)
         self._write_running(

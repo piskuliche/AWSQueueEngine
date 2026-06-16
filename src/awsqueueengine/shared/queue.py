@@ -195,7 +195,7 @@ def normalize_job_item(item):
     }
 
 
-def build_resume_item(job_item, host, priority=None):
+def build_resume_item(job_item, host, priority=None, mps=None):
     item = normalize_job_item(job_item)
     item["hosts"] = [host]
     item["queue"] = normalize_queue_name(item.get("queue", DEFAULT_QUEUE))
@@ -204,6 +204,9 @@ def build_resume_item(job_item, host, priority=None):
     item["submit_failures"] = 0
     if priority is not None:
         item["priority"] = _normalize_priority(priority)
+    # mps=None preserves the job's existing setting; pass True/False to override.
+    if mps is not None:
+        item["mps"] = _normalize_mps(mps)
     return item
 
 
