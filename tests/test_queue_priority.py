@@ -149,6 +149,7 @@ class QueuePriorityTests(unittest.TestCase):
                 "queue": "default",
                 "hosts": ["eci17"],
                 "preempt": False,
+                "mps": False,
                 "payload_remote_path": None,
                 "payload_s3_uri": None,
                 "payload_size_bytes": None,

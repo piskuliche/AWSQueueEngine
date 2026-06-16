@@ -116,6 +116,7 @@ def handle_enqueue(params: dict) -> dict:
     priority = _optional_int(params, "priority")
     high_priority = _optional_bool(params, "high_priority")
     preempt = _optional_bool(params, "preempt")
+    mps = _optional_bool(params, "mps")
     payload = _optional_str(params, "payload")
     payload_s3_uri = _optional_str(params, "payload_s3_uri")
     payload_size_bytes = _optional_int(params, "payload_size_bytes")
@@ -143,6 +144,7 @@ def handle_enqueue(params: dict) -> dict:
         "queue": queue_name,
         "hosts": hosts,
         "preempt": preempt,
+        "mps": mps,
         "payload_s3_uri": payload_s3_uri,
         "payload_size_bytes": payload_size_bytes,
         "job_id": job_id,

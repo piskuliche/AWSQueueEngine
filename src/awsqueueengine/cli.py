@@ -44,6 +44,7 @@ def _build_parser():
     p_submit.add_argument("--priority", type=int, default=None)
     p_submit.add_argument("--high-priority", action="store_true")
     p_submit.add_argument("--preempt", action="store_true")
+    p_submit.add_argument("--mps", action="store_true", help="Wrap the command in the NVIDIA MPS launch/teardown script.")
     p_submit.add_argument("--queue-host", default=None)
     p_submit.add_argument("--payload-s3-uri", default=None, help=argparse.SUPPRESS)
     p_submit.add_argument("--payload-size-bytes", type=int, default=None, help=argparse.SUPPRESS)

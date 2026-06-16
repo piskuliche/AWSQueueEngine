@@ -180,6 +180,7 @@ def cmd_submit_local(args, command):
         "queue": queue_name,
         "hosts": hosts,
         "preempt": args.preempt,
+        "mps": bool(getattr(args, "mps", False)),
         "payload_s3_uri": args.payload_s3_uri,
         "payload_size_bytes": args.payload_size_bytes,
         "job_id": job_id,
@@ -214,9 +215,10 @@ def cmd_list(args):
         hosts_text = ",".join(item["hosts"]) if item["hosts"] else "-"
         payload_text = _payload_display_text(item)
         job_id_text = item.get("job_id") or "-"
+        mps_text = "[mps=True] " if item.get("mps") else ""
         print(
             f"{i:3d}. [job={job_id_text}] [priority={item['priority']}] [queue={item['queue']}] "
-            f"[hosts={hosts_text}] [preempt={item['preempt']}] "
+            f"[hosts={hosts_text}] [preempt={item['preempt']}] {mps_text}"
             f"cmd={item['cmd']!r} payload={payload_text!r}",
             flush=True
         )
@@ -551,6 +553,7 @@ def _add_submit_subparser(sub):
     p.add_argument("--priority", type=int, default=None)
     p.add_argument("--high-priority", action="store_true")
     p.add_argument("--preempt", action="store_true")
+    p.add_argument("--mps", action="store_true", help="Wrap the command in the NVIDIA MPS launch/teardown script.")
     p.add_argument("--payload-s3-uri", default=None)
     p.add_argument("--payload-size-bytes", type=int, default=None)
     p.add_argument("--job-id", default=None)

@@ -221,6 +221,20 @@ class CliSubmitTests(unittest.TestCase):
         items = self._read_queue()
         self.assertTrue(items[0]["preempt"])
 
+    def test_submit_mps_flag_persists(self):
+        res = self._run_cli("submit", "--mps", "echo", "hello")
+
+        self.assertEqual(res.returncode, 0)
+        items = self._read_queue()
+        self.assertTrue(items[0]["mps"])
+
+    def test_submit_defaults_mps_to_false(self):
+        res = self._run_cli("submit", "echo", "hello")
+
+        self.assertEqual(res.returncode, 0)
+        items = self._read_queue()
+        self.assertFalse(items[0]["mps"])
+
     def test_submit_queue_persists_queue_name_without_host_allowlist(self):
         res = self._run_cli(
             "submit",
@@ -353,6 +367,30 @@ class CliSubmitTests(unittest.TestCase):
         self.assertEqual(params["cmd"], "echo hello world")
         self.assertEqual(params["hosts"], ["eci17"])
         self.assertEqual(params["priority"], 5)
+
+    def test_remote_submit_forwards_mps_flag_over_ssh(self):
+        capture_path = self.home_path / "ssh_args.txt"
+        stdin_path = self.home_path / "ssh_stdin.txt"
+        fake_ssh_dir = self._make_fake_ssh_rpc(
+            capture_path,
+            stdin_path,
+            result={"job_id": "JOB", "queue": "default", "hosts": None},
+        )
+
+        res = self._run_cli_with_path_prefix(
+            fake_ssh_dir,
+            "submit",
+            "--queue-host",
+            "queuebox",
+            "--mps",
+            "echo",
+            "hello",
+        )
+
+        self.assertEqual(res.returncode, 0)
+        request = json.loads(stdin_path.read_text())
+        self.assertEqual(request["method"], "enqueue")
+        self.assertTrue(request["params"]["mps"])
 
     def test_remote_submit_rejects_host_set_with_hosts(self):
         res = self._run_cli(

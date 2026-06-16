@@ -169,9 +169,10 @@ def _render_queue_jobs(jobs):
         hosts_text = ",".join(item.get("hosts") or []) if item.get("hosts") else "-"
         payload_text = _payload_display_text(item)
         job_id_text = item.get("job_id") or "-"
+        mps_text = "[mps=True] " if item.get("mps") else ""
         print(
             f"{i:3d}. [job={job_id_text}] [priority={item.get('priority', 0)}] [queue={item.get('queue', 'default')}] "
-            f"[hosts={hosts_text}] [preempt={item.get('preempt', False)}] "
+            f"[hosts={hosts_text}] [preempt={item.get('preempt', False)}] {mps_text}"
             f"cmd={item.get('cmd')!r} payload={payload_text!r}",
             flush=True,
         )
@@ -294,6 +295,7 @@ def cmd_submit_remote(args, command):
         "queue": queue_name,
         "job_id": job_id,
         "preempt": bool(getattr(args, "preempt", False)),
+        "mps": bool(getattr(args, "mps", False)),
     }
     if hosts_param:
         params["hosts"] = hosts_param
@@ -573,6 +575,7 @@ def build_parser():
     p_submit.add_argument("--priority", type=int, default=None)
     p_submit.add_argument("--high-priority", action="store_true")
     p_submit.add_argument("--preempt", action="store_true")
+    p_submit.add_argument("--mps", action="store_true", help="Wrap the command in the NVIDIA MPS launch/teardown script.")
     p_submit.add_argument("--queue-host", default=None)
     p_submit.add_argument("--hosts-file", default=None)
     p_submit.add_argument("command", nargs=argparse.REMAINDER)

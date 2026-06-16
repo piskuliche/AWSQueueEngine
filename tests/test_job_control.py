@@ -1,7 +1,7 @@
 import unittest
 from unittest.mock import patch
 
-from awsqueueengine.host.job_control import submit_to_host
+from awsqueueengine.host.job_control import submit_to_host, wrap_in_mps_script
 from awsqueueengine.shared.worker_actions import kill_managed_on_host
 from awsqueueengine.shared.config import REMOTE_LOG_DIR
 
@@ -105,6 +105,65 @@ class SubmitToHostS3PayloadTests(unittest.TestCase):
         self.assertFalse(result["ok"])
         self.assertIn("s3 payload download failed", result["err"])
         self.assertEqual(result["payload"], "/scratch/payload-" + result["tag"])
+
+
+class MpsWrapTests(unittest.TestCase):
+    def test_wrap_places_command_between_mps_launch_and_teardown(self):
+        wrapped = wrap_in_mps_script("bash run.sh --epochs 5", job_name="20260616-120000-abcdef")
+
+        # Command lands where AAA was, bracketed by MPS launch + teardown.
+        self.assertIn("nvidia-cuda-mps-control -d", wrapped)
+        self.assertIn("bash run.sh --epochs 5", wrapped)
+        self.assertIn("echo quit | nvidia-cuda-mps-control", wrapped)
+        launch_idx = wrapped.index("nvidia-cuda-mps-control -d")
+        cmd_idx = wrapped.index("bash run.sh --epochs 5")
+        teardown_idx = wrapped.index("echo quit | nvidia-cuda-mps-control")
+        cleanup_idx = wrapped.index("rm -rf ${temp_path}")
+        self.assertLess(launch_idx, cmd_idx)
+        self.assertLess(cmd_idx, teardown_idx)
+        # Per-job /tmp scratch is removed last so it doesn't accumulate.
+        self.assertLess(teardown_idx, cleanup_idx)
+        # job_name drives the per-job MPS pipe/log directories.
+        self.assertIn("job_name=20260616-120000-abcdef", wrapped)
+        self.assertIn("export CUDA_MPS_PIPE_DIRECTORY=${temp_path}/nvidia-mps", wrapped)
+
+    def test_submit_to_host_wraps_command_when_mps_enabled(self):
+        commands = []
+
+        def fake_ssh_run(_host, cmd, timeout=60, capture_output=True):
+            commands.append(cmd)
+            if cmd.startswith("cat "):
+                return 0, "1234", ""
+            if "ps -p 1234" in cmd:
+                return 0, "1234", ""
+            return 0, "", ""
+
+        with patch("awsqueueengine.host.job_control.ssh_run", side_effect=fake_ssh_run):
+            result = submit_to_host("eci5", "bash run.sh", tag="20260616-120000-abcdef", mps=True)
+
+        self.assertTrue(result["ok"])
+        launch_cmd = commands[0]
+        self.assertIn("nvidia-cuda-mps-control -d", launch_cmd)
+        self.assertIn("bash run.sh", launch_cmd)
+        self.assertIn("echo quit | nvidia-cuda-mps-control", launch_cmd)
+        # The MANAGER_TAG env wrapper and pidfile plumbing are still present.
+        self.assertIn("MANAGER_TAG=20260616-120000-abcdef", launch_cmd)
+
+    def test_submit_to_host_does_not_wrap_when_mps_disabled(self):
+        commands = []
+
+        def fake_ssh_run(_host, cmd, timeout=60, capture_output=True):
+            commands.append(cmd)
+            if cmd.startswith("cat "):
+                return 0, "1234", ""
+            if "ps -p 1234" in cmd:
+                return 0, "1234", ""
+            return 0, "", ""
+
+        with patch("awsqueueengine.host.job_control.ssh_run", side_effect=fake_ssh_run):
+            submit_to_host("eci5", "bash run.sh", tag="20260616-120000-abcdef")
+
+        self.assertNotIn("nvidia-cuda-mps-control", commands[0])
 
 
 if __name__ == "__main__":
