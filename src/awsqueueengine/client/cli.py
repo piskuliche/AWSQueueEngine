@@ -236,17 +236,55 @@ def _render_deferred_jobs(jobs):
 
 # ---------- subcommand handlers ----------
 
+def _status_hosts_from_map(args, queue_host_map):
+    """Choose which hosts `status` probes from a queue->hosts map."""
+    if args.host_set:
+        queue_name = normalize_queue_name(args.host_set)
+        return queue_host_map.get(queue_name) or _resolve_host_set(args.host_set)
+    return list(dict.fromkeys(host for hosts in queue_host_map.values() for host in hosts))
+
+
+def _fetch_remote_queue_host_map(args):
+    """Ask the queue host for its queue->hosts map (the source of truth).
+
+    Returns ``None`` when the queue host can't be reached, so the caller can
+    fall back to local host resolution instead of failing outright.
+    """
+    try:
+        result = rpc_call(args.queue_host, "stats", {})
+    except (RpcError, RpcTransportError) as exc:
+        detail = getattr(exc, "detail", None) or getattr(exc, "message", None) or str(exc)
+        print(
+            f"[WARN] Could not fetch host list from queue host {args.queue_host}: {detail}. "
+            f"Falling back to local host config.",
+            file=sys.stderr,
+            flush=True,
+        )
+        return None
+    raw_map = result.get("queue_host_map") or {}
+    return {queue: list(hosts) for queue, hosts in raw_map.items() if hosts}
+
+
 def cmd_status(args):
     if args.host_set and args.hosts_file:
         print("--host-set and --hosts-file cannot be used together.", flush=True)
         sys.exit(1)
-    if args.host_set:
-        queue_name = normalize_queue_name(args.host_set)
+
+    # The queue host is the source of truth for the host pool. A client machine
+    # usually has no local queues.json, so resolving hosts locally falls back to
+    # the built-in eci1..eci20 default and silently misses any host past 20. Pull
+    # the map from the queue host (like `qstat` does) unless the user forced a
+    # local source with --hosts-file.
+    queue_host_map = None
+    if not args.hosts_file:
+        queue_host = effective_queue_host(getattr(args, "queue_host", None))
+        if queue_host:
+            args.queue_host = queue_host
+            queue_host_map = _fetch_remote_queue_host_map(args)
+    if queue_host_map is None:
         queue_host_map = _resolve_queue_hosts_for_cli(args.hosts_file)
-        monitor_hosts = queue_host_map.get(queue_name) or _resolve_host_set(args.host_set)
-    else:
-        queue_host_map = _resolve_queue_hosts_for_cli(args.hosts_file)
-        monitor_hosts = list(dict.fromkeys(host for hosts in queue_host_map.values() for host in hosts))
+
+    monitor_hosts = _status_hosts_from_map(args, queue_host_map)
     rows = status_all(monitor_hosts)
     print(f"{'HOST':8}  {'REACH':8}  {'PID':8}  {'TAG':12}  INFO", flush=True)
     for r in rows:
@@ -566,6 +604,7 @@ def build_parser():
     p_status = sub.add_parser("status", help="Show status for all hosts")
     p_status.add_argument("--hosts-file", default=None)
     p_status.add_argument("--host-set", default=None)
+    p_status.add_argument("--queue-host", default=None)
 
     p_submit = sub.add_parser("submit", help="Archive a payload, upload to S3, and enqueue on the queue host")
     p_submit.add_argument("--payload", "-p", default=None)

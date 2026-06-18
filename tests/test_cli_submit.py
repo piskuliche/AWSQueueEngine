@@ -679,6 +679,90 @@ class CliSubmitTests(unittest.TestCase):
         self.assertEqual(cm.exception.code, 1)
         rpc_mock.assert_not_called()
 
+    def test_status_fetches_host_pool_from_queue_host_beyond_20(self):
+        # Regression: a client with no local queues.json must not fall back to
+        # the built-in eci1..eci20 default for `status`. It asks the queue host
+        # (the source of truth), which can have more than 20 hosts.
+        class Args:
+            queue_host = "queuebox"
+            host_set = None
+            hosts_file = None
+
+        all_hosts = [f"eci{i}" for i in range(1, 31)]
+        captured = {}
+
+        def fake_rpc_call(host, method, params, **kwargs):
+            captured["queue_host"] = host
+            captured["method"] = method
+            return {"queue_host_map": {"default": list(all_hosts)}}
+
+        def fake_status_all(hosts):
+            captured["probed"] = list(hosts)
+            return [{"host": h, "reachable": True, "pid": None, "tag": None, "raw": ""} for h in hosts]
+
+        from awsqueueengine.client import cli as client_cli
+        with patch("awsqueueengine.client.cli.rpc_call", side_effect=fake_rpc_call), \
+             patch("awsqueueengine.client.cli.effective_queue_host", return_value="queuebox"), \
+             patch("awsqueueengine.client.cli.status_all", side_effect=fake_status_all):
+            client_cli.cmd_status(Args())
+
+        self.assertEqual(captured["queue_host"], "queuebox")
+        self.assertEqual(captured["method"], "stats")
+        self.assertEqual(set(captured["probed"]), set(all_hosts))
+        self.assertIn("eci30", captured["probed"])  # the whole point: past eci20
+
+    def test_status_falls_back_to_local_when_queue_host_unreachable(self):
+        # If the queue host can't be reached, `status` warns and uses local host
+        # resolution rather than failing outright.
+        from awsqueueengine.shared.protocol import RpcTransportError
+
+        class Args:
+            queue_host = "queuebox"
+            host_set = None
+            hosts_file = None
+
+        captured = {}
+
+        def boom(host, method, params, **kwargs):
+            raise RpcTransportError(255, "ssh: connect: Connection refused")
+
+        def fake_status_all(hosts):
+            captured["probed"] = list(hosts)
+            return []
+
+        from awsqueueengine.client import cli as client_cli
+        with patch("awsqueueengine.client.cli.rpc_call", side_effect=boom), \
+             patch("awsqueueengine.client.cli.effective_queue_host", return_value="queuebox"), \
+             patch("awsqueueengine.client.cli._resolve_queue_hosts_for_cli",
+                   return_value={"default": ["eci1", "eci2"]}), \
+             patch("awsqueueengine.client.cli.status_all", side_effect=fake_status_all):
+            client_cli.cmd_status(Args())
+
+        self.assertEqual(captured["probed"], ["eci1", "eci2"])
+
+    def test_status_hosts_file_override_bypasses_queue_host(self):
+        # An explicit --hosts-file is a local override: no RPC to the queue host.
+        class Args:
+            queue_host = "queuebox"
+            host_set = None
+            hosts_file = "/tmp/does-not-matter"
+
+        captured = {}
+
+        def fake_status_all(hosts):
+            captured["probed"] = list(hosts)
+            return []
+
+        from awsqueueengine.client import cli as client_cli
+        with patch("awsqueueengine.client.cli.rpc_call") as rpc_mock, \
+             patch("awsqueueengine.client.cli._resolve_queue_hosts_for_cli",
+                   return_value={"default": ["eci1", "eci2", "eci3"]}), \
+             patch("awsqueueengine.client.cli.status_all", side_effect=fake_status_all):
+            client_cli.cmd_status(Args())
+
+        rpc_mock.assert_not_called()
+        self.assertEqual(captured["probed"], ["eci1", "eci2", "eci3"])
+
     def test_qstat_lists_running_jobs(self):
         self._write_running(
             {
