@@ -371,6 +371,30 @@ class EnqueueTests(_StateFixture):
         self.assertEqual(resp["error"]["code"], "invalid_params")
         self.assertIn("invalid host(s)", resp["error"]["message"])
 
+    def test_enqueue_persists_mps_flag(self):
+        resp = rpc.dispatch({
+            "version": 1, "method": "enqueue",
+            "params": {"cmd": "echo hi", "queue": "default", "mps": True},
+        })
+        self.assertTrue(resp["ok"], resp)
+        self.assertTrue(queue_mod.load_queue()[0]["mps"])
+
+    def test_enqueue_defaults_mps_to_false(self):
+        resp = rpc.dispatch({
+            "version": 1, "method": "enqueue",
+            "params": {"cmd": "echo hi", "queue": "default"},
+        })
+        self.assertTrue(resp["ok"], resp)
+        self.assertFalse(queue_mod.load_queue()[0]["mps"])
+
+    def test_enqueue_rejects_non_bool_mps(self):
+        resp = rpc.dispatch({
+            "version": 1, "method": "enqueue",
+            "params": {"cmd": "echo hi", "queue": "default", "mps": "yes"},
+        })
+        self.assertFalse(resp["ok"])
+        self.assertEqual(resp["error"]["code"], "invalid_params")
+
     def test_enqueue_with_high_priority_maps_to_100(self):
         resp = rpc.dispatch({
             "version": 1, "method": "enqueue",

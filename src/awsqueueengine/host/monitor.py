@@ -424,6 +424,7 @@ def _launch_job_on_host(host, job_item, running_jobs):
     target_hosts = item.get("hosts")
     priority = item.get("priority", 0)
     preempt = item.get("preempt", False)
+    mps = item.get("mps", False)
     job_id = item.get("job_id")
     hosts_text = ",".join(target_hosts) if target_hosts else f"queue:{queue_name}"
     print(
@@ -439,6 +440,7 @@ def _launch_job_on_host(host, job_item, running_jobs):
         payload_s3_uri=payload_s3_uri,
         payload_size_bytes=payload_size_bytes,
         tag=job_id,
+        mps=mps,
     )
     if not res.get("ok"):
         reason = res.get("reason") or "job"
@@ -509,6 +511,7 @@ def _launch_job_on_host(host, job_item, running_jobs):
         "queue": queue_name,
         "hosts": target_hosts,
         "preempt": False,
+        "mps": mps,
         "payload_remote_path": remote_payload,
         "payload_s3_uri": payload_s3_uri,
         "payload_size_bytes": payload_size_bytes,

@@ -25,6 +25,40 @@ def _payload_name_from_s3_uri(payload_s3_uri):
     return name or "payload"
 
 
+# Jobs that opt into MPS (``--mps``) have their command bracketed by this
+# template before launch. MPS control has to be (re)started per job on these
+# hosts, so we tear down any stale daemon, start a fresh one with per-job
+# pipe/log directories, run the job in its place, quit the daemon, then remove
+# the per-job /tmp dir so MPS scratch doesn't accumulate on long-lived workers.
+MPS_WRAPPER_TEMPLATE = """\
+killall nvidia-cuda-mps-control nvidia-cuda-mps-server 2>/dev/null || true
+sleep 1
+job_name={job_name}
+temp_path=/tmp/temp_${{job_name}}
+mkdir -p ${{temp_path}}
+export CUDA_MPS_PIPE_DIRECTORY=${{temp_path}}/nvidia-mps
+export CUDA_MPS_LOG_DIRECTORY=${{temp_path}}/nvidia-log
+nvidia-cuda-mps-control -d
+sleep 1
+
+{job_command}
+
+echo quit | nvidia-cuda-mps-control
+rm -rf ${{temp_path}}
+"""
+
+
+def wrap_in_mps_script(job_command, job_name):
+    """Bracket ``job_command`` with NVIDIA MPS launch/teardown boilerplate.
+
+    ``job_name`` (the job tag) keeps the MPS pipe/log directories unique per
+    job under ``/tmp``. The result is a multi-line bash script meant to be run
+    via ``bash -lc`` exactly where the bare command would have been.
+    """
+    safe_job_name = shlex.quote(str(job_name) if job_name else "awsqe")
+    return MPS_WRAPPER_TEMPLATE.format(job_name=safe_job_name, job_command=job_command)
+
+
 def submit_to_host(
     host,
     job_command,
@@ -33,8 +67,11 @@ def submit_to_host(
     payload_s3_uri=None,
     payload_size_bytes=None,
     tag=None,
+    mps=False,
 ):
     tag = tag or new_job_tag()
+    if mps:
+        job_command = wrap_in_mps_script(job_command, job_name=tag)
     remote_payload_dir = None
     if payload_remote_path:
         remote_payload_dir = str(payload_remote_path).strip() or None

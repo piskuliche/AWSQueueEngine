@@ -180,6 +180,7 @@ def cmd_submit_local(args, command):
         "queue": queue_name,
         "hosts": hosts,
         "preempt": args.preempt,
+        "mps": bool(getattr(args, "mps", False)),
         "payload_s3_uri": args.payload_s3_uri,
         "payload_size_bytes": args.payload_size_bytes,
         "job_id": job_id,
@@ -214,9 +215,10 @@ def cmd_list(args):
         hosts_text = ",".join(item["hosts"]) if item["hosts"] else "-"
         payload_text = _payload_display_text(item)
         job_id_text = item.get("job_id") or "-"
+        mps_text = "[mps=True] " if item.get("mps") else ""
         print(
             f"{i:3d}. [job={job_id_text}] [priority={item['priority']}] [queue={item['queue']}] "
-            f"[hosts={hosts_text}] [preempt={item['preempt']}] "
+            f"[hosts={hosts_text}] [preempt={item['preempt']}] {mps_text}"
             f"cmd={item['cmd']!r} payload={payload_text!r}",
             flush=True
         )
@@ -378,6 +380,9 @@ def cmd_requeue_running(args):
         print("No target hosts found for requeue-running.", flush=True)
         return
 
+    # --mps forces the wrapper on; without it each job keeps its current setting.
+    mps_override = True if getattr(args, "mps", False) else None
+
     requeued_count = 0
     for host in target_hosts:
         running_item = running_jobs.get(host)
@@ -385,13 +390,14 @@ def cmd_requeue_running(args):
             print(f"No tracked running job on {host}; skipping requeue.", flush=True)
             continue
 
-        resume_item = build_resume_item(running_item, host, priority=100)
+        resume_item = build_resume_item(running_item, host, priority=100, mps=mps_override)
         q = load_queue()
         q.insert(0, resume_item)
         save_queue(q)
         requeued_count += 1
+        mps_note = " with MPS enabled" if resume_item.get("mps") else ""
         print(
-            f"Requeued running job for {host} at priority 100: "
+            f"Requeued running job for {host} at priority 100{mps_note}: "
             f"{str(resume_item.get('cmd') or '')[:120]}",
             flush=True,
         )
@@ -551,6 +557,7 @@ def _add_submit_subparser(sub):
     p.add_argument("--priority", type=int, default=None)
     p.add_argument("--high-priority", action="store_true")
     p.add_argument("--preempt", action="store_true")
+    p.add_argument("--mps", action="store_true", help="Wrap the command in the NVIDIA MPS launch/teardown script.")
     p.add_argument("--payload-s3-uri", default=None)
     p.add_argument("--payload-size-bytes", type=int, default=None)
     p.add_argument("--job-id", default=None)
@@ -561,6 +568,11 @@ def _add_submit_subparser(sub):
 def _add_requeue_running_subparser(sub):
     p = sub.add_parser("requeue-running", help="Kill running managed job(s) and requeue at priority 100")
     p.add_argument("--hosts-file", default=None)
+    p.add_argument(
+        "--mps",
+        action="store_true",
+        help="Force the NVIDIA MPS wrapper on the requeued job(s) (default: keep each job's current setting).",
+    )
     target = p.add_mutually_exclusive_group(required=True)
     target.add_argument("--hosts", action="append", default=None)
     target.add_argument("--all", "-all", action="store_true")

@@ -5,6 +5,7 @@ from .queue_config import DEFAULT_QUEUE, host_is_eligible_for_item, normalize_qu
 
 DEFAULT_PRIORITY = 0
 DEFAULT_PREEMPT = False
+DEFAULT_MPS = False
 DEFAULT_RESUME_FIRST = False
 LEGACY_PRIORITY_MAP = {
     "high": 100,
@@ -76,6 +77,16 @@ def _normalize_preempt(value):
     return DEFAULT_PREEMPT
 
 
+def _normalize_mps(value):
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, int):
+        return value != 0
+    if isinstance(value, str):
+        return value.strip().lower() in {"1", "true", "yes", "y", "on"}
+    return DEFAULT_MPS
+
+
 def _normalize_payload_remote_path(value):
     if not isinstance(value, str):
         return None
@@ -137,6 +148,7 @@ def normalize_job_item(item):
             "queue": DEFAULT_QUEUE,
             "hosts": None,
             "preempt": DEFAULT_PREEMPT,
+            "mps": DEFAULT_MPS,
             "payload_remote_path": None,
             "payload_s3_uri": None,
             "payload_size_bytes": None,
@@ -153,6 +165,7 @@ def normalize_job_item(item):
             "queue": DEFAULT_QUEUE,
             "hosts": None,
             "preempt": DEFAULT_PREEMPT,
+            "mps": DEFAULT_MPS,
             "payload_remote_path": None,
             "payload_s3_uri": None,
             "payload_size_bytes": None,
@@ -171,6 +184,7 @@ def normalize_job_item(item):
         "queue": normalize_queue_name(item.get("queue", DEFAULT_QUEUE)),
         "hosts": _normalize_hosts(item.get("hosts")),
         "preempt": _normalize_preempt(item.get("preempt", DEFAULT_PREEMPT)),
+        "mps": _normalize_mps(item.get("mps", DEFAULT_MPS)),
         "payload_remote_path": _normalize_payload_remote_path(item.get("payload_remote_path")),
         "payload_s3_uri": _normalize_payload_s3_uri(item.get("payload_s3_uri")),
         "payload_size_bytes": _normalize_payload_size_bytes(item.get("payload_size_bytes")),
@@ -181,7 +195,7 @@ def normalize_job_item(item):
     }
 
 
-def build_resume_item(job_item, host, priority=None):
+def build_resume_item(job_item, host, priority=None, mps=None):
     item = normalize_job_item(job_item)
     item["hosts"] = [host]
     item["queue"] = normalize_queue_name(item.get("queue", DEFAULT_QUEUE))
@@ -190,6 +204,9 @@ def build_resume_item(job_item, host, priority=None):
     item["submit_failures"] = 0
     if priority is not None:
         item["priority"] = _normalize_priority(priority)
+    # mps=None preserves the job's existing setting; pass True/False to override.
+    if mps is not None:
+        item["mps"] = _normalize_mps(mps)
     return item
 
 

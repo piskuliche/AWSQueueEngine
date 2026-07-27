@@ -221,6 +221,20 @@ class CliSubmitTests(unittest.TestCase):
         items = self._read_queue()
         self.assertTrue(items[0]["preempt"])
 
+    def test_submit_mps_flag_persists(self):
+        res = self._run_cli("submit", "--mps", "echo", "hello")
+
+        self.assertEqual(res.returncode, 0)
+        items = self._read_queue()
+        self.assertTrue(items[0]["mps"])
+
+    def test_submit_defaults_mps_to_false(self):
+        res = self._run_cli("submit", "echo", "hello")
+
+        self.assertEqual(res.returncode, 0)
+        items = self._read_queue()
+        self.assertFalse(items[0]["mps"])
+
     def test_submit_queue_persists_queue_name_without_host_allowlist(self):
         res = self._run_cli(
             "submit",
@@ -353,6 +367,30 @@ class CliSubmitTests(unittest.TestCase):
         self.assertEqual(params["cmd"], "echo hello world")
         self.assertEqual(params["hosts"], ["eci17"])
         self.assertEqual(params["priority"], 5)
+
+    def test_remote_submit_forwards_mps_flag_over_ssh(self):
+        capture_path = self.home_path / "ssh_args.txt"
+        stdin_path = self.home_path / "ssh_stdin.txt"
+        fake_ssh_dir = self._make_fake_ssh_rpc(
+            capture_path,
+            stdin_path,
+            result={"job_id": "JOB", "queue": "default", "hosts": None},
+        )
+
+        res = self._run_cli_with_path_prefix(
+            fake_ssh_dir,
+            "submit",
+            "--queue-host",
+            "queuebox",
+            "--mps",
+            "echo",
+            "hello",
+        )
+
+        self.assertEqual(res.returncode, 0)
+        request = json.loads(stdin_path.read_text())
+        self.assertEqual(request["method"], "enqueue")
+        self.assertTrue(request["params"]["mps"])
 
     def test_remote_submit_rejects_host_set_with_hosts(self):
         res = self._run_cli(
@@ -488,6 +526,47 @@ class CliSubmitTests(unittest.TestCase):
         self.assertTrue(items[0]["resume_first"])
         self.assertEqual(items[0]["resume_host"], "eci5")
 
+    def test_requeue_running_mps_flag_forces_wrapper_on_requeued_job(self):
+        fake_ssh_dir = self._make_fake_ssh(exit_code=0)
+        self._write_running(
+            {
+                "eci5": {
+                    "cmd": "bash run.sh",
+                    "payload_remote_path": "/remote/payload",
+                    "priority": 7,
+                    "hosts": ["eci5"],
+                    "started_at": 1,
+                }
+            }
+        )
+
+        res = self._run_cli_with_path_prefix(fake_ssh_dir, "requeue-running", "--hosts", "eci5", "--mps")
+
+        self.assertEqual(res.returncode, 0)
+        self.assertIn("with MPS enabled", res.stdout)
+        items = self._read_queue()
+        self.assertEqual(len(items), 1)
+        self.assertTrue(items[0]["mps"])
+        # In-place resume metadata is preserved (no re-stage of the payload).
+        self.assertEqual(items[0]["payload_remote_path"], "/remote/payload")
+        self.assertTrue(items[0]["resume_first"])
+
+    def test_requeue_running_without_mps_preserves_existing_setting(self):
+        fake_ssh_dir = self._make_fake_ssh(exit_code=0)
+        self._write_running(
+            {
+                "eci5": {"cmd": "a", "mps": True, "hosts": ["eci5"], "started_at": 1},
+                "eci7": {"cmd": "b", "mps": False, "hosts": ["eci7"], "started_at": 1},
+            }
+        )
+
+        res = self._run_cli_with_path_prefix(fake_ssh_dir, "requeue-running", "--all")
+
+        self.assertEqual(res.returncode, 0)
+        by_cmd = {item["cmd"]: item for item in self._read_queue()}
+        self.assertTrue(by_cmd["a"]["mps"])
+        self.assertFalse(by_cmd["b"]["mps"])
+
     def test_requeue_running_all_targets_all_tracked_running_hosts(self):
         fake_ssh_dir = self._make_fake_ssh(exit_code=0)
         self._write_running(
@@ -599,6 +678,90 @@ class CliSubmitTests(unittest.TestCase):
                 client_cli.cmd_qdel_remote(Args())
         self.assertEqual(cm.exception.code, 1)
         rpc_mock.assert_not_called()
+
+    def test_status_fetches_host_pool_from_queue_host_beyond_20(self):
+        # Regression: a client with no local queues.json must not fall back to
+        # the built-in eci1..eci20 default for `status`. It asks the queue host
+        # (the source of truth), which can have more than 20 hosts.
+        class Args:
+            queue_host = "queuebox"
+            host_set = None
+            hosts_file = None
+
+        all_hosts = [f"eci{i}" for i in range(1, 31)]
+        captured = {}
+
+        def fake_rpc_call(host, method, params, **kwargs):
+            captured["queue_host"] = host
+            captured["method"] = method
+            return {"queue_host_map": {"default": list(all_hosts)}}
+
+        def fake_status_all(hosts):
+            captured["probed"] = list(hosts)
+            return [{"host": h, "reachable": True, "pid": None, "tag": None, "raw": ""} for h in hosts]
+
+        from awsqueueengine.client import cli as client_cli
+        with patch("awsqueueengine.client.cli.rpc_call", side_effect=fake_rpc_call), \
+             patch("awsqueueengine.client.cli.effective_queue_host", return_value="queuebox"), \
+             patch("awsqueueengine.client.cli.status_all", side_effect=fake_status_all):
+            client_cli.cmd_status(Args())
+
+        self.assertEqual(captured["queue_host"], "queuebox")
+        self.assertEqual(captured["method"], "stats")
+        self.assertEqual(set(captured["probed"]), set(all_hosts))
+        self.assertIn("eci30", captured["probed"])  # the whole point: past eci20
+
+    def test_status_falls_back_to_local_when_queue_host_unreachable(self):
+        # If the queue host can't be reached, `status` warns and uses local host
+        # resolution rather than failing outright.
+        from awsqueueengine.shared.protocol import RpcTransportError
+
+        class Args:
+            queue_host = "queuebox"
+            host_set = None
+            hosts_file = None
+
+        captured = {}
+
+        def boom(host, method, params, **kwargs):
+            raise RpcTransportError(255, "ssh: connect: Connection refused")
+
+        def fake_status_all(hosts):
+            captured["probed"] = list(hosts)
+            return []
+
+        from awsqueueengine.client import cli as client_cli
+        with patch("awsqueueengine.client.cli.rpc_call", side_effect=boom), \
+             patch("awsqueueengine.client.cli.effective_queue_host", return_value="queuebox"), \
+             patch("awsqueueengine.client.cli._resolve_queue_hosts_for_cli",
+                   return_value={"default": ["eci1", "eci2"]}), \
+             patch("awsqueueengine.client.cli.status_all", side_effect=fake_status_all):
+            client_cli.cmd_status(Args())
+
+        self.assertEqual(captured["probed"], ["eci1", "eci2"])
+
+    def test_status_hosts_file_override_bypasses_queue_host(self):
+        # An explicit --hosts-file is a local override: no RPC to the queue host.
+        class Args:
+            queue_host = "queuebox"
+            host_set = None
+            hosts_file = "/tmp/does-not-matter"
+
+        captured = {}
+
+        def fake_status_all(hosts):
+            captured["probed"] = list(hosts)
+            return []
+
+        from awsqueueengine.client import cli as client_cli
+        with patch("awsqueueengine.client.cli.rpc_call") as rpc_mock, \
+             patch("awsqueueengine.client.cli._resolve_queue_hosts_for_cli",
+                   return_value={"default": ["eci1", "eci2", "eci3"]}), \
+             patch("awsqueueengine.client.cli.status_all", side_effect=fake_status_all):
+            client_cli.cmd_status(Args())
+
+        rpc_mock.assert_not_called()
+        self.assertEqual(captured["probed"], ["eci1", "eci2", "eci3"])
 
     def test_qstat_lists_running_jobs(self):
         self._write_running(
