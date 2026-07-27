@@ -19,6 +19,7 @@ HOST_STATE_DIR = AWSQE_ROOT / "host"
 QUEUE_FILE = HOST_STATE_DIR / "queue.json"
 RUNNING_FILE = HOST_STATE_DIR / "running.json"
 COMPLETED_FILE = HOST_STATE_DIR / "completed.json"
+FAILED_FILE = HOST_STATE_DIR / "failed.json"
 DEFERRED_FILE = HOST_STATE_DIR / "deferred.json"
 MONITOR_STATE_FILE = HOST_STATE_DIR / "monitor_state.json"
 
@@ -34,6 +35,7 @@ __all__ = [
     "QUEUE_FILE",
     "RUNNING_FILE",
     "COMPLETED_FILE",
+    "FAILED_FILE",
     "DEFERRED_FILE",
     "MONITOR_STATE_FILE",
     "LOCK_FILE",

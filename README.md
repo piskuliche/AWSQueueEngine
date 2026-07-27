@@ -102,6 +102,8 @@ awsqe-client submit --preempt --priority 999 "bash urgent-job.sh"
 # Inspect the queue host:
 awsqe-client list                  # queued jobs
 awsqe-client qstat                 # running jobs (elapsed HH:MM:SS each)
+awsqe-client failed                # jobs that failed, newest first, with a reason
+awsqe-client failed --job-id JOB --log   # plus the captured tail of that job's log
 awsqe-client deferred              # jobs that exceeded the submit-failure limit
 awsqe-client requeue-deferred --all
 awsqe-client enable-host           # show active host cooldowns (no args)
@@ -118,9 +120,9 @@ awsqe-client info -p ./my_payload  # refresh run.info from queue-host state
 awsqe-client submit --queue-host other-queue "python sweep.py"
 ```
 
-The legacy `awsqueueengine <subcommand>` still works for every command
-above. It will be deprecated in a later release; new scripts should use
-`awsqe-client`.
+The legacy `awsqueueengine <subcommand>` still works for the commands it
+shipped with (everything above except `failed`). It will be deprecated in
+a later release; new scripts should use `awsqe-client`.
 
 `submit --high-priority` is still supported for backward compatibility and
 maps to priority `100`. If both `--priority` and `--high-priority` are
@@ -143,6 +145,47 @@ payload path.
 (`HH:MM:SS`). When jobs finish, the monitor appends completion records to
 `~/.awsqe/host/completed.json` with the `qstat` fields plus final duration
 and timestamps (`started_at`, `finished_at`).
+
+### Failed jobs
+
+Every job is launched wrapped so the worker writes its exit status to
+`~/manager_jobs/<job_id>.rc` next to the job log. When the monitor sees a
+host go idle it reads that status back: a clean `0` becomes a completion
+record, and anything else becomes a **failure record** in
+`~/.awsqe/host/failed.json` — including jobs that die seconds after
+launch, which previously left no trace at all.
+
+Each failure record carries the usual job fields plus `exit_code`, a
+short `failure_reason` slug, a one-line `failure_detail`, and the last 40
+lines of the job log (`log_tail`):
+
+```bash
+awsqe-client failed                      # 50 most recent, newest first
+awsqe-client failed -n 200               # more history
+awsqe-client failed --job-id JOB --log   # one job, with its captured log tail
+awsqe-host failed --log                  # same view, on the queue host
+```
+
+`awsqe-client info -p ./my_payload` reports `status: failed` for a failed
+job and writes `failure_reason` / `failure_detail` / `exit_code` into the
+payload's `run.info`.
+
+Reasons are a rough classification, taken from the log tail first and the
+exit status second: `out_of_memory`, `disk_full`, `cuda_error`,
+`command_not_found`, `permission_denied`, `python_import_error`,
+`python_exception`, `not_executable`, `killed`, `segfault`,
+`terminated`, `signal_N`, `nonzero_exit`, plus two that describe how the
+job ended rather than why:
+
+- `start_failed` — the job never ran (submit failure, or it exited before
+  the monitor could confirm the process). Repeated start failures still
+  move the job to `deferred.json` for requeueing as before.
+- `no_exit_status` — the job vanished without recording a status. Usually
+  a hard kill, a host reboot, or an operator running `stop` /
+  `requeue-running` against the host; the failure history records those
+  too rather than counting them as clean finishes.
+
+The failure history is capped at the 1000 most recent records.
 
 ## Remote queue host setup
 
@@ -250,6 +293,7 @@ The queue host's state files moved from `~/.aws_slurm_like_*.json` to
 ~/.awsqe/host/queue.json
 ~/.awsqe/host/running.json
 ~/.awsqe/host/completed.json
+~/.awsqe/host/failed.json      # no legacy counterpart; created on first failure
 ~/.awsqe/host/deferred.json
 ~/.awsqe/host/monitor_state.json
 ~/.awsqe/host/lock

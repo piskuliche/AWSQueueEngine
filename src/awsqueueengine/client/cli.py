@@ -234,6 +234,32 @@ def _render_deferred_jobs(jobs):
         )
 
 
+def _render_failed_jobs(jobs, show_log=False):
+    if not jobs:
+        print("(no failed jobs recorded)", flush=True)
+        return
+    print(
+        f"{'FAILED AT':20}  {'JOB':22}  {'HOST':8}  {'DUR':8}  {'EXIT':5}  {'REASON':18}  CMD",
+        flush=True,
+    )
+    for item in jobs:
+        exit_code = item.get("exit_code")
+        exit_text = "-" if exit_code is None else str(exit_code)
+        failed_at = format_epoch(item.get("failed_at") or item.get("finished_at")) or "-"
+        print(
+            f"{failed_at:20}  {(item.get('job_id') or '-'):22}  {(item.get('host') or '-'):8}  "
+            f"{(item.get('dur') or '-'):8}  {exit_text:5}  {(item.get('failure_reason') or '-')[:18]:18}  "
+            f"{str(item.get('cmd') or '')}",
+            flush=True,
+        )
+        detail = item.get("failure_detail")
+        if detail:
+            print(f"{'':20}  -> {detail}", flush=True)
+        if show_log and item.get("log_tail"):
+            for line in str(item["log_tail"]).splitlines():
+                print(f"{'':20}  |  {line}", flush=True)
+
+
 # ---------- subcommand handlers ----------
 
 def _status_hosts_from_map(args, queue_host_map):
@@ -417,19 +443,32 @@ def cmd_info(args):
         response = _rpc(rpc_args, "job_info", {"job_id": job_id})
         state = response.get("state")
     if not state:
-        print(f"Job {job_id} not found in queue host state (queued/running/completed).", flush=True)
+        print(f"Job {job_id} not found in queue host state (queued/running/completed/failed).", flush=True)
         sys.exit(1)
     merged = dict(existing)
     for key, value in state.items():
         if value is None or value == "":
             continue
         merged[key] = value
+    # A retry that succeeded shouldn't leave the previous attempt's failure
+    # fields sitting in run.info.
+    if merged.get("status") != "failed":
+        for key in ("failure_reason", "failure_detail", "exit_code"):
+            merged.pop(key, None)
     write_run_info_file(info_path, merged)
     print(
         f"Updated {info_path}: status={merged.get('status', '?')} "
         f"host={merged.get('host', '-')} remote_payload={merged.get('remote_payload_path', '-')}",
         flush=True,
     )
+    if merged.get("status") == "failed":
+        exit_text = merged.get("exit_code") or "-"
+        print(
+            f"  failed: reason={merged.get('failure_reason', 'unknown')} exit={exit_text}\n"
+            f"  detail: {merged.get('failure_detail') or '-'}\n"
+            f"  See `awsqe-client failed --job-id {job_id} --log` for the captured log tail.",
+            flush=True,
+        )
 
 
 def cmd_list_remote(args):
@@ -445,6 +484,14 @@ def cmd_qstat_remote(args):
 def cmd_deferred_remote(args):
     result = _rpc(args, "deferred_list", {})
     _render_deferred_jobs(result.get("jobs") or [])
+
+
+def cmd_failed_remote(args):
+    params = {"limit": args.limit, "log": bool(args.log)}
+    if args.job_id:
+        params["job_id"] = args.job_id
+    result = _rpc(args, "failed_list", params)
+    _render_failed_jobs(result.get("jobs") or [], show_log=bool(args.log))
 
 
 def cmd_qdel_remote(args):
@@ -640,6 +687,12 @@ def build_parser():
     p_deferred = sub.add_parser("deferred", help="Show deferred jobs on the queue host")
     p_deferred.add_argument("--queue-host", default=None)
 
+    p_failed = sub.add_parser("failed", help="Show jobs that failed on the queue host")
+    p_failed.add_argument("--limit", "-n", type=int, default=50, help="How many recent failures to show (default 50)")
+    p_failed.add_argument("--job-id", default=None, help="Only show failures for this job id")
+    p_failed.add_argument("--log", action="store_true", help="Also print the captured tail of each job log")
+    p_failed.add_argument("--queue-host", default=None)
+
     p_qdel = sub.add_parser("qdel", help="Delete queued job(s) by list index")
     p_qdel.add_argument("indices", nargs="+", type=int, metavar="INDEX")
     p_qdel.add_argument("--queue-host", default=None)
@@ -709,6 +762,9 @@ def dispatch(args, parser=None):
     elif cmd == "deferred":
         _resolve_queue_host(args, "deferred")
         cmd_deferred_remote(args)
+    elif cmd == "failed":
+        _resolve_queue_host(args, "failed")
+        cmd_failed_remote(args)
     elif cmd == "qdel":
         _resolve_queue_host(args, "qdel")
         cmd_qdel_remote(args)

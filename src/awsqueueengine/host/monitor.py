@@ -9,7 +9,9 @@ from pathlib import Path
 
 from ..shared.completion_state import append_completed_records
 from ..shared.deferred_state import append_deferred_job
+from ..shared.failure_state import append_failed_records
 from ..shared.host_status import status_all
+from ..shared.job_outcome import classify_failure, fetch_job_outcome
 from ..shared.queue import build_resume_item, dequeue_for_host, load_queue, save_queue, normalize_job_item
 from ..shared.queue_config import (
     QueueConfigSource,
@@ -158,7 +160,7 @@ def _format_duration_seconds(duration_seconds):
     return f"{hours:02d}:{minutes:02d}:{seconds:02d}"
 
 
-def _build_completed_job_record(host, running_item, finished_at):
+def _build_finished_job_record(host, running_item, finished_at):
     item = normalize_job_item(running_item)
     started_at = running_item.get("started_at") if isinstance(running_item, dict) else None
     if isinstance(started_at, (int, float)):
@@ -189,6 +191,66 @@ def _build_completed_job_record(host, running_item, finished_at):
         "started_at": started_at,
         "finished_at": float(finished_at),
     }
+
+
+def _build_completed_job_record(host, running_item, finished_at, exit_code=None):
+    record = _build_finished_job_record(host, running_item, finished_at)
+    record["status"] = "completed"
+    record["exit_code"] = exit_code
+    return record
+
+
+def _build_failed_job_record(host, running_item, finished_at, outcome=None):
+    """Completed-job record plus why it failed (reason slug + log evidence)."""
+    outcome = outcome or {}
+    exit_code = outcome.get("exit_code")
+    log_tail = outcome.get("log_tail") or ""
+    reason, detail = classify_failure(exit_code, log_tail, outcome.get("error") or "")
+    record = _build_finished_job_record(host, running_item, finished_at)
+    record["status"] = "failed"
+    record["exit_code"] = exit_code
+    record["failure_reason"] = reason
+    record["failure_detail"] = detail
+    record["log_tail"] = log_tail
+    record["failed_at"] = float(finished_at)
+    return record
+
+
+def _build_start_failure_record(host, job_item, failed_at, err, deferred=False):
+    """Record for a job that never got as far as running on the worker."""
+    record = _build_finished_job_record(host, job_item, failed_at)
+    record["status"] = "failed"
+    record["exit_code"] = None
+    record["failure_reason"] = "start_failed"
+    detail = str(err or "job failed to start")
+    record["failure_detail"] = detail[:200]
+    record["log_tail"] = ""
+    record["failed_at"] = float(failed_at)
+    record["deferred"] = bool(deferred)
+    return record
+
+
+def _build_failed_jobs_alert_body(failed_records):
+    lines = [f"{len(failed_records)} job(s) failed on the worker hosts.", ""]
+    for record in failed_records:
+        exit_text = record.get("exit_code")
+        exit_text = "-" if exit_text is None else str(exit_text)
+        lines.extend(
+            [
+                f"Host: {record.get('host')}",
+                f"  Job ID: {record.get('job_id') or '-'}",
+                f"  Queue: {record.get('queue') or 'default'}",
+                f"  Command: {record.get('cmd')}",
+                f"  Ran for: {record.get('dur')}",
+                f"  Exit code: {exit_text}",
+                f"  Reason: {record.get('failure_reason')}",
+                f"  Detail: {record.get('failure_detail')}",
+                f"  Payload: {record.get('payload') or '-'}",
+                "",
+            ]
+        )
+    lines.append(f"Generated at: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+    return "\n".join(lines)
 
 
 def _should_send_low_queue_alert(queue_len, already_sent):
@@ -464,6 +526,10 @@ def _launch_job_on_host(host, job_item, running_jobs):
 
         if err_text == "pidfile present but process not running":
             print(f"    Job Failed on {host}; but had pid file. Job maybe had error.", flush=True)
+            # The job started and died immediately. It is not requeued and not
+            # tracked as running, so this is the only chance to record it.
+            outcome = fetch_job_outcome(host, res.get("tag") or item.get("job_id"))
+            append_failed_records([_build_failed_job_record(host, item, time.time(), outcome)])
             return {
                 "launched": False,
                 "reason": "job",
@@ -482,6 +548,7 @@ def _launch_job_on_host(host, job_item, running_jobs):
                 flush=True,
             )
             append_deferred_job(item, last_error=err_text, last_host=host)
+            append_failed_records([_build_start_failure_record(host, item, time.time(), err_text, deferred=True)])
             return {
                 "launched": False,
                 "reason": "job",
@@ -567,7 +634,13 @@ def _select_preempt_target(queue_items, running_hosts, running_jobs, queue_host_
     return best_queue_idx, best_item, best_victim
 
 
-def _prune_running_jobs_for_status(running_jobs, status_rows):
+def _prune_running_jobs_for_status(running_jobs, status_rows, fetch_outcome=fetch_job_outcome):
+    """Drop finished jobs from the running map, sorting them into done vs failed.
+
+    The worker records each job's exit status next to its log, so a job that
+    died after two seconds is separated here from one that ran to completion
+    instead of both landing in the completed history.
+    """
     reachable_hosts = {row["host"] for row in status_rows if row.get("reachable")}
     active_hosts = {
         row["host"]
@@ -576,15 +649,28 @@ def _prune_running_jobs_for_status(running_jobs, status_rows):
     }
     changed = False
     completed_records = []
+    failed_records = []
     finished_at = time.time()
     for host in list(running_jobs):
         # Only drop metadata when the host is reachable and confirmed idle.
         if host in reachable_hosts and host not in active_hosts:
             finished_item = running_jobs.pop(host, None)
-            if isinstance(finished_item, dict):
-                completed_records.append(_build_completed_job_record(host, finished_item, finished_at))
             changed = True
-    return changed, completed_records
+            if not isinstance(finished_item, dict):
+                continue
+            try:
+                # No job tag → no status file to read; fetch_outcome says so
+                # rather than guessing the job succeeded.
+                outcome = fetch_outcome(host, finished_item.get("job_id"))
+            except Exception as exc:  # a flaky SSH must not lose the job record
+                outcome = {"exit_code": None, "log_tail": "", "found": False, "error": f"{type(exc).__name__}: {exc}"}
+            if outcome.get("found") and outcome.get("exit_code") == 0:
+                completed_records.append(
+                    _build_completed_job_record(host, finished_item, finished_at, exit_code=0)
+                )
+            else:
+                failed_records.append(_build_failed_job_record(host, finished_item, finished_at, outcome))
+    return changed, completed_records, failed_records
 
 
 def monitor_loop(hosts, poll_interval=CHECK_INTERVAL, stop_event: threading.Event | None = None, hosts_file=None):
@@ -652,11 +738,29 @@ def monitor_loop(hosts, poll_interval=CHECK_INTERVAL, stop_event: threading.Even
             ]
             running_hosts = [s["host"] for s in status if s["reachable"] and s["pid"] is not None]
             unreachable_hosts = [s["host"] for s in status if not s["reachable"]]
-            state_changed, completed_records = _prune_running_jobs_for_status(running_jobs, status)
+            state_changed, completed_records, failed_records = _prune_running_jobs_for_status(
+                running_jobs, status
+            )
             if state_changed:
                 save_running_jobs(running_jobs)
             if completed_records:
                 append_completed_records(completed_records)
+            if failed_records:
+                append_failed_records(failed_records)
+                for record in failed_records:
+                    print(
+                        f"[FAIL] {record.get('host')} job={record.get('job_id') or '-'} "
+                        f"exit={record.get('exit_code') if record.get('exit_code') is not None else '-'} "
+                        f"reason={record.get('failure_reason')}: {record.get('failure_detail')}",
+                        flush=True,
+                    )
+                _send_alert_email_with_limits(
+                    alert_recipients,
+                    f"[AWSQueueEngine] {len(failed_records)} job(s) failed",
+                    _build_failed_jobs_alert_body(failed_records),
+                    alert_state,
+                    "job_fail",
+                )
             if unreachable_hosts:
                 print(f"[WARN] unreachable hosts: {', '.join(unreachable_hosts)}", flush=True)
             if disabled_free_hosts:

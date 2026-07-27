@@ -7,6 +7,7 @@ from unittest.mock import patch
 from awsqueueengine.host.monitor import (
     _build_job_fail_alert_body,
     _build_completed_job_record,
+    _build_failed_job_record,
     _initial_alert_runtime_state,
     _prune_running_jobs_for_status,
     _reset_queue_alert_state,
@@ -20,6 +21,10 @@ from awsqueueengine.host.monitor import (
 )
 
 
+def _outcome(exit_code=0, log_tail="", found=True, error=""):
+    return {"exit_code": exit_code, "log_tail": log_tail, "found": found, "error": error}
+
+
 class MonitorRunningStatePruneTests(unittest.TestCase):
     def test_unreachable_host_keeps_running_metadata(self):
         running_jobs = {
@@ -31,10 +36,13 @@ class MonitorRunningStatePruneTests(unittest.TestCase):
             {"host": "eci6", "reachable": True, "pid": "123"},
         ]
 
-        changed, completed_records = _prune_running_jobs_for_status(running_jobs, status_rows)
+        changed, completed_records, failed_records = _prune_running_jobs_for_status(
+            running_jobs, status_rows, fetch_outcome=lambda host, tag: _outcome()
+        )
 
         self.assertFalse(changed)
         self.assertEqual(completed_records, [])
+        self.assertEqual(failed_records, [])
         self.assertEqual(set(running_jobs), {"eci5", "eci6"})
 
     def test_reachable_idle_host_is_pruned(self):
@@ -48,25 +56,101 @@ class MonitorRunningStatePruneTests(unittest.TestCase):
         ]
 
         with patch("awsqueueengine.host.monitor.time.time", return_value=160.0):
-            changed, completed_records = _prune_running_jobs_for_status(running_jobs, status_rows)
+            changed, completed_records, failed_records = _prune_running_jobs_for_status(
+                running_jobs, status_rows, fetch_outcome=lambda host, tag: _outcome()
+            )
 
         self.assertTrue(changed)
         self.assertEqual(set(running_jobs), {"eci6"})
+        self.assertEqual(failed_records, [])
         self.assertEqual(len(completed_records), 1)
         self.assertEqual(completed_records[0]["host"], "eci5")
         self.assertEqual(completed_records[0]["dur"], "00:01:00")
         self.assertEqual(completed_records[0]["duration_seconds"], 60)
         self.assertEqual(completed_records[0]["cmd"], "run-a")
+        self.assertEqual(completed_records[0]["status"], "completed")
+        self.assertEqual(completed_records[0]["exit_code"], 0)
+
+    def test_nonzero_exit_is_recorded_as_a_failure(self):
+        running_jobs = {"eci5": {"cmd": "run-a", "job_id": "tag-1", "started_at": 100.0}}
+        status_rows = [{"host": "eci5", "reachable": True, "pid": None}]
+
+        with patch("awsqueueengine.host.monitor.time.time", return_value=105.0):
+            changed, completed_records, failed_records = _prune_running_jobs_for_status(
+                running_jobs,
+                status_rows,
+                fetch_outcome=lambda host, tag: _outcome(1, "python: run.py: No such file"),
+            )
+
+        self.assertTrue(changed)
+        self.assertEqual(completed_records, [])
+        self.assertEqual(len(failed_records), 1)
+        record = failed_records[0]
+        self.assertEqual(record["host"], "eci5")
+        self.assertEqual(record["job_id"], "tag-1")
+        self.assertEqual(record["status"], "failed")
+        self.assertEqual(record["exit_code"], 1)
+        self.assertEqual(record["failure_reason"], "nonzero_exit")
+        self.assertEqual(record["dur"], "00:00:05")
+        self.assertIn("No such file", record["failure_detail"])
+
+    def test_job_without_exit_status_is_recorded_as_a_failure(self):
+        running_jobs = {"eci5": {"cmd": "run-a", "job_id": "tag-2"}}
+        status_rows = [{"host": "eci5", "reachable": True, "pid": None}]
+
+        _changed, completed_records, failed_records = _prune_running_jobs_for_status(
+            running_jobs,
+            status_rows,
+            fetch_outcome=lambda host, tag: _outcome(None, "", found=False, error="no exit status recorded on host"),
+        )
+
+        self.assertEqual(completed_records, [])
+        self.assertEqual(len(failed_records), 1)
+        self.assertEqual(failed_records[0]["failure_reason"], "no_exit_status")
+        self.assertIsNone(failed_records[0]["exit_code"])
+
+    def test_outcome_fetch_error_still_records_the_job(self):
+        running_jobs = {"eci5": {"cmd": "run-a", "job_id": "tag-3"}}
+        status_rows = [{"host": "eci5", "reachable": True, "pid": None}]
+
+        def boom(host, tag):
+            raise OSError("ssh exploded")
+
+        _changed, completed_records, failed_records = _prune_running_jobs_for_status(
+            running_jobs, status_rows, fetch_outcome=boom
+        )
+
+        self.assertEqual(completed_records, [])
+        self.assertEqual(len(failed_records), 1)
+        self.assertIn("ssh exploded", failed_records[0]["failure_detail"])
 
     def test_missing_host_in_status_keeps_running_metadata(self):
         running_jobs = {"eci9": {"cmd": "run-z"}}
         status_rows = [{"host": "eci8", "reachable": True, "pid": None}]
 
-        changed, completed_records = _prune_running_jobs_for_status(running_jobs, status_rows)
+        changed, completed_records, failed_records = _prune_running_jobs_for_status(
+            running_jobs, status_rows, fetch_outcome=lambda host, tag: _outcome()
+        )
 
         self.assertFalse(changed)
         self.assertEqual(completed_records, [])
+        self.assertEqual(failed_records, [])
         self.assertEqual(set(running_jobs), {"eci9"})
+
+    def test_build_failed_job_record_keeps_job_metadata_and_log_tail(self):
+        record = _build_failed_job_record(
+            "eci8",
+            {"cmd": "pmemd.cuda", "job_id": "tag-9", "queue": "gpu", "started_at": 10.0},
+            finished_at=25.0,
+            outcome=_outcome(137, "slurmstepd: Killed\nout of memory"),
+        )
+        self.assertEqual(record["status"], "failed")
+        self.assertEqual(record["exit_code"], 137)
+        self.assertEqual(record["failure_reason"], "out_of_memory")
+        self.assertEqual(record["queue"], "gpu")
+        self.assertEqual(record["dur"], "00:00:15")
+        self.assertEqual(record["failed_at"], 25.0)
+        self.assertIn("out of memory", record["log_tail"])
 
     def test_build_completed_job_record_uses_qstat_payload_selection(self):
         record = _build_completed_job_record(
@@ -280,7 +364,7 @@ class MonitorHostSourceTests(unittest.TestCase):
             ), patch(
                 "awsqueueengine.host.monitor._launch_job_on_host", side_effect=fake_launch_job_on_host
             ), patch(
-                "awsqueueengine.host.monitor._prune_running_jobs_for_status", return_value=(False, [])
+                "awsqueueengine.host.monitor._prune_running_jobs_for_status", return_value=(False, [], [])
             ), patch(
                 "awsqueueengine.host.monitor._select_preempt_target", return_value=(None, None, None)
             ), patch(
