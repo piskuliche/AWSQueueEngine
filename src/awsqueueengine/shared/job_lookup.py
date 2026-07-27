@@ -67,7 +67,10 @@ def _lookup_finished_job(job_id):
     if failed is not None and (completed is None or _finished_at_of(failed) >= _finished_at_of(completed)):
         record, status = failed, "failed"
     else:
-        record, status = completed, "completed"
+        # "unknown" for jobs that finished without a recorded exit status
+        # (launched before the monitor started tracking it).
+        record = completed
+        status = record.get("status") if record.get("status") in {"completed", "unknown"} else "completed"
 
     state = {
         "status": status,

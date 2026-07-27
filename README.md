@@ -185,6 +185,14 @@ job ended rather than why:
   `requeue-running` against the host; the failure history records those
   too rather than counting them as clean finishes.
 
+This only applies to jobs *this* monitor launched, which it marks with
+`exit_status_tracked` in `running.json`. Jobs already running when the
+daemon is upgraded never got the wrapper, so no status file exists for
+them; those finish as `status: unknown` in `completed.json` (never as
+failures) — a clean multi-hour run must not be reported as broken just
+because its outcome can't be proven. The distinction is only relevant for
+the jobs in flight across one upgrade.
+
 The failure history is capped at the 1000 most recent records.
 
 ## Remote queue host setup

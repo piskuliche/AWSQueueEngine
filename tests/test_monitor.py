@@ -9,6 +9,7 @@ from awsqueueengine.host.monitor import (
     _build_completed_job_record,
     _build_failed_job_record,
     _initial_alert_runtime_state,
+    _launch_job_on_host,
     _prune_running_jobs_for_status,
     _reset_queue_alert_state,
     _select_preempt_target,
@@ -94,8 +95,8 @@ class MonitorRunningStatePruneTests(unittest.TestCase):
         self.assertEqual(record["dur"], "00:00:05")
         self.assertIn("No such file", record["failure_detail"])
 
-    def test_job_without_exit_status_is_recorded_as_a_failure(self):
-        running_jobs = {"eci5": {"cmd": "run-a", "job_id": "tag-2"}}
+    def test_tracked_job_without_exit_status_is_recorded_as_a_failure(self):
+        running_jobs = {"eci5": {"cmd": "run-a", "job_id": "tag-2", "exit_status_tracked": True}}
         status_rows = [{"host": "eci5", "reachable": True, "pid": None}]
 
         _changed, completed_records, failed_records = _prune_running_jobs_for_status(
@@ -109,8 +110,41 @@ class MonitorRunningStatePruneTests(unittest.TestCase):
         self.assertEqual(failed_records[0]["failure_reason"], "no_exit_status")
         self.assertIsNone(failed_records[0]["exit_code"])
 
+    def test_untracked_job_without_exit_status_is_unknown_not_failed(self):
+        # Jobs already running when the monitor was upgraded never got the
+        # exit-status wrapper, so a missing .rc file proves nothing. Reporting
+        # those as failures marked clean 7-hour runs as broken in production.
+        running_jobs = {"eci5": {"cmd": "run-a", "job_id": "tag-old", "started_at": 100.0}}
+        status_rows = [{"host": "eci5", "reachable": True, "pid": None}]
+
+        with patch("awsqueueengine.host.monitor.time.time", return_value=25300.0):
+            _changed, completed_records, failed_records = _prune_running_jobs_for_status(
+                running_jobs,
+                status_rows,
+                fetch_outcome=lambda host, tag: _outcome(None, "", found=False, error="no exit status recorded on host"),
+            )
+
+        self.assertEqual(failed_records, [])
+        self.assertEqual(len(completed_records), 1)
+        self.assertEqual(completed_records[0]["status"], "unknown")
+        self.assertIsNone(completed_records[0]["exit_code"])
+        self.assertEqual(completed_records[0]["dur"], "07:00:00")
+
+    def test_untracked_job_with_a_real_nonzero_exit_still_fails(self):
+        # Absence of a status is unknowable; a status we can read is not.
+        running_jobs = {"eci5": {"cmd": "run-a", "job_id": "tag-old"}}
+        status_rows = [{"host": "eci5", "reachable": True, "pid": None}]
+
+        _changed, completed_records, failed_records = _prune_running_jobs_for_status(
+            running_jobs, status_rows, fetch_outcome=lambda host, tag: _outcome(1, "boom")
+        )
+
+        self.assertEqual(completed_records, [])
+        self.assertEqual(len(failed_records), 1)
+        self.assertEqual(failed_records[0]["exit_code"], 1)
+
     def test_outcome_fetch_error_still_records_the_job(self):
-        running_jobs = {"eci5": {"cmd": "run-a", "job_id": "tag-3"}}
+        running_jobs = {"eci5": {"cmd": "run-a", "job_id": "tag-3", "exit_status_tracked": True}}
         status_rows = [{"host": "eci5", "reachable": True, "pid": None}]
 
         def boom(host, tag):
@@ -179,6 +213,23 @@ class MonitorRunningStatePruneTests(unittest.TestCase):
         self.assertTrue(record["preempt"])
         self.assertEqual(record["hosts"], ["eci8"])
         self.assertEqual(record["cmd"], "python run.py")
+
+
+class MonitorLaunchTrackingTests(unittest.TestCase):
+    def test_launch_marks_the_running_job_as_exit_status_tracked(self):
+        running_jobs = {}
+        with patch(
+            "awsqueueengine.host.monitor.submit_to_host",
+            return_value={"ok": True, "tag": "tag-1", "pid": "123", "payload": "/scratch/p"},
+        ), patch("awsqueueengine.host.monitor.save_running_jobs"), patch(
+            "awsqueueengine.host.monitor.write_run_info"
+        ):
+            result = _launch_job_on_host("eci5", {"cmd": "run.sh", "job_id": "tag-1"}, running_jobs)
+
+        self.assertTrue(result["launched"])
+        # Without this flag the prune step can't tell a killed job from one that
+        # predates exit-status tracking.
+        self.assertTrue(running_jobs["eci5"]["exit_status_tracked"])
 
 
 class MonitorPreemptTargetTests(unittest.TestCase):

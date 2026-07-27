@@ -193,9 +193,9 @@ def _build_finished_job_record(host, running_item, finished_at):
     }
 
 
-def _build_completed_job_record(host, running_item, finished_at, exit_code=None):
+def _build_completed_job_record(host, running_item, finished_at, exit_code=None, status="completed"):
     record = _build_finished_job_record(host, running_item, finished_at)
-    record["status"] = "completed"
+    record["status"] = status
     record["exit_code"] = exit_code
     return record
 
@@ -584,6 +584,10 @@ def _launch_job_on_host(host, job_item, running_jobs):
         "payload_size_bytes": payload_size_bytes,
         "job_id": res.get("tag") or job_id,
         "started_at": time.time(),
+        # This monitor wrapped the job to record its exit status, so a missing
+        # status file later is real evidence the job was killed — not just an
+        # artifact of the job predating the wrapper.
+        "exit_status_tracked": True,
     }
     save_running_jobs(running_jobs)
     write_run_info(
@@ -667,6 +671,14 @@ def _prune_running_jobs_for_status(running_jobs, status_rows, fetch_outcome=fetc
             if outcome.get("found") and outcome.get("exit_code") == 0:
                 completed_records.append(
                     _build_completed_job_record(host, finished_item, finished_at, exit_code=0)
+                )
+            elif outcome.get("exit_code") is None and not finished_item.get("exit_status_tracked"):
+                # Launched before this monitor started wrapping jobs (an upgrade
+                # with jobs in flight), so there was never a status file to find.
+                # A long clean run must not be reported as a failure just
+                # because we can't prove it succeeded.
+                completed_records.append(
+                    _build_completed_job_record(host, finished_item, finished_at, status="unknown")
                 )
             else:
                 failed_records.append(_build_failed_job_record(host, finished_item, finished_at, outcome))
