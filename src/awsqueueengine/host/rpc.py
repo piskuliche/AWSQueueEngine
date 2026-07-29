@@ -16,6 +16,7 @@ from ..shared.deferred_state import (
     pop_all_deferred,
     pop_deferred_by_indices,
 )
+from ..shared.failure_state import load_failed_jobs
 from ..shared.job_lookup import lookup_job_state
 from ..shared.protocol import (
     PROTOCOL_VERSION,
@@ -247,6 +248,35 @@ def handle_requeue_deferred(params: dict) -> dict:
     return {"moved": moved, "action": "dropped" if drop else "requeued"}
 
 
+def handle_failed_list(params: dict) -> dict:
+    """Most recent failed jobs, newest first.
+
+    ``limit`` caps how many come back (default 50) and ``log`` opts into the
+    captured log tail, which is far too big to ship for every record.
+    """
+    params = _require_dict(params)
+    limit = _optional_int(params, "limit")
+    if limit is None:
+        limit = 50
+    limit = max(1, min(limit, 1000))
+    include_log = _optional_bool(params, "log")
+    job_id = _optional_str(params, "job_id")
+
+    jobs = []
+    for raw in reversed(load_failed_jobs()):
+        if not isinstance(raw, dict):
+            continue
+        if job_id and raw.get("job_id") != job_id:
+            continue
+        record = dict(raw)
+        if not include_log:
+            record.pop("log_tail", None)
+        jobs.append(record)
+        if len(jobs) >= limit:
+            break
+    return {"jobs": jobs}
+
+
 def handle_list_cooldowns(params: dict) -> dict:
     _require_dict(params)
     cooldowns = get_host_cooldowns()
@@ -332,6 +362,7 @@ METHODS: dict[str, Callable[[dict], dict]] = {
     "qstat": handle_qstat,
     "qdel": handle_qdel,
     "deferred_list": handle_deferred_list,
+    "failed_list": handle_failed_list,
     "requeue_deferred": handle_requeue_deferred,
     "list_cooldowns": handle_list_cooldowns,
     "enable_host": handle_enable_host,

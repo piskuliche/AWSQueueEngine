@@ -17,6 +17,7 @@ from pathlib import Path
 from ..shared.cli_utils import join_command_argv
 from ..shared.config import HOSTS, HOSTS_FILE
 from ..shared.deferred_state import load_deferred_jobs, pop_all_deferred, pop_deferred_by_indices
+from ..shared.failure_state import load_failed_jobs
 from ..shared.job_lookup import lookup_job_state
 from ..shared.paths import PIDFILE
 from ..shared.queue import (
@@ -312,6 +313,33 @@ def cmd_deferred(args):
             f"cmd={item['cmd']!r} payload={payload_text!r} last_error={last_error!r}",
             flush=True,
         )
+
+
+def cmd_failed(args):
+    records = [r for r in load_failed_jobs() if isinstance(r, dict)]
+    if args.job_id:
+        records = [r for r in records if r.get("job_id") == args.job_id]
+    if not records:
+        print("(no failed jobs recorded)", flush=True)
+        return
+    limit = max(1, int(args.limit or 50))
+    for record in list(reversed(records))[:limit]:
+        exit_code = record.get("exit_code")
+        exit_text = "-" if exit_code is None else str(exit_code)
+        failed_at = format_epoch(record.get("failed_at") or record.get("finished_at")) or "-"
+        payload_text = _payload_display_text(normalize_job_item(record))
+        print(
+            f"[{failed_at}] [job={record.get('job_id') or '-'}] [host={record.get('host') or '-'}] "
+            f"[queue={record.get('queue') or 'default'}] [dur={record.get('dur') or '-'}] "
+            f"[exit={exit_text}] [reason={record.get('failure_reason') or 'unknown'}] "
+            f"cmd={str(record.get('cmd') or '')!r} payload={payload_text!r}",
+            flush=True,
+        )
+        if record.get("failure_detail"):
+            print(f"    -> {record['failure_detail']}", flush=True)
+        if args.log and record.get("log_tail"):
+            for line in str(record["log_tail"]).splitlines():
+                print(f"    |  {line}", flush=True)
 
 
 def cmd_requeue_deferred(args):
@@ -627,6 +655,10 @@ def build_parser():
     _add_qdel_subparser(sub)
     sub.add_parser("clear", help="Clear the queue")
     sub.add_parser("deferred", help="Show deferred jobs")
+    p_failed = sub.add_parser("failed", help="Show jobs that failed, newest first")
+    p_failed.add_argument("--limit", "-n", type=int, default=50, help="How many recent failures to show (default 50)")
+    p_failed.add_argument("--job-id", default=None, help="Only show failures for this job id")
+    p_failed.add_argument("--log", action="store_true", help="Also print the captured tail of each job log")
     _add_requeue_deferred_subparser(sub)
     _add_requeue_running_subparser(sub)
     _add_enable_host_subparser(sub)
@@ -697,6 +729,8 @@ def dispatch(args, parser=None):
         cmd_clear(args)
     elif cmd == "deferred":
         cmd_deferred(args)
+    elif cmd == "failed":
+        cmd_failed(args)
     elif cmd == "requeue-deferred":
         cmd_requeue_deferred(args)
     elif cmd == "requeue-running":

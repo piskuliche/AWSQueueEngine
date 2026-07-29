@@ -165,6 +165,42 @@ class MpsWrapTests(unittest.TestCase):
 
         self.assertNotIn("nvidia-cuda-mps-control", commands[0])
 
+    def test_mps_wrapper_preserves_the_job_exit_status(self):
+        wrapped = wrap_in_mps_script("bash run.sh", job_name="tag-1")
+        # The job's status is captured before MPS teardown and re-raised, so the
+        # outer .rc file records the job's result, not `rm -rf`'s.
+        self.assertLess(wrapped.index("__awsqe_job_rc=$?"), wrapped.index("echo quit"))
+        self.assertTrue(wrapped.rstrip().endswith("exit $__awsqe_job_rc"))
+
+
+class ExitStatusCaptureTests(unittest.TestCase):
+    def _submit_and_capture(self, **kwargs):
+        commands = []
+
+        def fake_ssh_run(_host, cmd, timeout=60, capture_output=True):
+            commands.append(cmd)
+            if cmd.startswith("cat "):
+                return 0, "1234", ""
+            if "ps -p 1234" in cmd:
+                return 0, "1234", ""
+            return 0, "", ""
+
+        with patch("awsqueueengine.host.job_control.ssh_run", side_effect=fake_ssh_run):
+            submit_to_host("eci5", "bash run.sh", tag="20260616-120000-abcdef", **kwargs)
+        return commands[0]
+
+    def test_launch_command_records_exit_status_next_to_the_log(self):
+        launch_cmd = self._submit_and_capture()
+        self.assertIn("/manager_jobs/20260616-120000-abcdef.rc", launch_cmd)
+        self.assertIn("__awsqe_rc=$?", launch_cmd)
+        # Stale status from a previous attempt with the same tag is cleared first.
+        self.assertLess(launch_cmd.index("rm -f "), launch_cmd.index("bash run.sh"))
+
+    def test_exit_status_is_recorded_for_mps_jobs_too(self):
+        launch_cmd = self._submit_and_capture(mps=True)
+        self.assertIn("/manager_jobs/20260616-120000-abcdef.rc", launch_cmd)
+        self.assertIn("nvidia-cuda-mps-control -d", launch_cmd)
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -7,6 +7,8 @@ from awsqueueengine.host import rpc
 from awsqueueengine.shared import queue as queue_mod
 from awsqueueengine.shared import running_state as running_state_mod
 from awsqueueengine.shared import deferred_state as deferred_state_mod
+from awsqueueengine.shared import completion_state as completion_state_mod
+from awsqueueengine.shared import failure_state as failure_state_mod
 
 
 class DispatchEnvelopeTests(unittest.TestCase):
@@ -49,7 +51,7 @@ class DispatchEnvelopeTests(unittest.TestCase):
 
 
 class _StateFixture(unittest.TestCase):
-    """Common: redirect QUEUE_FILE / RUNNING_FILE / DEFERRED_FILE to a temp dir."""
+    """Common: redirect the queue-host state files to a temp dir."""
 
     def setUp(self):
         self.tmpdir = tempfile.TemporaryDirectory()
@@ -58,6 +60,8 @@ class _StateFixture(unittest.TestCase):
             (queue_mod, "QUEUE_FILE", tmp / "queue.json"),
             (running_state_mod, "RUNNING_FILE", tmp / "running.json"),
             (deferred_state_mod, "DEFERRED_FILE", tmp / "deferred.json"),
+            (completion_state_mod, "COMPLETED_FILE", tmp / "completed.json"),
+            (failure_state_mod, "FAILED_FILE", tmp / "failed.json"),
         ]
         self._originals = []
         for module, name, replacement in self._patches:
@@ -165,6 +169,65 @@ class DeferredListTests(_StateFixture):
         self.assertEqual(jobs[0]["deferred_at"], 1234.5)
         self.assertEqual(jobs[0]["last_host"], "eci7")
         self.assertEqual(jobs[0]["last_error"], "host_storage: no scratch")
+
+
+class FailedListTests(_StateFixture):
+    def _seed(self, count=3):
+        failure_state_mod.save_failed_jobs([
+            {
+                "job_id": f"F{i}", "host": "eci3", "cmd": f"job {i}", "queue": "default",
+                "status": "failed", "exit_code": 1, "failure_reason": "nonzero_exit",
+                "failure_detail": "boom", "log_tail": f"line-{i}\ntail-{i}", "failed_at": 100.0 + i,
+                "finished_at": 100.0 + i,
+            }
+            for i in range(count)
+        ])
+
+    def test_failed_list_returns_newest_first_without_log_tail(self):
+        self._seed()
+        resp = rpc.dispatch({"version": 1, "method": "failed_list", "params": {}})
+        self.assertTrue(resp["ok"])
+        jobs = resp["result"]["jobs"]
+        self.assertEqual([j["job_id"] for j in jobs], ["F2", "F1", "F0"])
+        self.assertNotIn("log_tail", jobs[0])
+        self.assertEqual(jobs[0]["failure_reason"], "nonzero_exit")
+
+    def test_failed_list_honours_limit_and_log_flag(self):
+        self._seed()
+        resp = rpc.dispatch({"version": 1, "method": "failed_list", "params": {"limit": 2, "log": True}})
+        jobs = resp["result"]["jobs"]
+        self.assertEqual([j["job_id"] for j in jobs], ["F2", "F1"])
+        self.assertEqual(jobs[0]["log_tail"], "line-2\ntail-2")
+
+    def test_failed_list_filters_by_job_id(self):
+        self._seed()
+        resp = rpc.dispatch({"version": 1, "method": "failed_list", "params": {"job_id": "F1"}})
+        self.assertEqual([j["job_id"] for j in resp["result"]["jobs"]], ["F1"])
+
+    def test_failed_list_empty_when_nothing_failed(self):
+        resp = rpc.dispatch({"version": 1, "method": "failed_list", "params": {}})
+        self.assertEqual(resp["result"], {"jobs": []})
+
+    def test_job_info_reports_failed_state(self):
+        self._seed(1)
+        resp = rpc.dispatch({"version": 1, "method": "job_info", "params": {"job_id": "F0"}})
+        state = resp["result"]["state"]
+        self.assertEqual(state["status"], "failed")
+        self.assertEqual(state["failure_reason"], "nonzero_exit")
+        self.assertEqual(state["exit_code"], "1")
+
+    def test_job_info_prefers_the_newer_terminal_record(self):
+        failure_state_mod.save_failed_jobs([
+            {"job_id": "R1", "host": "eci1", "cmd": "retry me", "failure_reason": "segfault", "finished_at": 100.0},
+        ])
+        completion_state_mod.save_completed_jobs([
+            {"job_id": "R1", "host": "eci2", "cmd": "retry me", "dur": "00:10:00", "finished_at": 200.0},
+        ])
+        resp = rpc.dispatch({"version": 1, "method": "job_info", "params": {"job_id": "R1"}})
+        state = resp["result"]["state"]
+        self.assertEqual(state["status"], "completed")
+        self.assertEqual(state["host"], "eci2")
+        self.assertNotIn("failure_reason", state)
 
 
 class RequeueDeferredTests(_StateFixture):

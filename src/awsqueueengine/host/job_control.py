@@ -8,6 +8,7 @@ from pathlib import Path
 from urllib.parse import urlparse
 
 from ..shared.config import REMOTE_LOG_DIR, SSH_TIMEOUT
+from ..shared.job_outcome import rc_path_for_tag
 from ..shared.ssh_utils import ssh_run
 from ..shared.worker_actions import new_job_tag
 from ..shared.worker_staging import (
@@ -42,9 +43,11 @@ nvidia-cuda-mps-control -d
 sleep 1
 
 {job_command}
+__awsqe_job_rc=$?
 
 echo quit | nvidia-cuda-mps-control
 rm -rf ${{temp_path}}
+exit $__awsqe_job_rc
 """
 
 
@@ -57,6 +60,34 @@ def wrap_in_mps_script(job_command, job_name):
     """
     safe_job_name = shlex.quote(str(job_name) if job_name else "awsqe")
     return MPS_WRAPPER_TEMPLATE.format(job_name=safe_job_name, job_command=job_command)
+
+
+# Every job is bracketed by this so the worker records how it ended. The
+# monitor reads `{tag}.rc` back when the host goes idle (see
+# `awsqueueengine.shared.job_outcome`); without it a job that dies in two
+# seconds is indistinguishable from one that finished cleanly. The leading
+# `rm -f` matters for requeued jobs, which reuse their job tag: a stale status
+# from the previous attempt must not be read back as this attempt's outcome.
+#
+# The status is written from an EXIT trap rather than after the command, so a
+# job script that ends in `exit 1` (which would otherwise leave the shell before
+# any trailing line ran) still records what happened. A job killed outright —
+# preemption, SIGKILL, host reboot — records nothing, and the monitor reports
+# that as `no_exit_status` instead of a clean finish.
+EXIT_STATUS_WRAPPER_TEMPLATE = """\
+__awsqe_rc_path={rc_path}
+rm -f "$__awsqe_rc_path"
+trap '__awsqe_rc=$?; echo $__awsqe_rc > "$__awsqe_rc_path" 2>/dev/null || true' EXIT
+{job_command}
+"""
+
+
+def wrap_with_exit_status(job_command, tag):
+    """Bracket ``job_command`` so its exit status lands in ``{tag}.rc``."""
+    return EXIT_STATUS_WRAPPER_TEMPLATE.format(
+        rc_path=shlex.quote(rc_path_for_tag(tag)),
+        job_command=job_command,
+    )
 
 
 def submit_to_host(
@@ -72,6 +103,7 @@ def submit_to_host(
     tag = tag or new_job_tag()
     if mps:
         job_command = wrap_in_mps_script(job_command, job_name=tag)
+    job_command = wrap_with_exit_status(job_command, tag)
     remote_payload_dir = None
     if payload_remote_path:
         remote_payload_dir = str(payload_remote_path).strip() or None
