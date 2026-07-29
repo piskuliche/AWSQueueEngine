@@ -177,9 +177,14 @@ exit status second: `out_of_memory`, `disk_full`, `cuda_error`,
 `terminated`, `signal_N`, `nonzero_exit`, plus two that describe how the
 job ended rather than why:
 
-- `start_failed` — the job never ran (submit failure, or it exited before
-  the monitor could confirm the process). Repeated start failures still
-  move the job to `deferred.json` for requeueing as before.
+- `start_failed` — the job never ran (submit failure). Repeated start
+  failures still move the job to `deferred.json` for requeueing as before.
+
+A job that exits before the monitor can confirm its pid is judged by its
+recorded status, not by its absence: exit `0` there means the work was
+already done and the job is filed as **completed** (no alert, and the
+host stays available for the next queued job), while a nonzero or missing
+status is filed as a failure.
 - `no_exit_status` — the job vanished without recording a status. Usually
   a hard kill, a host reboot, or an operator running `stop` /
   `requeue-running` against the host; the failure history records those

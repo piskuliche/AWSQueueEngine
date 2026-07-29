@@ -215,6 +215,58 @@ class MonitorRunningStatePruneTests(unittest.TestCase):
         self.assertEqual(record["cmd"], "python run.py")
 
 
+class MonitorFastFinishTests(unittest.TestCase):
+    """A job whose process is gone by the pid check may have succeeded."""
+
+    FAST_EXIT = {"ok": False, "err": "pidfile present but process not running",
+                 "reason": "job", "tag": "tag-1", "payload": "/scratch/p"}
+
+    def _launch(self, outcome):
+        recorded = {"completed": [], "failed": []}
+        with patch("awsqueueengine.host.monitor.submit_to_host", return_value=dict(self.FAST_EXIT)), patch(
+            "awsqueueengine.host.monitor.fetch_job_outcome", return_value=outcome
+        ), patch(
+            "awsqueueengine.host.monitor.append_completed_records",
+            side_effect=lambda r: recorded["completed"].extend(r),
+        ), patch(
+            "awsqueueengine.host.monitor.append_failed_records",
+            side_effect=lambda r: recorded["failed"].extend(r),
+        ):
+            result = _launch_job_on_host("eci5", {"cmd": "run.sh", "job_id": "tag-1"}, {})
+        return result, recorded
+
+    def test_exit_zero_before_pid_check_is_recorded_as_completed(self):
+        # A job with nothing left to do exits 0 in under a second and looks
+        # identical to a crash from the launcher's point of view. Recording it
+        # as a failure marked successful production runs as broken.
+        result, recorded = self._launch(_outcome(0, "all nodes completed"))
+
+        self.assertEqual(recorded["failed"], [])
+        self.assertEqual(len(recorded["completed"]), 1)
+        self.assertEqual(recorded["completed"][0]["status"], "completed")
+        self.assertEqual(recorded["completed"][0]["exit_code"], 0)
+        # Must not look like a start failure: no alert, no dispatch stall.
+        self.assertTrue(result["finished_immediately"])
+        self.assertIsNone(result["reason"])
+
+    def test_nonzero_exit_before_pid_check_is_still_a_failure(self):
+        result, recorded = self._launch(_outcome(1, "Traceback (most recent call last):"))
+
+        self.assertEqual(recorded["completed"], [])
+        self.assertEqual(len(recorded["failed"]), 1)
+        self.assertEqual(recorded["failed"][0]["failure_reason"], "python_exception")
+        self.assertFalse(result.get("finished_immediately"))
+        self.assertEqual(result["reason"], "job")
+
+    def test_missing_status_after_launch_is_a_failure(self):
+        # We just launched it ourselves, so the wrapper was definitely applied:
+        # a missing status here really does mean the job died.
+        _result, recorded = self._launch(_outcome(None, "", found=False, error="no exit status recorded on host"))
+
+        self.assertEqual(recorded["completed"], [])
+        self.assertEqual(recorded["failed"][0]["failure_reason"], "no_exit_status")
+
+
 class MonitorLaunchTrackingTests(unittest.TestCase):
     def test_launch_marks_the_running_job_as_exit_status_tracked(self):
         running_jobs = {}

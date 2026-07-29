@@ -230,6 +230,25 @@ def _build_start_failure_record(host, job_item, failed_at, err, deferred=False):
     return record
 
 
+def _record_for_outcome(host, job_item, finished_at, outcome, exit_status_tracked=False):
+    """Turn a finished job + its outcome into exactly one record.
+
+    Returns ``(completed_record, failed_record)`` with the other side ``None``.
+    Both the prune path and the died-during-launch path go through here so they
+    can't disagree about what counts as a failure — an exit status of 0 is a
+    success no matter which path observed it.
+    """
+    outcome = outcome or {}
+    if outcome.get("found") and outcome.get("exit_code") == 0:
+        return _build_completed_job_record(host, job_item, finished_at, exit_code=0), None
+    if outcome.get("exit_code") is None and not exit_status_tracked:
+        # Launched before this monitor started wrapping jobs (an upgrade with
+        # jobs in flight), so there was never a status file to find. A long
+        # clean run must not be called a failure just because we can't prove it.
+        return _build_completed_job_record(host, job_item, finished_at, status="unknown"), None
+    return None, _build_failed_job_record(host, job_item, finished_at, outcome)
+
+
 def _build_failed_jobs_alert_body(failed_records):
     lines = [f"{len(failed_records)} job(s) failed on the worker hosts.", ""]
     for record in failed_records:
@@ -489,6 +508,7 @@ def _launch_job_on_host(host, job_item, running_jobs):
     mps = item.get("mps", False)
     job_id = item.get("job_id")
     hosts_text = ",".join(target_hosts) if target_hosts else f"queue:{queue_name}"
+    launch_started_at = time.time()
     print(
         f"[{time.strftime('%H:%M:%S')}] Launching (priority={priority}, hosts={hosts_text}, preempt={preempt}) on {host}: "
         f"{job_cmd[:120]}{'...' if len(job_cmd)>120 else ''}",
@@ -525,11 +545,32 @@ def _launch_job_on_host(host, job_item, running_jobs):
             }
 
         if err_text == "pidfile present but process not running":
-            print(f"    Job Failed on {host}; but had pid file. Job maybe had error.", flush=True)
-            # The job started and died immediately. It is not requeued and not
-            # tracked as running, so this is the only chance to record it.
+            # The process is already gone one second after launch. That is not
+            # automatically a failure: a job whose work was already done exits
+            # 0 immediately and looks identical from here. Ask the host for the
+            # exit status before deciding. Either way the job is neither
+            # requeued nor tracked as running, so this is the only chance to
+            # record it.
+            finished_at = time.time()
+            item["started_at"] = launch_started_at
             outcome = fetch_job_outcome(host, res.get("tag") or item.get("job_id"))
-            append_failed_records([_build_failed_job_record(host, item, time.time(), outcome)])
+            completed_record, failed_record = _record_for_outcome(
+                host, item, finished_at, outcome, exit_status_tracked=True
+            )
+            if completed_record is not None:
+                print(f"    Job on {host} finished immediately with exit 0; recorded as completed.", flush=True)
+                append_completed_records([completed_record])
+                return {
+                    "launched": False,
+                    "reason": None,
+                    "err": None,
+                    "host_failed": False,
+                    "deferred": False,
+                    "finished_immediately": True,
+                    "item": item,
+                }
+            print(f"    Job Failed on {host}; but had pid file. Job maybe had error.", flush=True)
+            append_failed_records([failed_record])
             return {
                 "launched": False,
                 "reason": "job",
@@ -668,20 +709,17 @@ def _prune_running_jobs_for_status(running_jobs, status_rows, fetch_outcome=fetc
                 outcome = fetch_outcome(host, finished_item.get("job_id"))
             except Exception as exc:  # a flaky SSH must not lose the job record
                 outcome = {"exit_code": None, "log_tail": "", "found": False, "error": f"{type(exc).__name__}: {exc}"}
-            if outcome.get("found") and outcome.get("exit_code") == 0:
-                completed_records.append(
-                    _build_completed_job_record(host, finished_item, finished_at, exit_code=0)
-                )
-            elif outcome.get("exit_code") is None and not finished_item.get("exit_status_tracked"):
-                # Launched before this monitor started wrapping jobs (an upgrade
-                # with jobs in flight), so there was never a status file to find.
-                # A long clean run must not be reported as a failure just
-                # because we can't prove it succeeded.
-                completed_records.append(
-                    _build_completed_job_record(host, finished_item, finished_at, status="unknown")
-                )
+            completed_record, failed_record = _record_for_outcome(
+                host,
+                finished_item,
+                finished_at,
+                outcome,
+                exit_status_tracked=bool(finished_item.get("exit_status_tracked")),
+            )
+            if completed_record is not None:
+                completed_records.append(completed_record)
             else:
-                failed_records.append(_build_failed_job_record(host, finished_item, finished_at, outcome))
+                failed_records.append(failed_record)
     return changed, completed_records, failed_records
 
 
@@ -790,6 +828,11 @@ def monitor_loop(hosts, poll_interval=CHECK_INTERVAL, stop_event: threading.Even
                         continue
                     launch_result = _launch_job_on_host(host, job_item, running_jobs)
                     if launch_result.get("launched"):
+                        continue
+                    if launch_result.get("finished_immediately"):
+                        # Ran to completion before we could confirm the pid.
+                        # Not a failure: no alert, and the host is free for the
+                        # next queued job rather than stalling this cycle.
                         continue
                     failed_item = launch_result.get("item") or normalize_job_item(job_item)
                     if launch_result.get("host_failed"):
