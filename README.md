@@ -109,6 +109,12 @@ awsqe-client requeue-deferred --all
 awsqe-client enable-host           # show active host cooldowns (no args)
 awsqe-client enable-host eci17     # release a host from cooldown early
 
+# Delete queued jobs, addressed by the job id `list` prints as [job=...]:
+awsqe-client qdel 20260730-141530-a1b2c3
+awsqe-client qdel 20260730-141530-a1b2c3 20260730-141602-9f0e11   # several at once
+awsqe-client qdel 20260730-1415    # any unique prefix of a job id
+awsqe-client qdel --queue fast-gpus   # every queued job in one queue
+
 # Worker-host operations from your laptop (SSHes to the worker directly):
 awsqe-client status                # ps probe of every host's MANAGER_TAG state
 awsqe-client tail eci17            # tail the most recent job log on a worker
@@ -119,6 +125,16 @@ awsqe-client info -p ./my_payload  # refresh run.info from queue-host state
 # Override config on a one-off command:
 awsqe-client submit --queue-host other-queue "python sweep.py"
 ```
+
+`qdel` selects by job id rather than by the number `list` prints in the left
+column. That number is only a render-time position and it moves constantly:
+every deletion renumbers the entries after it, the monitor dequeues the
+highest-priority job from anywhere in the list, requeues insert at the front,
+and other users' submits append. Deleting several jobs from one listing by
+position therefore hits the wrong ones. `--index N` still deletes by position
+for the cases where that's genuinely what you want, and the three selectors
+(job ids, `--index`, `--queue`) cannot be combined in one command. Nothing is
+removed unless every selector resolves, so a typo leaves the queue untouched.
 
 The legacy `awsqueueengine <subcommand>` still works for the commands it
 shipped with (everything above except `failed`). It will be deprecated in

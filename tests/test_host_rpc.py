@@ -129,10 +129,81 @@ class QdelTests(_StateFixture):
         self.assertFalse(resp["ok"])
         self.assertEqual(resp["error"]["code"], "conflict")
 
-    def test_qdel_requires_non_empty_indices_list(self):
+    def test_qdel_requires_a_selector(self):
         resp = rpc.dispatch({"version": 1, "method": "qdel", "params": {}})
         self.assertFalse(resp["ok"])
         self.assertEqual(resp["error"]["code"], "invalid_params")
+
+    def _three_jobs(self):
+        queue_mod.save_queue([
+            {"cmd": "first", "job_id": "aaa111"},
+            {"cmd": "second", "job_id": "bbb222", "queue": "fast"},
+            {"cmd": "third", "job_id": "ccc333", "queue": "fast"},
+        ])
+
+    def test_qdel_removes_entries_by_job_id(self):
+        self._three_jobs()
+        resp = rpc.dispatch({
+            "version": 1, "method": "qdel", "params": {"job_ids": ["aaa111", "ccc333"]},
+        })
+        self.assertTrue(resp["ok"])
+        removed = resp["result"]["removed"]
+        self.assertEqual([r["index"] for r in removed], [1, 3])
+        self.assertEqual([r["selector"] for r in removed], ["aaa111", "ccc333"])
+        self.assertEqual([i["cmd"] for i in queue_mod.load_queue()], ["second"])
+
+    def test_qdel_accepts_a_unique_job_id_prefix(self):
+        self._three_jobs()
+        resp = rpc.dispatch({"version": 1, "method": "qdel", "params": {"job_ids": ["bbb"]}})
+        self.assertTrue(resp["ok"])
+        self.assertEqual(
+            [i["cmd"] for i in queue_mod.load_queue()], ["first", "third"]
+        )
+
+    def test_qdel_by_queue_name_removes_the_whole_queue(self):
+        self._three_jobs()
+        resp = rpc.dispatch({"version": 1, "method": "qdel", "params": {"queue": "fast"}})
+        self.assertTrue(resp["ok"])
+        self.assertEqual([r["index"] for r in resp["result"]["removed"]], [2, 3])
+        self.assertEqual([i["cmd"] for i in queue_mod.load_queue()], ["first"])
+
+    def test_qdel_unknown_job_id_leaves_the_queue_untouched(self):
+        self._three_jobs()
+        resp = rpc.dispatch({
+            "version": 1, "method": "qdel", "params": {"job_ids": ["aaa111", "nosuch"]},
+        })
+        self.assertFalse(resp["ok"])
+        self.assertEqual(resp["error"]["code"], "not_found")
+        self.assertEqual(len(queue_mod.load_queue()), 3)
+
+    def test_qdel_ambiguous_prefix_returns_conflict(self):
+        queue_mod.save_queue([
+            {"cmd": "first", "job_id": "aaa111"},
+            {"cmd": "second", "job_id": "aaa222"},
+        ])
+        resp = rpc.dispatch({"version": 1, "method": "qdel", "params": {"job_ids": ["aaa"]}})
+        self.assertFalse(resp["ok"])
+        self.assertEqual(resp["error"]["code"], "conflict")
+        self.assertEqual(len(queue_mod.load_queue()), 2)
+
+    def test_qdel_rejects_mixed_selectors(self):
+        self._three_jobs()
+        resp = rpc.dispatch({
+            "version": 1, "method": "qdel", "params": {"job_ids": ["aaa111"], "indices": [2]},
+        })
+        self.assertFalse(resp["ok"])
+        self.assertEqual(resp["error"]["code"], "invalid_params")
+        self.assertEqual(len(queue_mod.load_queue()), 3)
+
+    def test_qdel_explains_a_job_that_is_already_running(self):
+        self._three_jobs()
+        running_state_mod.save_running_jobs({
+            "eci5": {"cmd": "gone", "job_id": "ddd444", "started_at": 1.0},
+        })
+        resp = rpc.dispatch({"version": 1, "method": "qdel", "params": {"job_ids": ["ddd444"]}})
+        self.assertFalse(resp["ok"])
+        self.assertEqual(resp["error"]["code"], "not_found")
+        self.assertIn("already running on eci5", resp["error"]["message"])
 
 
 class JobInfoTests(_StateFixture):

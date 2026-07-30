@@ -17,7 +17,7 @@ from ..shared.deferred_state import (
     pop_deferred_by_indices,
 )
 from ..shared.failure_state import load_failed_jobs
-from ..shared.job_lookup import lookup_job_state
+from ..shared.job_lookup import enrich_selection_message, lookup_job_state
 from ..shared.protocol import (
     PROTOCOL_VERSION,
     RpcError,
@@ -25,9 +25,12 @@ from ..shared.protocol import (
     make_ok,
 )
 from ..shared.queue import (
+    QueueSelectionError,
     enqueue_item,
     load_queue,
     normalize_job_item,
+    remove_queue_positions,
+    resolve_queue_selection,
     save_queue,
 )
 from ..shared.queue_config import (
@@ -172,30 +175,28 @@ def handle_qstat(params: dict) -> dict:
 
 
 def handle_qdel(params: dict) -> dict:
+    """Delete queued jobs selected by job id, queue name, or (legacy) position.
+
+    ``indices`` keeps its original meaning so an older client still works
+    against this handler unchanged.
+    """
     params = _require_dict(params)
+    job_ids = _optional_string_list(params, "job_ids") or []
     indices = _optional_int_list(params, "indices")
-    if not indices:
-        raise RpcError("invalid_params", "indices must be a non-empty list")
+    queue = _optional_str(params, "queue")
 
     q = load_queue()
-    if not q:
-        raise RpcError("not_found", "queue is empty")
+    try:
+        selection = resolve_queue_selection(q, job_ids=job_ids, indices=indices, queue=queue)
+    except QueueSelectionError as exc:
+        raise RpcError(exc.code, enrich_selection_message(exc.message, exc.tokens)) from exc
 
-    queue_size = len(q)
-    unique_indices = sorted(set(indices))
-    invalid = [i for i in unique_indices if i < 1 or i > queue_size]
-    if invalid:
-        raise RpcError(
-            "conflict",
-            f"invalid queue index(es): {', '.join(str(i) for i in invalid)}; queue size {queue_size}",
-        )
-
-    removed = []
-    for idx in sorted(unique_indices, reverse=True):
-        item = normalize_job_item(q.pop(idx - 1))
-        removed.append({"index": idx, "item": item})
-    save_queue(q)
-    return {"removed": sorted(removed, key=lambda r: r["index"])}
+    removed = remove_queue_positions(q, selection)
+    return {
+        "removed": [
+            {"index": idx, "item": item, "selector": token} for idx, item, token in removed
+        ]
+    }
 
 
 def handle_deferred_list(params: dict) -> dict:

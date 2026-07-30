@@ -216,6 +216,133 @@ def enqueue_item(item):
     save_queue(q)
 
 
+# ---------- qdel selection ----------
+
+class QueueSelectionError(Exception):
+    """A qdel selector did not resolve to a unique set of queue entries.
+
+    ``code`` is protocol-neutral on purpose: the RPC handler maps it onto an
+    ``RpcError`` code while the host CLI just prints ``message``. ``tokens``
+    carries the selectors that matched nothing, so callers can enrich the
+    message with where those jobs actually went.
+    """
+
+    def __init__(self, code, message, tokens=None):
+        super().__init__(message)
+        self.code = code
+        self.message = message
+        self.tokens = list(tokens or [])
+
+
+def _selector_kinds(job_ids, indices, queue):
+    present = (("job ids", job_ids), ("indices", indices), ("queue", queue))
+    return [name for name, value in present if value]
+
+
+def _resolve_indices(q, indices):
+    queue_size = len(q)
+    unique_indices = sorted(set(indices))
+    invalid = [i for i in unique_indices if i < 1 or i > queue_size]
+    if invalid:
+        raise QueueSelectionError(
+            "conflict",
+            f"invalid queue index(es): {', '.join(str(i) for i in invalid)}; queue size {queue_size}",
+        )
+    return [(idx - 1, str(idx)) for idx in unique_indices]
+
+
+def _resolve_queue_name(q, queue):
+    wanted = normalize_queue_name(queue)
+    selection = [
+        (pos, f"--queue {wanted}")
+        for pos, raw_item in enumerate(q)
+        if normalize_job_item(raw_item)["queue"] == wanted
+    ]
+    if not selection:
+        raise QueueSelectionError("not_found", f"no queued jobs in queue {wanted!r}")
+    return selection
+
+
+def _resolve_job_ids(q, job_ids):
+    """Match each token against job ids, exact first then unique prefix.
+
+    Exact wins outright so a full job id is never reported as ambiguous even
+    when it happens to prefix another one.
+    """
+    ids = [normalize_job_item(raw_item)["job_id"] for raw_item in q]
+    folded = [(job_id or "").casefold() for job_id in ids]
+
+    selection = {}
+    missing = []
+    for raw_token in job_ids:
+        token = str(raw_token).strip()
+        if not token:
+            continue
+        needle = token.casefold()
+        matches = [pos for pos, value in enumerate(folded) if value and value == needle]
+        if not matches:
+            matches = [pos for pos, value in enumerate(folded) if value and value.startswith(needle)]
+        if not matches:
+            missing.append(token)
+            continue
+        if len(matches) > 1:
+            candidates = ", ".join(ids[pos] for pos in matches)
+            raise QueueSelectionError(
+                "conflict",
+                f"job id {token!r} matches {len(matches)} queued jobs: {candidates}",
+            )
+        selection.setdefault(matches[0], token)
+
+    if missing:
+        raise QueueSelectionError(
+            "not_found",
+            f"no queued job matching: {', '.join(missing)}",
+            tokens=missing,
+        )
+    if not selection:
+        raise QueueSelectionError("invalid_params", "provide at least one non-empty job id")
+    return sorted(selection.items())
+
+
+def resolve_queue_selection(q, job_ids=None, indices=None, queue=None):
+    """Resolve qdel selectors to ``[(position, token), ...]`` sorted by position.
+
+    Exactly one selector kind may be supplied — mixing job ids with positions
+    in a single command is the ambiguity this whole path exists to avoid.
+    Resolution happens before anything is popped, so a bad selector leaves the
+    queue untouched.
+    """
+    kinds = _selector_kinds(job_ids, indices, queue)
+    if not kinds:
+        raise QueueSelectionError("invalid_params", "provide job id(s), indices, or a queue name")
+    if len(kinds) > 1:
+        raise QueueSelectionError(
+            "invalid_params",
+            f"cannot combine {' and '.join(kinds)}; pick one selector",
+        )
+    if not q:
+        raise QueueSelectionError("not_found", "queue is empty")
+
+    if indices:
+        return _resolve_indices(q, indices)
+    if queue:
+        return _resolve_queue_name(q, queue)
+    return _resolve_job_ids(q, job_ids)
+
+
+def remove_queue_positions(q, selection):
+    """Pop the selected positions from ``q``, persist, and report what went.
+
+    Takes the ``[(position, token), ...]`` from :func:`resolve_queue_selection`
+    and returns ``[(index_1based, item, token), ...]`` in ascending queue order.
+    """
+    removed = []
+    for pos, token in sorted(selection, reverse=True):
+        removed.append((pos + 1, normalize_job_item(q.pop(pos)), token))
+    save_queue(q)
+    return sorted(removed, key=lambda entry: entry[0])
+
+
 def _is_host_eligible(item, host, queue_host_map=None):
     return host_is_eligible_for_item(item, host, queue_host_map)
 

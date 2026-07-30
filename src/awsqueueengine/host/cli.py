@@ -14,17 +14,26 @@ import time
 from datetime import datetime
 from pathlib import Path
 
-from ..shared.cli_utils import join_command_argv
+from ..shared.cli_utils import (
+    QDEL_HELP,
+    add_qdel_arguments,
+    join_command_argv,
+    qdel_selectors,
+    validate_qdel_selectors,
+)
 from ..shared.config import HOSTS, HOSTS_FILE
 from ..shared.deferred_state import load_deferred_jobs, pop_all_deferred, pop_deferred_by_indices
 from ..shared.failure_state import load_failed_jobs
-from ..shared.job_lookup import lookup_job_state
+from ..shared.job_lookup import enrich_selection_message, lookup_job_state
 from ..shared.paths import PIDFILE
 from ..shared.queue import (
+    QueueSelectionError,
     build_resume_item,
     enqueue_item,
     load_queue,
     normalize_job_item,
+    remove_queue_positions,
+    resolve_queue_selection,
     save_queue,
 )
 from ..shared.queue_config import (
@@ -252,34 +261,29 @@ def cmd_qstat(args):
 
 
 def cmd_qdel(args):
+    selector_error = validate_qdel_selectors(args)
+    if selector_error:
+        print(selector_error, flush=True)
+        sys.exit(1)
+
+    job_ids, indices, queue = qdel_selectors(args)
     q = load_queue()
-    if not q:
-        print("(queue empty)", flush=True)
+    try:
+        selection = resolve_queue_selection(q, job_ids=job_ids, indices=indices, queue=queue)
+    except QueueSelectionError as exc:
+        print(enrich_selection_message(exc.message, exc.tokens), flush=True)
         sys.exit(1)
 
-    queue_size = len(q)
-    unique_ids = sorted(set(args.job_ids))
-    invalid_ids = [idx for idx in unique_ids if idx < 1 or idx > queue_size]
-    if invalid_ids:
-        print(
-            f"Invalid queue index(es): {', '.join(str(i) for i in invalid_ids)}. "
-            f"Queue size: {queue_size}",
-            flush=True,
-        )
-        sys.exit(1)
-
-    removed_jobs = []
-    for idx in sorted(unique_ids, reverse=True):
-        removed = normalize_job_item(q.pop(idx - 1))
-        removed_jobs.append((idx, removed))
-    save_queue(q)
+    removed_jobs = remove_queue_positions(q, selection)
 
     print(f"Removed {len(removed_jobs)} job(s).", flush=True)
-    for idx, item in sorted(removed_jobs, key=lambda pair: pair[0]):
+    for idx, item, _token in removed_jobs:
         hosts_text = ",".join(item["hosts"]) if item["hosts"] else "-"
         payload_text = _payload_display_text(item)
+        job_id_text = item.get("job_id") or "-"
         print(
-            f"  {idx:3d}. [priority={item['priority']}] [queue={item['queue']}] [hosts={hosts_text}] [preempt={item['preempt']}] "
+            f"  {idx:3d}. [job={job_id_text}] [priority={item['priority']}] [queue={item['queue']}] "
+            f"[hosts={hosts_text}] [preempt={item['preempt']}] "
             f"cmd={item['cmd']!r} payload={payload_text!r}",
             flush=True,
         )
@@ -608,8 +612,8 @@ def _add_requeue_running_subparser(sub):
 
 
 def _add_qdel_subparser(sub):
-    p = sub.add_parser("qdel", help="Delete queued job(s) by list index")
-    p.add_argument("job_ids", nargs="+", type=int)
+    p = sub.add_parser("qdel", help=QDEL_HELP)
+    add_qdel_arguments(p)
     return p
 
 

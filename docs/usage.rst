@@ -103,9 +103,34 @@ Basic Commands
    awsqueueengine requeue-running --all
    awsqueueengine list
    awsqueueengine qstat
-   awsqueueengine qdel 2
+   awsqueueengine qdel 20260730-141530-a1b2c3
+   awsqueueengine qdel --queue fast-gpus
+   awsqueueengine qdel --index 2
    awsqueueengine start-monitor
    awsqueueengine stop-monitor
+
+Deleting Queued Jobs
+--------------------
+
+``qdel`` selects jobs by the job id ``list`` prints as ``[job=...]``, not by the
+number in its left column. That number is a render-time position and it moves
+constantly — every deletion renumbers the entries after it, the monitor dequeues
+the highest-priority job from anywhere in the list, requeues insert at the front,
+and other users' submits append. Deleting several jobs from one listing by
+position therefore removes the wrong ones.
+
+.. code-block:: bash
+
+   awsqueueengine qdel 20260730-141530-a1b2c3                      # one job
+   awsqueueengine qdel 20260730-141530-a1b2c3 20260730-141602-9f0e11
+   awsqueueengine qdel 20260730-1415                               # unique prefix
+   awsqueueengine qdel --queue fast-gpus                           # a whole queue
+   awsqueueengine qdel --index 2                                   # by position
+
+The three selectors cannot be combined in a single command. Nothing is removed
+unless every selector resolves, so an unknown or ambiguous job id leaves the
+queue untouched. ``qdel`` only removes *queued* jobs; use ``stop`` for one that
+has already started.
 
 Queue Targeting
 ---------------

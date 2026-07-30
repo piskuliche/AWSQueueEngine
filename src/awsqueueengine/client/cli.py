@@ -12,7 +12,13 @@ import sys
 from datetime import datetime
 from pathlib import Path
 
-from ..shared.cli_utils import join_command_argv
+from ..shared.cli_utils import (
+    QDEL_HELP,
+    add_qdel_arguments,
+    join_command_argv,
+    qdel_selectors,
+    validate_qdel_selectors,
+)
 from ..shared.config import HOSTS, HOSTS_FILE
 from ..shared.host_status import status_all
 from ..shared.job_lookup import lookup_job_state
@@ -495,10 +501,38 @@ def cmd_failed_remote(args):
 
 
 def cmd_qdel_remote(args):
-    if not args.indices:
-        print("Provide one or more queue index(es) to delete.", flush=True)
+    selector_error = validate_qdel_selectors(args)
+    if selector_error:
+        print(selector_error, flush=True)
         sys.exit(1)
-    result = _rpc(args, "qdel", {"indices": list(args.indices)})
+
+    job_ids, indices, queue = qdel_selectors(args)
+    params = {}
+    if job_ids:
+        params["job_ids"] = job_ids
+    if indices:
+        params["indices"] = indices
+    if queue:
+        params["queue"] = queue
+
+    try:
+        result = rpc_call(args.queue_host, "qdel", params)
+    except RpcTransportError as exc:
+        print(f"RPC transport error talking to {args.queue_host}: {exc.detail}", flush=True, file=sys.stderr)
+        sys.exit(1)
+    except RpcError as exc:
+        print(f"RPC error from {args.queue_host}: {exc.code}: {exc.message}", flush=True, file=sys.stderr)
+        # A host predating job-id selectors rejects any qdel without `indices`,
+        # and its message doesn't say why. Name the likely cause.
+        if not indices and exc.code == "invalid_params" and "indices" in (exc.message or ""):
+            print(
+                f"{args.queue_host} may be running an older awsqe-host that only accepts "
+                "queue positions. Upgrade it, or select with --index.",
+                flush=True,
+                file=sys.stderr,
+            )
+        sys.exit(1)
+
     removed = result.get("removed") or []
     if not removed:
         print("No jobs removed.", flush=True)
@@ -693,8 +727,8 @@ def build_parser():
     p_failed.add_argument("--log", action="store_true", help="Also print the captured tail of each job log")
     p_failed.add_argument("--queue-host", default=None)
 
-    p_qdel = sub.add_parser("qdel", help="Delete queued job(s) by list index")
-    p_qdel.add_argument("indices", nargs="+", type=int, metavar="INDEX")
+    p_qdel = sub.add_parser("qdel", help=QDEL_HELP)
+    add_qdel_arguments(p_qdel)
     p_qdel.add_argument("--queue-host", default=None)
 
     p_requeue_deferred = sub.add_parser("requeue-deferred", help="Requeue deferred job(s) on the queue host")

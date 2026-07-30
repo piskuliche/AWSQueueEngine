@@ -42,6 +42,32 @@ def lookup_job_state(job_id):
     return _lookup_finished_job(job_id)
 
 
+def describe_missing_job(job_id):
+    """Where a job id went, for one that `qdel` found no queue entry for.
+
+    Returns ``None`` when the id is unknown or still queued (in which case the
+    caller's own "no queued job matching" message is already the whole story).
+    """
+    state = lookup_job_state(job_id)
+    if not state:
+        return None
+    status = state.get("status")
+    if status == "queued":
+        return None
+    if status == "running":
+        host = state.get("host") or "?"
+        return f"{job_id} is already running on {host}; qdel only removes queued jobs (use `stop`)"
+    return f"{job_id} already finished ({status})"
+
+
+def enrich_selection_message(message, tokens):
+    """Append per-token context to a qdel "not found" message, when we have any."""
+    notes = [note for note in (describe_missing_job(t) for t in tokens or []) if note]
+    if not notes:
+        return message
+    return f"{message} ({'; '.join(notes)})"
+
+
 def _find_last_record(records, job_id):
     for record in reversed(records):
         if isinstance(record, dict) and record.get("job_id") == job_id:

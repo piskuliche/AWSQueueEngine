@@ -1,3 +1,5 @@
+import contextlib
+import io
 import json
 import os
 import re
@@ -601,48 +603,117 @@ class CliSubmitTests(unittest.TestCase):
         self.assertEqual(by_host[("eci5",)]["priority"], 100)
         self.assertEqual(by_host[("eci7",)]["priority"], 100)
 
-    def test_qdel_removes_single_job_by_index(self):
+    def _queued_job_ids(self):
+        return [item["job_id"] for item in self._read_queue()]
+
+    def test_qdel_removes_single_job_by_job_id(self):
         self._run_cli("submit", "echo", "one")
         self._run_cli("submit", "echo", "two")
         self._run_cli("submit", "echo", "three")
+        job_ids = self._queued_job_ids()
 
-        res = self._run_cli("qdel", "2")
+        res = self._run_cli("qdel", job_ids[1])
 
         self.assertEqual(res.returncode, 0)
         self.assertIn("Removed 1 job(s).", res.stdout)
         items = self._read_queue()
         self.assertEqual([item["cmd"] for item in items], ["echo one", "echo three"])
 
-    def test_qdel_removes_multiple_jobs_atomically(self):
+    def test_qdel_removes_multiple_jobs_by_job_id(self):
+        """The motivating case: two ids from one listing, no index renumbering."""
         self._run_cli("submit", "echo", "one")
         self._run_cli("submit", "echo", "two")
         self._run_cli("submit", "echo", "three")
         self._run_cli("submit", "echo", "four")
+        job_ids = self._queued_job_ids()
 
-        res = self._run_cli("qdel", "1", "3")
+        res = self._run_cli("qdel", job_ids[0], job_ids[2])
 
         self.assertEqual(res.returncode, 0)
         self.assertIn("Removed 2 job(s).", res.stdout)
         items = self._read_queue()
         self.assertEqual([item["cmd"] for item in items], ["echo two", "echo four"])
 
-    def test_qdel_rejects_invalid_index_without_changes(self):
+    def test_qdel_accepts_unique_job_id_prefix(self):
+        self._run_cli("submit", "echo", "one")
+        self._run_cli("submit", "echo", "two")
+        job_ids = self._queued_job_ids()
+
+        res = self._run_cli("qdel", job_ids[1][:-1])
+
+        self.assertEqual(res.returncode, 0)
+        self.assertIn("Removed 1 job(s).", res.stdout)
+        self.assertEqual([item["cmd"] for item in self._read_queue()], ["echo one"])
+
+    def test_qdel_still_deletes_by_index_behind_flag(self):
+        self._run_cli("submit", "echo", "one")
+        self._run_cli("submit", "echo", "two")
+        self._run_cli("submit", "echo", "three")
+
+        res = self._run_cli("qdel", "--index", "2")
+
+        self.assertEqual(res.returncode, 0)
+        self.assertIn("Removed 1 job(s).", res.stdout)
+        self.assertEqual(
+            [item["cmd"] for item in self._read_queue()], ["echo one", "echo three"]
+        )
+
+    def test_qdel_deletes_a_whole_queue(self):
+        # `submit` only accepts configured queue names, so this covers the flag
+        # end-to-end on `default`; selective removal is covered at the RPC layer
+        # in test_host_rpc.QdelTests.
         self._run_cli("submit", "echo", "one")
         self._run_cli("submit", "echo", "two")
 
-        res = self._run_cli("qdel", "3")
+        res = self._run_cli("qdel", "--queue", "default")
+
+        self.assertEqual(res.returncode, 0)
+        self.assertIn("Removed 2 job(s).", res.stdout)
+        self.assertEqual(self._read_queue(), [])
+
+    def test_qdel_rejects_bare_integer_and_points_at_index_flag(self):
+        self._run_cli("submit", "echo", "one")
+        self._run_cli("submit", "echo", "two")
+
+        res = self._run_cli("qdel", "2")
 
         self.assertEqual(res.returncode, 1)
-        self.assertIn("Invalid queue index(es): 3", res.stdout)
-        items = self._read_queue()
-        self.assertEqual([item["cmd"] for item in items], ["echo one", "echo two"])
+        self.assertIn("looks like a queue index", res.stdout)
+        self.assertIn("--index 2", res.stdout)
+        self.assertEqual(
+            [item["cmd"] for item in self._read_queue()], ["echo one", "echo two"]
+        )
 
-    def test_remote_qdel_forwards_indices_over_ssh(self):
+    def test_qdel_rejects_unknown_job_id_without_changes(self):
+        self._run_cli("submit", "echo", "one")
+        self._run_cli("submit", "echo", "two")
+
+        res = self._run_cli("qdel", "nosuchjob")
+
+        self.assertEqual(res.returncode, 1)
+        self.assertIn("no queued job matching: nosuchjob", res.stdout)
+        self.assertEqual(
+            [item["cmd"] for item in self._read_queue()], ["echo one", "echo two"]
+        )
+
+    def test_qdel_rejects_combined_selectors(self):
+        self._run_cli("submit", "echo", "one")
+        job_ids = self._queued_job_ids()
+
+        res = self._run_cli("qdel", job_ids[0], "--index", "1")
+
+        self.assertEqual(res.returncode, 1)
+        self.assertIn("Cannot combine", res.stdout)
+        self.assertEqual([item["cmd"] for item in self._read_queue()], ["echo one"])
+
+    def test_remote_qdel_forwards_job_ids_over_ssh(self):
         # Mirrors the test_remote_submit pattern: stub rpc_call and verify the
         # client builds the right RPC envelope rather than dispatching locally.
         class Args:
             queue_host = "queuebox"
-            indices = [1, 3]
+            job_ids = ["JOB-A", "JOB-C"]
+            indices = []
+            queue = None
 
         captured = {}
 
@@ -665,12 +736,54 @@ class CliSubmitTests(unittest.TestCase):
 
         self.assertEqual(captured["queue_host"], "queuebox")
         self.assertEqual(captured["method"], "qdel")
-        self.assertEqual(captured["params"], {"indices": [1, 3]})
+        # Only the selector actually used goes on the wire.
+        self.assertEqual(captured["params"], {"job_ids": ["JOB-A", "JOB-C"]})
 
-    def test_remote_qdel_rejects_empty_indices(self):
+    def test_remote_qdel_forwards_index_selector_unchanged(self):
+        """`indices` keeps its original wire meaning, so old hosts still work."""
         class Args:
             queue_host = "queuebox"
+            job_ids = []
+            indices = [1, 3]
+            queue = None
+
+        captured = {}
+
+        def fake_rpc_call(host, method, params, **kwargs):
+            captured["params"] = params
+            return {"removed": []}
+
+        from awsqueueengine.client import cli as client_cli
+        with patch("awsqueueengine.client.cli.rpc_call", side_effect=fake_rpc_call):
+            client_cli.cmd_qdel_remote(Args())
+
+        self.assertEqual(captured["params"], {"indices": [1, 3]})
+
+    def test_remote_qdel_forwards_queue_selector(self):
+        class Args:
+            queue_host = "queuebox"
+            job_ids = []
             indices = []
+            queue = "fast"
+
+        captured = {}
+
+        def fake_rpc_call(host, method, params, **kwargs):
+            captured["params"] = params
+            return {"removed": []}
+
+        from awsqueueengine.client import cli as client_cli
+        with patch("awsqueueengine.client.cli.rpc_call", side_effect=fake_rpc_call):
+            client_cli.cmd_qdel_remote(Args())
+
+        self.assertEqual(captured["params"], {"queue": "fast"})
+
+    def test_remote_qdel_rejects_missing_selectors(self):
+        class Args:
+            queue_host = "queuebox"
+            job_ids = []
+            indices = []
+            queue = None
 
         from awsqueueengine.client import cli as client_cli
         with patch("awsqueueengine.client.cli.rpc_call") as rpc_mock:
@@ -678,6 +791,26 @@ class CliSubmitTests(unittest.TestCase):
                 client_cli.cmd_qdel_remote(Args())
         self.assertEqual(cm.exception.code, 1)
         rpc_mock.assert_not_called()
+
+    def test_remote_qdel_hints_at_old_host_on_indices_error(self):
+        """New client, old host: the host's `indices` complaint gets explained."""
+        class Args:
+            queue_host = "queuebox"
+            job_ids = ["JOB-A"]
+            indices = []
+            queue = None
+
+        from awsqueueengine.client import cli as client_cli
+        from awsqueueengine.shared.protocol import RpcError
+
+        err = RpcError("invalid_params", "indices must be a non-empty list")
+        buf = io.StringIO()
+        with patch("awsqueueengine.client.cli.rpc_call", side_effect=err):
+            with contextlib.redirect_stderr(buf):
+                with self.assertRaises(SystemExit) as cm:
+                    client_cli.cmd_qdel_remote(Args())
+        self.assertEqual(cm.exception.code, 1)
+        self.assertIn("older awsqe-host", buf.getvalue())
 
     def test_status_fetches_host_pool_from_queue_host_beyond_20(self):
         # Regression: a client with no local queues.json must not fall back to
