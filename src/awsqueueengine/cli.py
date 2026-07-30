@@ -16,7 +16,7 @@ from pathlib import Path
 from .client import cli as client_cli
 from .client.config import effective_queue_host
 from .host import cli as host_cli
-from .shared.cli_utils import join_command_argv
+from .shared.cli_utils import QDEL_HELP, add_qdel_arguments, join_command_argv
 
 
 def _build_parser():
@@ -65,8 +65,8 @@ def _build_parser():
     p_list = sub.add_parser("list", help="Show queued jobs")
     p_list.add_argument("--queue-host", default=None)
 
-    p_qdel = sub.add_parser("qdel", help="Delete queued job(s) by list index")
-    p_qdel.add_argument("job_ids", nargs="+", type=int)
+    p_qdel = sub.add_parser("qdel", help=QDEL_HELP)
+    add_qdel_arguments(p_qdel)
 
     sub.add_parser("clear", help="Clear the queue")
 
