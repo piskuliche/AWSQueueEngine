@@ -109,6 +109,14 @@ awsqe-client requeue-deferred --all
 awsqe-client enable-host           # show active host cooldowns (no args)
 awsqe-client enable-host eci17     # release a host from cooldown early
 
+# Track your own submissions (a local list; works without a payload dir):
+awsqe-client jobs                        # everything this machine submitted, newest first
+awsqe-client jobs --status active        # still submitted, queued or running
+awsqe-client jobs --status failed --since 7d
+awsqe-client jobs --no-refresh           # skip the queue-host round trip
+awsqe-client jobs --forget 20260730-1415 # stop tracking (does NOT cancel)
+awsqe-client info --job-id 20260730-1415 # refresh one job without a payload dir
+
 # Delete queued jobs, addressed by the job id `list` prints as [job=...]:
 awsqe-client qdel 20260730-141530-a1b2c3
 awsqe-client qdel 20260730-141530-a1b2c3 20260730-141602-9f0e11   # several at once
@@ -137,8 +145,8 @@ for the cases where that's genuinely what you want, and the three selectors
 removed unless every selector resolves, so a typo leaves the queue untouched.
 
 The legacy `awsqueueengine <subcommand>` still works for the commands it
-shipped with (everything above except `failed`). It will be deprecated in
-a later release; new scripts should use `awsqe-client`.
+shipped with (everything above except `failed` and `jobs`). It will be
+deprecated in a later release; new scripts should use `awsqe-client`.
 
 `submit --high-priority` is still supported for backward compatibility and
 maps to priority `100`. If both `--priority` and `--high-priority` are
@@ -215,6 +223,76 @@ because its outcome can't be proven. The distinction is only relevant for
 the jobs in flight across one upgrade.
 
 The failure history is capped at the 1000 most recent records.
+
+### Tracked jobs
+
+`list`, `qstat` and `failed` are **global** views: the queue host records no
+notion of who submitted what, so it can't answer "how are *my* jobs doing?".
+`awsqe-client jobs` answers that from a local ledger at
+`~/.awsqe/client/jobs.json`, appended on every `awsqe-client submit` —
+including payload-less ones, which write no `run.info` anywhere:
+
+```
+$ awsqe-client jobs --since 2d
+SUBMITTED             JOB                     STATUS      HOST      QUEUE         DUR       CMD
+2026-07-30 14:15:30   20260730-141530-a1b2c3  running     eci7      fast-gpus     -         python train.py
+2026-07-30 09:02:11   20260730-090211-9f0e11  failed      eci3      default       01:44:20  bash run.sh
+                      -> out_of_memory exit=137 (see `awsqe-client failed --job-id 20260730-090211-9f0e11 --log`)
+2026-07-29 22:10:03   20260729-221003-4c5d6e  queued      -         default       q#3       python sweep.py
+```
+
+Each run refreshes every job that isn't already finished, in one round trip per
+queue host, and writes the results back. `--no-refresh` skips the network
+entirely. If a queue host is unreachable, the affected jobs keep their
+last-known status, a warning goes to stderr, and the rest still refresh — the
+list is local, so it stays useful offline.
+
+The `DUR` column does double duty: elapsed time for finished jobs, queue
+position (`q#3`) for queued ones. Running jobs show `-`, because the host
+reports start times as preformatted text in its own timezone.
+
+| Status | Meaning |
+| --- | --- |
+| `submitted` | enqueued; not yet refreshed from the queue host |
+| `queued` | waiting on the queue host |
+| `running` | dispatched to a worker |
+| `completed` | finished with exit `0` |
+| `failed` | finished badly; see `awsqe-client failed` |
+| `unknown` | finished, but without a provable exit status (see above) |
+| `deleted` | removed from the queue by **this client's** `qdel` |
+| `missing` | the queue host has no record of it |
+
+`missing` is the ambiguous one. It means someone else deleted the job, or the
+failure aged out of the host's 1000-record history, or the job was submitted to
+a different queue host than the one being queried. It is *not* treated as
+final — the job keeps getting re-checked, and a whole host's worth of jobs
+never flips to `missing` at once (that pattern is read as a bad read of the
+host's state files rather than as mass deletion).
+
+Filters:
+
+- `--status` takes any of the names above, repeated or comma-separated, plus
+  the aliases `active` (submitted/queued/running), `done` and `all`.
+- `--since` / `--until` accept `YYYY-MM-DD`, `'YYYY-MM-DD HH:MM[:SS]'`, or a
+  relative span (`30m`, `24h`, `7d`, `2w`). They filter on submission time, in
+  **your** local timezone. As an upper bound a bare date means the *end* of
+  that day, so `--until 2026-07-30` includes the 30th.
+- `--limit` / `-n` caps the rows (default 50; `0` for all).
+
+The ledger holds 2000 jobs, dropping the oldest *finished* ones past that —
+jobs still in flight are never evicted. `--forget <job-id-or-prefix>` and
+`--forget-before <when>` remove entries by hand; both only stop tracking, they
+never cancel anything (use `qdel` for that).
+
+`awsqe-client info --job-id <id-or-prefix>` refreshes a single tracked job
+without needing to `cd` to its payload directory, and rewrites that payload's
+`run.info` if it still exists. It's also how to re-check a job the list already
+considers finished, since `jobs` doesn't re-query those.
+
+Two caveats worth knowing: the ledger is **per machine**, so submitting from a
+laptop and a workstation gives each its own half of the picture; and a queue
+host running an older `awsqe-host` has no batched lookup, so the refresh falls
+back to one round trip per job (it says so, once, on stderr).
 
 ## Remote queue host setup
 
@@ -432,7 +510,7 @@ next alert-eligible event actually fire.)
 ## Project Structure
 
 - `src/awsqueueengine/shared/` — data models, protocol/RPC, paths used by both sides
-- `src/awsqueueengine/client/` — `awsqe-client` CLI, submit, run.info, RPC transport
+- `src/awsqueueengine/client/` — `awsqe-client` CLI, submit, run.info, tracked-job ledger, RPC transport
 - `src/awsqueueengine/host/` — `awsqe-host` CLI, monitor, job control, migration, daemon
 - `src/awsqueueengine/cli.py` — legacy `awsqueueengine` shim that dispatches to one of the two
 - `scripts/` — local-only utilities (smoke tests for remote queue host validation)

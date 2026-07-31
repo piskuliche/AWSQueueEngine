@@ -225,6 +225,57 @@ class JobInfoTests(_StateFixture):
         self.assertEqual(resp["error"]["code"], "invalid_params")
 
 
+class JobInfoBatchTests(_StateFixture):
+    def _batch(self, job_ids):
+        return rpc.dispatch({
+            "version": 1, "method": "job_info_batch", "params": {"job_ids": job_ids},
+        })
+
+    def test_resolves_mixed_states_in_one_call(self):
+        queue_mod.save_queue([{"cmd": "echo", "job_id": "Q1"}])
+        running_state_mod.save_running_jobs({
+            "eci5": {"cmd": "run.sh", "job_id": "R1", "started_at": 1715537422.5},
+        })
+        completion_state_mod.save_completed_jobs([
+            {"job_id": "C1", "host": "eci3", "status": "completed", "finished_at": 1715537600.0},
+        ])
+        resp = self._batch(["Q1", "R1", "C1", "GONE"])
+        self.assertTrue(resp["ok"])
+        states = resp["result"]["states"]
+        self.assertEqual(states["Q1"]["status"], "queued")
+        self.assertEqual(states["R1"]["status"], "running")
+        self.assertEqual(states["C1"]["status"], "completed")
+        self.assertIsNone(states["GONE"])
+        self.assertEqual(resp["result"]["skipped"], [])
+
+    def test_every_requested_id_is_present_so_null_is_unambiguous(self):
+        resp = self._batch(["A", "B"])
+        self.assertEqual(set(resp["result"]["states"]), {"A", "B"})
+
+    def test_duplicates_and_whitespace_collapse(self):
+        queue_mod.save_queue([{"cmd": "echo", "job_id": "Q1"}])
+        resp = self._batch(["Q1", " Q1 ", "Q1"])
+        self.assertEqual(set(resp["result"]["states"]), {"Q1"})
+
+    def test_empty_job_ids_is_invalid_params(self):
+        for params in ({}, {"job_ids": []}, {"job_ids": ["", "  "]}):
+            resp = rpc.dispatch({"version": 1, "method": "job_info_batch", "params": params})
+            self.assertFalse(resp["ok"], msg=f"expected failure for {params!r}")
+            self.assertEqual(resp["error"]["code"], "invalid_params")
+
+    def test_non_list_job_ids_is_invalid_params(self):
+        resp = self._batch("Q1")
+        self.assertFalse(resp["ok"])
+        self.assertEqual(resp["error"]["code"], "invalid_params")
+
+    def test_over_cap_is_clamped_and_the_remainder_named_in_skipped(self):
+        job_ids = [f"J{i}" for i in range(rpc.MAX_JOB_INFO_BATCH + 5)]
+        resp = self._batch(job_ids)
+        self.assertTrue(resp["ok"])
+        self.assertEqual(len(resp["result"]["states"]), rpc.MAX_JOB_INFO_BATCH)
+        self.assertEqual(resp["result"]["skipped"], job_ids[rpc.MAX_JOB_INFO_BATCH:])
+
+
 class DeferredListTests(_StateFixture):
     def test_deferred_list_carries_deferred_at_last_host_last_error(self):
         deferred_state_mod.save_deferred_jobs([

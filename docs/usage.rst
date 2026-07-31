@@ -132,6 +132,50 @@ unless every selector resolves, so an unknown or ambiguous job id leaves the
 queue untouched. ``qdel`` only removes *queued* jobs; use ``stop`` for one that
 has already started.
 
+Tracking Your Own Jobs
+----------------------
+
+``list``, ``qstat`` and ``failed`` are global views — the queue host records no
+notion of who submitted what. ``awsqe-client jobs`` answers "how are *my* jobs
+doing?" from a local ledger at ``~/.awsqe/client/jobs.json``, appended on every
+``awsqe-client submit`` (including submits with no payload directory, which
+write no ``run.info`` anywhere).
+
+.. note::
+
+   This subcommand is ``awsqe-client``-only. There is no ``awsqueueengine jobs``
+   equivalent: the ledger is a purely client-side file, so there is nothing for
+   the legacy shim to route to a host.
+
+.. code-block:: bash
+
+   awsqe-client jobs                          # newest first, refreshed from the queue host
+   awsqe-client jobs --status active          # submitted, queued or running
+   awsqe-client jobs --status failed --since 7d
+   awsqe-client jobs --status queued,running --until 2026-07-30
+   awsqe-client jobs --no-refresh             # local state only, no SSH
+   awsqe-client jobs -n 10                    # ten most recent (0 for all)
+   awsqe-client jobs --forget 20260730-1415   # stop tracking; does NOT cancel
+   awsqe-client jobs --forget-before 2026-01-01
+   awsqe-client info --job-id 20260730-1415   # refresh one job, no payload dir needed
+
+Statuses are ``submitted`` (not yet refreshed), ``queued``, ``running``,
+``completed``, ``failed``, ``unknown`` (finished without a provable exit
+status), ``deleted`` (removed by this client's ``qdel``) and ``missing`` (the
+queue host has no record — deleted by someone else, aged out of the failure
+history, or submitted to a different queue host). ``--status`` accepts these
+repeated or comma-separated, plus the aliases ``active``, ``done`` and ``all``.
+
+``--since`` and ``--until`` accept ``YYYY-MM-DD``, ``'YYYY-MM-DD HH:MM[:SS]'``,
+or a relative span (``30m``, ``24h``, ``7d``, ``2w``), and filter on submission
+time in the submitter's local timezone. As an upper bound a bare date means the
+*end* of that day, so ``--until 2026-07-30`` includes the 30th.
+
+The ledger is per machine and holds 2000 jobs, evicting only the oldest
+*finished* ones. An unreachable queue host degrades to last-known statuses with
+a warning rather than an error, and a queue host predating the batched lookup
+falls back to one round trip per job.
+
 Queue Targeting
 ---------------
 
