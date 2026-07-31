@@ -21,6 +21,7 @@ class _JobsArgs:
 
     def __init__(self, **kwargs):
         self.status = None
+        self.queue = None
         self.since = None
         self.until = None
         self.limit = 50
@@ -318,6 +319,48 @@ class FilterErrorTests(_LedgerFixture):
         out, _ = self._run(_JobsArgs(no_refresh=True, status=["active"]))
         self.assertIn("ACTIVE", out)
         self.assertNotIn("DONE", out)
+
+    def test_queue_filter(self):
+        self._submit("GPU-JOB", queue="gpu")
+        self._submit("CPU-JOB", queue="default")
+        out, _ = self._run(_JobsArgs(no_refresh=True, queue=["gpu"]))
+        self.assertIn("GPU-JOB", out)
+        self.assertNotIn("CPU-JOB", out)
+
+    def test_queue_filter_is_repeatable_and_comma_separated(self):
+        self._submit("A", queue="gpu")
+        self._submit("B", queue="bigmem")
+        self._submit("C", queue="default")
+        out, _ = self._run(_JobsArgs(no_refresh=True, queue=["gpu,bigmem"]))
+        self.assertIn("A", out)
+        self.assertIn("B", out)
+        self.assertNotIn("  C ", out)
+
+    def test_queue_filter_normalizes_like_the_host_does(self):
+        """`my queue` is stored as `my_queue`, so it must filter as `my_queue` too."""
+        self._submit("A", queue="my_queue")
+        out, _ = self._run(_JobsArgs(no_refresh=True, queue=["my queue"]))
+        self.assertIn("A", out)
+
+    def test_queue_filter_is_case_insensitive(self):
+        self._submit("A", queue="zeke-queue")
+        out, _ = self._run(_JobsArgs(no_refresh=True, queue=["Zeke-Queue"]))
+        self.assertIn("A", out)
+
+    def test_parser_wires_queue(self):
+        args = client_cli.build_parser().parse_args(
+            ["jobs", "--queue", "gpu", "--queue", "bigmem,fast"]
+        )
+        self.assertEqual(args.queue, ["gpu", "bigmem,fast"])
+
+    def test_forget_cannot_be_combined_with_a_queue_filter(self):
+        self._submit("A", queue="gpu")
+        out = io.StringIO()
+        with self.assertRaises(SystemExit) as ctx, redirect_stdout(out):
+            client_cli.cmd_jobs(_JobsArgs(forget=["A"], queue=["gpu"]))
+        self.assertEqual(ctx.exception.code, 2)
+        self.assertIn("--queue", out.getvalue())
+        self.assertEqual(len(ledger_mod.load_ledger()), 1)
 
     def test_bad_time_value_exits_2(self):
         self._submit("A")

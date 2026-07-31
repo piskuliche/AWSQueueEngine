@@ -153,6 +153,8 @@ write no ``run.info`` anywhere).
    awsqe-client jobs --status active          # submitted, queued or running
    awsqe-client jobs --status failed --since 7d
    awsqe-client jobs --status queued,running --until 2026-07-30
+   awsqe-client jobs --queue zeke-queue        # one queue
+   awsqe-client jobs --queue gpu,bigmem        # several
    awsqe-client jobs --no-refresh             # local state only, no SSH
    awsqe-client jobs -n 10                    # ten most recent (0 for all)
    awsqe-client jobs --forget 20260730-1415   # stop tracking; does NOT cancel
@@ -165,6 +167,10 @@ status), ``deleted`` (removed by this client's ``qdel``) and ``missing`` (the
 queue host has no record — deleted by someone else, aged out of the failure
 history, or submitted to a different queue host). ``--status`` accepts these
 repeated or comma-separated, plus the aliases ``active``, ``done`` and ``all``.
+
+``--queue`` filters by queue name, also repeated or comma-separated. Names go
+through the same normalization the queue host applies at submit and are matched
+case-insensitively, so what you can submit to is what you can filter on.
 
 ``--since`` and ``--until`` accept ``YYYY-MM-DD``, ``'YYYY-MM-DD HH:MM[:SS]'``,
 or a relative span (``30m``, ``24h``, ``7d``, ``2w``), and filter on submission

@@ -393,17 +393,21 @@ def merge_state(record, state, *, now=None):
     return merged
 
 
-def filter_records(records, *, statuses=None, since=None, until=None, limit=None):
+def filter_records(records, *, statuses=None, queues=None, since=None, until=None, limit=None):
     """Filter and sort tracked jobs for display: newest submission first.
 
     `since` is inclusive and `until` exclusive, both against ``submitted_at``
     (the *client's* clock — the host's timestamps are strings in the host's
-    zone and are never compared here). `limit` is applied last; ``0``, ``None``
-    or a negative value means no limit.
+    zone and are never compared here). `queues` is matched case-insensitively;
+    callers should normalize the names first. `limit` is applied last; ``0``,
+    ``None`` or a negative value means no limit.
     """
     selected = list(records)
     if statuses:
         selected = [r for r in selected if r.get("status") in statuses]
+    if queues:
+        wanted = {str(q).casefold() for q in queues}
+        selected = [r for r in selected if str(r.get("queue") or "").casefold() in wanted]
     if since is not None:
         selected = [r for r in selected if r["submitted_at"] >= since]
     if until is not None:

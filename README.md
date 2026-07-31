@@ -113,6 +113,7 @@ awsqe-client enable-host eci17     # release a host from cooldown early
 awsqe-client jobs                        # everything this machine submitted, newest first
 awsqe-client jobs --status active        # still submitted, queued or running
 awsqe-client jobs --status failed --since 7d
+awsqe-client jobs --queue zeke-queue     # one queue (repeatable, comma-separated)
 awsqe-client jobs --no-refresh           # skip the queue-host round trip
 awsqe-client jobs --forget 20260730-1415 # stop tracking (does NOT cancel)
 awsqe-client info --job-id 20260730-1415 # refresh one job without a payload dir
@@ -273,6 +274,9 @@ Filters:
 
 - `--status` takes any of the names above, repeated or comma-separated, plus
   the aliases `active` (submitted/queued/running), `done` and `all`.
+- `--queue` filters by queue name, also repeated or comma-separated. Names are
+  normalized the same way the queue host normalizes them at submit, and matched
+  case-insensitively, so what you can submit to is what you can filter on.
 - `--since` / `--until` accept `YYYY-MM-DD`, `'YYYY-MM-DD HH:MM[:SS]'`, or a
   relative span (`30m`, `24h`, `7d`, `2w`). They filter on submission time, in
   **your** local timezone. As an upper bound a bare date means the *end* of

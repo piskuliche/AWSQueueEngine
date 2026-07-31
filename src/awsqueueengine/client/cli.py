@@ -704,11 +704,27 @@ def _parse_time_arg(text, flag, *, end_of_day=False):
         sys.exit(2)
 
 
+def _expand_queue_filter(tokens):
+    """Queue names from repeated and/or comma-separated ``--queue`` tokens.
+
+    Normalized the same way the queue host normalizes a submitted queue name,
+    so what you can submit to is what you can filter on.
+    """
+    if not tokens:
+        return None
+    wanted = {
+        normalize_queue_name(part)
+        for token in tokens for part in str(token).split(",") if part.strip()
+    }
+    return wanted or None
+
+
 def _forget_tracked_jobs(args, records):
     """`--forget` / `--forget-before`: stop tracking, all-or-nothing."""
     conflicting = [
         flag for flag, value in (
-            ("--status", args.status), ("--since", args.since), ("--until", args.until),
+            ("--status", args.status), ("--queue", getattr(args, "queue", None)),
+            ("--since", args.since), ("--until", args.until),
         ) if value
     ]
     if conflicting:
@@ -762,6 +778,7 @@ def cmd_jobs(args):
     except ValueError as exc:
         print(f"--status: {exc}", flush=True)
         sys.exit(2)
+    queues = _expand_queue_filter(getattr(args, "queue", None))
     since = _parse_time_arg(args.since, "--since") if args.since else None
     # A bare date as an upper bound means "through that day", not "up to its 00:00".
     until = _parse_time_arg(args.until, "--until", end_of_day=True) if args.until else None
@@ -780,8 +797,8 @@ def cmd_jobs(args):
             records = ledger.load_ledger()
 
     _render_tracked_jobs(
-        ledger.filter_records(records, statuses=statuses, since=since,
-                              until=until, limit=args.limit),
+        ledger.filter_records(records, statuses=statuses, queues=queues,
+                              since=since, until=until, limit=args.limit),
         total=len(records),
     )
 
@@ -1030,6 +1047,10 @@ def build_parser():
         "--status", action="append", default=None, metavar="STATUS",
         help="Filter by status; repeatable and comma-separated. "
              f"Statuses: {', '.join(ALL_STATUSES)}. Aliases: active, done, all.",
+    )
+    p_jobs.add_argument(
+        "--queue", action="append", default=None, metavar="QUEUE",
+        help="Filter by queue name; repeatable and comma-separated.",
     )
     p_jobs.add_argument(
         "--since", default=None, metavar="WHEN",

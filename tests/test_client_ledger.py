@@ -348,6 +348,25 @@ class FilterRecordsTests(unittest.TestCase):
         self.assertEqual(self._ids(statuses={"running"}), ["B"])
         self.assertEqual(self._ids(statuses={"running", "failed"}), ["C", "B"])
 
+    def test_queue_filter(self):
+        for record, queue in zip(self.records, ("default", "gpu", "gpu")):
+            record["queue"] = queue
+        self.assertEqual(self._ids(queues={"gpu"}), ["C", "B"])
+        self.assertEqual(self._ids(queues={"default", "gpu"}), ["C", "B", "A"])
+        self.assertEqual(self._ids(queues={"nope"}), [])
+
+    def test_queue_filter_is_case_insensitive(self):
+        self.records[0]["queue"] = "Zeke-Queue"
+        self.assertEqual(self._ids(queues={"zeke-queue"}), ["A"])
+
+    def test_queue_filter_tolerates_records_with_no_queue(self):
+        self.assertEqual(self._ids(queues={"gpu"}), [])
+
+    def test_queue_and_status_filters_compose(self):
+        for record, queue in zip(self.records, ("gpu", "gpu", "default")):
+            record["queue"] = queue
+        self.assertEqual(self._ids(queues={"gpu"}, statuses={"running"}), ["B"])
+
     def test_since_is_inclusive_and_until_is_exclusive(self):
         self.assertEqual(self._ids(since=200.0), ["C", "B"])
         self.assertEqual(self._ids(until=200.0), ["A"])
