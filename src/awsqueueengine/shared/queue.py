@@ -2,6 +2,7 @@
 import json
 from .paths import QUEUE_FILE
 from .queue_config import DEFAULT_QUEUE, host_is_eligible_for_item, normalize_queue_name
+from .state_io import warn_unreadable, write_json_atomic
 
 DEFAULT_PRIORITY = 0
 DEFAULT_PREEMPT = False
@@ -18,14 +19,14 @@ def load_queue():
         try:
             data = json.loads(QUEUE_FILE.read_text())
             return data if isinstance(data, list) else []
-        except Exception:
+        except Exception as exc:
+            warn_unreadable(QUEUE_FILE, exc)
             return []
     return []
 
 
 def save_queue(q):
-    QUEUE_FILE.parent.mkdir(parents=True, exist_ok=True)
-    QUEUE_FILE.write_text(json.dumps(q, indent=2))
+    write_json_atomic(QUEUE_FILE, q)
 
 
 def _normalize_priority(value):

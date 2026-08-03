@@ -23,6 +23,8 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
+from ..shared.state_io import write_text_atomic
+
 # Python 3.11+ has tomllib in stdlib; 3.10 uses the `tomli` backport.
 if sys.version_info >= (3, 11):
     import tomllib as _tomllib
@@ -139,12 +141,7 @@ def load_config(path: Path | None = None) -> ClientConfig:
 def save_config(config: ClientConfig, path: Path | None = None) -> Path:
     """Atomically write the client config to disk. Creates parents as needed."""
     target = path or CONFIG_PATH
-    target.parent.mkdir(parents=True, exist_ok=True)
-    text = _render_toml(config.as_toml_sections())
-    tmp = target.with_suffix(target.suffix + ".tmp")
-    tmp.write_text(text)
-    os.replace(tmp, target)
-    return target
+    return write_text_atomic(target, _render_toml(config.as_toml_sections()))
 
 
 def _render_toml(sections: dict[str, dict[str, Any]]) -> str:

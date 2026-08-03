@@ -1,6 +1,7 @@
 import json
 
 from .paths import COMPLETED_FILE
+from .state_io import warn_unreadable, write_json_atomic
 
 
 def load_completed_jobs():
@@ -8,17 +9,17 @@ def load_completed_jobs():
         return []
     try:
         data = json.loads(COMPLETED_FILE.read_text())
-    except Exception:
+    except Exception as exc:
+        warn_unreadable(COMPLETED_FILE, exc)
         return []
     return data if isinstance(data, list) else []
 
 
 def save_completed_jobs(records):
-    COMPLETED_FILE.parent.mkdir(parents=True, exist_ok=True)
     if not isinstance(records, list):
-        COMPLETED_FILE.write_text("[]")
+        write_json_atomic(COMPLETED_FILE, [])
         return
-    COMPLETED_FILE.write_text(json.dumps(records, indent=2))
+    write_json_atomic(COMPLETED_FILE, records)
 
 
 def append_completed_records(records):

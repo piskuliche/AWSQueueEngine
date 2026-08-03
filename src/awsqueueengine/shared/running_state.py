@@ -2,6 +2,7 @@ import json
 
 from .paths import RUNNING_FILE
 from .queue import normalize_job_item
+from .state_io import warn_unreadable, write_json_atomic
 
 
 def _normalize_started_at(value):
@@ -32,7 +33,8 @@ def load_running_jobs():
         return {}
     try:
         data = json.loads(RUNNING_FILE.read_text())
-    except Exception:
+    except Exception as exc:
+        warn_unreadable(RUNNING_FILE, exc)
         return {}
 
     if not isinstance(data, dict):
@@ -50,9 +52,8 @@ def load_running_jobs():
 
 
 def save_running_jobs(running_jobs):
-    RUNNING_FILE.parent.mkdir(parents=True, exist_ok=True)
     if not isinstance(running_jobs, dict):
-        RUNNING_FILE.write_text("{}")
+        write_json_atomic(RUNNING_FILE, {})
         return
 
     serializable = {}
@@ -63,4 +64,4 @@ def save_running_jobs(running_jobs):
         if not clean_host:
             continue
         serializable[clean_host] = normalize_running_item(job)
-    RUNNING_FILE.write_text(json.dumps(serializable, indent=2))
+    write_json_atomic(RUNNING_FILE, serializable)

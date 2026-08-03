@@ -303,7 +303,10 @@ failure aged out of the host's 1000-record history, or the job was submitted to
 a different queue host than the one being queried. It is *not* treated as
 final — the job keeps getting re-checked, and a whole host's worth of jobs
 never flips to `missing` at once (that pattern is read as a bad read of the
-host's state files rather than as mass deletion).
+host's state files rather than as mass deletion). That last rule is now a
+backstop rather than the primary defense: the queue host writes its state files
+atomically, so a reader can no longer catch one mid-write. It still covers a
+queue host running an older version.
 
 Filters:
 

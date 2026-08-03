@@ -20,6 +20,7 @@ from ..shared.queue_config import (
 )
 from ..shared.paths import LOCK_FILE, MONITOR_STATE_FILE
 from ..shared.running_state import load_running_jobs, save_running_jobs
+from ..shared.state_io import warn_unreadable, write_json_atomic
 from ..shared.worker_actions import kill_managed_on_host
 from .config import (
     ALERT_DAILY_EMAIL_LIMIT,
@@ -308,14 +309,14 @@ def _load_monitor_state():
     try:
         data = json.loads(MONITOR_STATE_FILE.read_text())
         return data if isinstance(data, dict) else {}
-    except Exception:
+    except Exception as exc:
+        warn_unreadable(MONITOR_STATE_FILE, exc)
         return {}
 
 
 def _save_monitor_state(state):
     try:
-        MONITOR_STATE_FILE.parent.mkdir(parents=True, exist_ok=True)
-        MONITOR_STATE_FILE.write_text(json.dumps(state, indent=2))
+        write_json_atomic(MONITOR_STATE_FILE, state)
     except Exception as exc:
         print(f"[WARN] Could not save monitor state: {exc}", flush=True)
 

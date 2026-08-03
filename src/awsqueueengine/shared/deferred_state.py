@@ -3,6 +3,7 @@ import time
 
 from .paths import DEFERRED_FILE
 from .queue import normalize_job_item
+from .state_io import warn_unreadable, write_json_atomic
 
 
 def load_deferred_jobs():
@@ -11,13 +12,13 @@ def load_deferred_jobs():
     try:
         data = json.loads(DEFERRED_FILE.read_text())
         return data if isinstance(data, list) else []
-    except Exception:
+    except Exception as exc:
+        warn_unreadable(DEFERRED_FILE, exc)
         return []
 
 
 def save_deferred_jobs(jobs):
-    DEFERRED_FILE.parent.mkdir(parents=True, exist_ok=True)
-    DEFERRED_FILE.write_text(json.dumps(jobs, indent=2))
+    write_json_atomic(DEFERRED_FILE, jobs)
 
 
 def append_deferred_job(job_item, last_error=None, last_host=None):

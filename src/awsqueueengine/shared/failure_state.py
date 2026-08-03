@@ -11,6 +11,7 @@ host that is failing every job cannot grow the file without bound.
 import json
 
 from .paths import FAILED_FILE
+from .state_io import warn_unreadable, write_json_atomic
 
 MAX_FAILED_RECORDS = 1000
 
@@ -20,17 +21,17 @@ def load_failed_jobs():
         return []
     try:
         data = json.loads(FAILED_FILE.read_text())
-    except Exception:
+    except Exception as exc:
+        warn_unreadable(FAILED_FILE, exc)
         return []
     return data if isinstance(data, list) else []
 
 
 def save_failed_jobs(records):
-    FAILED_FILE.parent.mkdir(parents=True, exist_ok=True)
     if not isinstance(records, list):
-        FAILED_FILE.write_text("[]")
+        write_json_atomic(FAILED_FILE, [])
         return
-    FAILED_FILE.write_text(json.dumps(records[-MAX_FAILED_RECORDS:], indent=2))
+    write_json_atomic(FAILED_FILE, records[-MAX_FAILED_RECORDS:])
 
 
 def append_failed_records(records):
