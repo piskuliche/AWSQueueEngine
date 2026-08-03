@@ -220,6 +220,24 @@ def enqueue_item(item):
     save_queue(q)
 
 
+def enqueue_items(items):
+    """Append many items in one load-modify-save. Returns how many were added.
+
+    Not just a convenience: the queue host has no lock around state mutation and
+    the monitor can save a stale copy over a concurrent write (issue #21), so a
+    batch of 105 doing one read-modify-write instead of 105 shrinks that window
+    roughly a hundredfold rather than widening it. It does not *close* it — a
+    single `enqueue` landing inside this one can still be lost.
+    """
+    normalized = [normalize_job_item(item) for item in items]
+    if not normalized:
+        return 0
+    q = load_queue()
+    q.extend(normalized)
+    save_queue(q)
+    return len(normalized)
+
+
 # ---------- qdel selection ----------
 
 class QueueSelectionError(Exception):

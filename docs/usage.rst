@@ -171,6 +171,7 @@ write no ``run.info`` anywhere).
    awsqe-client jobs --status queued,running --until 2026-07-30
    awsqe-client jobs --queue zeke-queue        # one queue
    awsqe-client jobs --queue gpu,bigmem        # several
+   awsqe-client submit --payload-glob 'IDC*' "cd \$PAYLOAD_DIR && python run.py"
    awsqe-client jobs --array ffpopt-IDC       # list one batch's jobs individually
    awsqe-client jobs --expand                 # never collapse batches into one row
    awsqe-client jobs --no-refresh             # local state only, no SSH
@@ -206,11 +207,40 @@ submitting a folder of work does not drown out everything else in ``jobs``:
 
 .. code-block:: bash
 
+   awsqe-client submit --payload-glob 'IDC*' --queue production \
+       "source ~/flowrc && cd \$PAYLOAD_DIR && python run_fe.py"
+
+``--payload-glob`` submits one job per matching directory from a single
+invocation, which is where the real cost was: 105 payloads submitted from a
+shell loop meant 105 interpreter startups, 105 serial tar-and-upload round trips
+to S3, and 105 separate SSH connections. Here the uploads run in a pool
+(``-j``/``--jobs``, default 4), the enqueues share one connection via the
+``enqueue_many`` RPC, and the ledger is written once.
+
+Because one invocation is exactly one batch, the tag is *derived*
+(``IDC-20260802-091402``) rather than typed; ``--array NAME`` overrides it. The
+equivalent shell loop still works, tagging each job by hand:
+
+.. code-block:: bash
+
    for IDC in IDC*; do
        awsqe-client submit --queue production --array ffpopt-IDC \
            --payload "${PWD}/$IDC/" \
            "source ~/flowrc && cd \$PAYLOAD_DIR && python run_fe.py"
    done
+
+Things worth knowing about the batch path:
+
+- ``--dry-run`` lists what would be submitted and stops, without touching S3 or
+  the network.
+- Job ids are minted up front, so they follow directory order even though the
+  uploads finish out of order.
+- **Partial failure is reported, never rolled back.** If payload 60 of 105 fails
+  to upload, the other 104 are already real jobs on the queue. Both sets are
+  named and the exit status is non-zero.
+- Only directories match; a file caught by the same pattern is skipped.
+- Against a queue host predating ``enqueue_many``, the client warns once and
+  falls back to one ``enqueue`` per job.
 
 ``jobs`` then collapses each batch to a single row, above the untagged jobs::
 
