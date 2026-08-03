@@ -8,6 +8,7 @@ Resolution precedence is **CLI flag > env var > config > error**.
 """
 import argparse
 import os
+import shutil
 import sys
 from datetime import datetime
 from pathlib import Path
@@ -736,15 +737,35 @@ def fetch_tracked_logs(records):
     return fetched, warnings
 
 
-def _show_one_log(args, records):
-    """`jobs --log <job-id>`: print the local path, fetching it if needed."""
+def _dump_log(path):
+    """Stream a cached log to stdout.
+
+    Streamed rather than read whole: a job log is unbounded, and `--cat` on a
+    multi-gigabyte run should not need to hold it in memory first.
+    """
     try:
-        record = ledger.find_record(args.log, records=records)
+        # errors="replace": a job's stdout is whatever it wrote, not necessarily
+        # valid UTF-8, and that is no reason to refuse to show it.
+        with open(path, "r", errors="replace") as handle:
+            shutil.copyfileobj(handle, sys.stdout)
+    except BrokenPipeError:
+        # `--cat X | head` closes the pipe early. That's the caller being done,
+        # not a failure; exit quietly without a traceback on interpreter close.
+        os._exit(0)
+    except OSError as exc:
+        print(f"could not read {path}: {exc}", file=sys.stderr, flush=True)
+        sys.exit(1)
+
+
+def _show_one_log(args, records, token, *, dump=False):
+    """`jobs --log` / `jobs --cat`: locate one job's log, fetching it if needed."""
+    try:
+        record = ledger.find_record(token, records=records)
     except ledger.LedgerSelectionError as exc:
         print(exc.message, flush=True)
         sys.exit(1)
     if record is None:
-        print(f"no tracked job matching: {args.log}", flush=True)
+        print(f"no tracked job matching: {token}", flush=True)
         sys.exit(1)
     if not record.get("host"):
         print(
@@ -761,8 +782,12 @@ def _show_one_log(args, records):
         record = ledger.find_record(record["job_id"]) or record
     if not record.get("log_path"):
         sys.exit(1)
-    # Bare path on stdout so it composes: less "$(awsqe-client jobs --log X)"
-    print(record["log_path"], flush=True)
+
+    if dump:
+        _dump_log(record["log_path"])
+    else:
+        # Bare path on stdout so it composes: less "$(awsqe-client jobs --log X)"
+        print(record["log_path"], flush=True)
 
 
 def _parse_time_arg(text, flag, *, end_of_day=False):
@@ -849,7 +874,10 @@ def cmd_jobs(args):
         _forget_tracked_jobs(args, records)
         return
     if getattr(args, "log", None):
-        _show_one_log(args, records)
+        _show_one_log(args, records, args.log)
+        return
+    if getattr(args, "cat", None):
+        _show_one_log(args, records, args.cat, dump=True)
         return
 
     try:
@@ -1161,9 +1189,16 @@ def build_parser():
         help="Copy each displayed job's log off its worker (skipping any already "
              "cached) and show the local path.",
     )
-    p_jobs.add_argument(
+    # Both name a single job and differ only in what they emit, so asking for
+    # both at once is a mistake worth catching rather than silently ordering.
+    p_jobs_log = p_jobs.add_mutually_exclusive_group()
+    p_jobs_log.add_argument(
         "--log", default=None, metavar="JOB_ID",
         help="Print the local path to one job's log, fetching it first if needed.",
+    )
+    p_jobs_log.add_argument(
+        "--cat", default=None, metavar="JOB_ID",
+        help="Print one job's log to the screen, fetching it first if needed.",
     )
     p_jobs.add_argument(
         "--forget", action="append", default=None, metavar="JOB_ID",

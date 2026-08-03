@@ -157,6 +157,7 @@ write no ``run.info`` anywhere).
    awsqe-client jobs --queue gpu,bigmem        # several
    awsqe-client jobs --no-refresh             # local state only, no SSH
    awsqe-client jobs --fetch-logs             # pull shown jobs' logs off their workers
+   awsqe-client jobs --cat 20260730-1415      # print one job's log to the screen
    awsqe-client jobs --log 20260730-1415      # print the local path to one log
    awsqe-client jobs -n 10                    # ten most recent (0 for all)
    awsqe-client jobs --forget 20260730-1415   # stop tracking; does NOT cancel

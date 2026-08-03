@@ -116,6 +116,7 @@ awsqe-client jobs --status failed --since 7d
 awsqe-client jobs --queue zeke-queue     # one queue (repeatable, comma-separated)
 awsqe-client jobs --no-refresh           # skip the queue-host round trip
 awsqe-client jobs --fetch-logs           # pull each shown job's log off its worker
+awsqe-client jobs --cat 20260730-1415    # print one job's log to the screen
 awsqe-client jobs --log 20260730-1415    # print the local path to one job's log
 awsqe-client jobs --forget 20260730-1415 # stop tracking (does NOT cancel)
 awsqe-client info --job-id 20260730-1415 # refresh one job without a payload dir
@@ -325,8 +326,14 @@ Filters:
                       log: /home/you/.awsqe/client/logs/20260731-181013-cfd2e8.log
 ```
 
-`awsqe-client jobs --log <id-or-prefix>` prints just the path, fetching first if
-needed, so it composes: `less "$(awsqe-client jobs --log 20260731-1810)"`.
+To read one job's log, `--cat` prints it straight to the screen and `--log`
+prints just its path — both fetch first if the log isn't cached yet:
+
+```bash
+awsqe-client jobs --cat 20260731-1810              # the log itself
+awsqe-client jobs --cat 20260731-1810 | grep Error # nothing else goes to stdout
+less "$(awsqe-client jobs --log 20260731-1810)"    # the path, for other tools
+```
 
 Fetching goes **client → worker** over `scp`, not through the queue host, so it
 needs SSH access to the ecis (the same access `awsqe-client tail`/`stop`/`status`

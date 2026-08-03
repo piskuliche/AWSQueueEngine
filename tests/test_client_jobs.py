@@ -29,6 +29,7 @@ class _JobsArgs:
         self.no_refresh = False
         self.fetch_logs = False
         self.log = None
+        self.cat = None
         self.forget = None
         self.forget_before = None
         self.queue_host = None
@@ -558,6 +559,69 @@ class FetchLogsTests(_LedgerFixture):
         self._finished("20260731-181013-cfd2e8")
         out, _, _ = self._run_with_scp(_JobsArgs(log="20260731-1810"))
         self.assertIn("20260731-181013-cfd2e8.log", out)
+
+    def test_cat_prints_the_log_contents(self):
+        self._finished("J1")
+        out, _, calls = self._run_with_scp(_JobsArgs(cat="J1"), body="line one\nline two\n")
+        self.assertEqual(calls, [("J1", "eci7")])
+        self.assertEqual(out, "line one\nline two\n")
+
+    def test_cat_uses_the_cache_on_a_second_call(self):
+        self._finished("J1")
+        self._run_with_scp(_JobsArgs(cat="J1"), body="cached body\n")
+        out, _, calls = self._run_with_scp(_JobsArgs(cat="J1"))
+        self.assertEqual(calls, [])
+        self.assertEqual(out, "cached body\n")
+
+    def test_cat_accepts_a_prefix(self):
+        self._finished("20260731-181013-cfd2e8")
+        out, _, _ = self._run_with_scp(_JobsArgs(cat="20260731-1810"), body="hello\n")
+        self.assertEqual(out, "hello\n")
+
+    def test_cat_emits_nothing_but_the_log_on_stdout(self):
+        """So `--cat X > file` and `--cat X | grep` behave."""
+        self._finished("J1")
+        out, _, _ = self._run_with_scp(_JobsArgs(cat="J1"), body="only this\n")
+        self.assertNotIn("SUBMITTED", out)
+        self.assertNotIn("J1  ", out)
+
+    def test_cat_handles_a_large_log(self):
+        self._finished("J1")
+        body = "".join(f"line {i}\n" for i in range(50000))
+        out, _, _ = self._run_with_scp(_JobsArgs(cat="J1"), body=body)
+        self.assertEqual(out, body)
+
+    def test_cat_tolerates_undecodable_bytes(self):
+        """A job's stdout is whatever it wrote; that's no reason to refuse to show it."""
+        self._finished("J1")
+        self._run_with_scp(_JobsArgs(no_refresh=True, fetch_logs=True), body="x")
+        logs_mod.local_log_path("J1", root=self.logroot).write_bytes(b"before \xff\xfe after\n")
+        out, _, _ = self._run_with_scp(_JobsArgs(cat="J1"))
+        self.assertIn("before", out)
+        self.assertIn("after", out)
+
+    def test_cat_on_an_unknown_job_exits_1(self):
+        with self.assertRaises(SystemExit) as ctx:
+            self._run_with_scp(_JobsArgs(cat="NOPE"))
+        self.assertEqual(ctx.exception.code, 1)
+
+    def test_cat_on_a_vanished_remote_log_exits_1(self):
+        self._finished("J1")
+        with self.assertRaises(SystemExit) as ctx:
+            self._run_with_scp(
+                _JobsArgs(cat="J1"), returncode=1,
+                stderr="scp: /home/ubuntu/manager_jobs/J1.log: No such file or directory",
+            )
+        self.assertEqual(ctx.exception.code, 1)
+
+    def test_parser_rejects_log_and_cat_together(self):
+        with self.assertRaises(SystemExit):
+            client_cli.build_parser().parse_args(["jobs", "--log", "A", "--cat", "A"])
+
+    def test_parser_wires_cat(self):
+        args = client_cli.build_parser().parse_args(["jobs", "--cat", "JOB-A"])
+        self.assertEqual(args.cat, "JOB-A")
+        self.assertIsNone(args.log)
 
     def test_log_flag_on_an_unknown_job_exits_1(self):
         with self.assertRaises(SystemExit) as ctx:
