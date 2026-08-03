@@ -10,6 +10,10 @@ Paths and state
 .. automodule:: awsqueueengine.shared.paths
    :undoc-members:
 
+.. automodule:: awsqueueengine.shared.state_io
+
+.. automodule:: awsqueueengine.shared.state_lock
+
 .. automodule:: awsqueueengine.shared.queue
 
 .. automodule:: awsqueueengine.shared.running_state
