@@ -8,8 +8,17 @@ rather than being read directly from environment at import time.
 import tarfile
 import tempfile
 import uuid
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime
 from pathlib import Path
+
+from .staging import sizeof_local_path_bytes
+
+#: Default parallel uploads for a batch submit. Each worker holds a whole
+#: tarball in the temp dir and saturates a share of the uplink, so this is
+#: deliberately modest rather than derived from the CPU count — the work is
+#: neither CPU-bound nor free in disk.
+DEFAULT_UPLOAD_WORKERS = 4
 
 
 def archive_payload_to_temp(payload_path):
@@ -57,3 +66,58 @@ def upload_payload_archive_to_s3(archive_path, payload_name, *, bucket, prefix):
     key = "/".join(key_parts)
     boto3.client("s3").upload_file(str(archive_path), bucket, key)
     return f"s3://{bucket}/{key}"
+
+
+def prepare_payload(payload_path, *, bucket, prefix):
+    """Archive one payload, upload it, and drop the temp archive.
+
+    The archive → upload → unlink sequence, extracted from ``cmd_submit_remote``
+    so single and batch submit share one definition of it. Returns
+    ``{"s3_uri", "size_bytes"}``; raises whatever the archive or upload raised,
+    with the temp file cleaned up either way.
+    """
+    payload = Path(payload_path).expanduser()
+    size_bytes = sizeof_local_path_bytes(payload)
+    archive_path = None
+    try:
+        archive_path = archive_payload_to_temp(payload)
+        s3_uri = upload_payload_archive_to_s3(
+            archive_path, payload.name, bucket=bucket, prefix=prefix,
+        )
+    finally:
+        if archive_path:
+            try:
+                archive_path.unlink()
+            except OSError:
+                pass
+    return {"s3_uri": s3_uri, "size_bytes": size_bytes}
+
+
+def upload_payloads_parallel(payload_paths, *, bucket, prefix, max_workers=None):
+    """Prepare many payloads concurrently. Returns ``[result_or_exception, ...]``.
+
+    Results stay **positional**, one entry per input in input order, so the
+    caller can pair each with the job id it minted up front regardless of the
+    order the uploads actually finished in.
+
+    Threads rather than processes: the work is I/O-bound, and the two things
+    that aren't (tar and gzip) release the GIL inside their C extensions.
+    Thread-safety of the upload itself comes for free — ``boto3.client("s3")``
+    is constructed per call, so no client is shared across workers.
+
+    A failure is *returned*, not raised: at 105 payloads one bad directory must
+    not abandon the other 104, and the caller has to report both sets.
+    """
+    paths = list(payload_paths)
+    if not paths:
+        return []
+    workers = max(1, min(max_workers or DEFAULT_UPLOAD_WORKERS, len(paths)))
+
+    def one(path):
+        try:
+            return prepare_payload(path, bucket=bucket, prefix=prefix)
+        except Exception as exc:  # returned, not raised — see docstring
+            return exc
+
+    with ThreadPoolExecutor(max_workers=workers) as pool:
+        return list(pool.map(one, paths))

@@ -35,6 +35,8 @@ def _build_parser():
 
     p_qstat = sub.add_parser("qstat", help="Show running jobs tracked by monitor")
     p_qstat.add_argument("--queue-host", default=None)
+    p_qstat.add_argument("--group", action="store_true",
+                         help="Collapse each batch to one row.")
 
     p_submit = sub.add_parser("submit", help="Enqueue a job (command string)")
     p_submit.add_argument("--hosts-file", default=None)
@@ -69,6 +71,8 @@ def _build_parser():
 
     p_list = sub.add_parser("list", help="Show queued jobs")
     p_list.add_argument("--queue-host", default=None)
+    p_list.add_argument("--group", action="store_true",
+                        help="Collapse each batch to one row; untagged jobs keep their positions.")
 
     p_qdel = sub.add_parser("qdel", help=QDEL_HELP)
     add_qdel_arguments(p_qdel)

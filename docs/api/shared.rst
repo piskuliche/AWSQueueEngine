@@ -42,6 +42,8 @@ Jobs and identity
 
 .. automodule:: awsqueueengine.shared.array_id
 
+.. automodule:: awsqueueengine.shared.batch_view
+
 .. automodule:: awsqueueengine.shared.job_status
 
 .. automodule:: awsqueueengine.shared.job_lookup

@@ -3,6 +3,7 @@ import io
 import json
 import tempfile
 import unittest
+import unittest.mock
 from contextlib import redirect_stderr
 from pathlib import Path
 
@@ -512,6 +513,48 @@ class SubmissionRecordTests(unittest.TestCase):
 
     def test_no_job_id_is_no_record(self):
         self.assertIsNone(ledger_mod.build_submission_record(job_id="", queue_host="qh"))
+
+
+class RecordSubmissionsTests(_LedgerFixture):
+    def _entries(self, count):
+        return [
+            {"job_id": f"J{i}", "queue_host": "qh", "queue": "gpu", "cmd": "run",
+             "array_id": "batch", "array_size": count, "submitted_at": 100.0 + i}
+            for i in range(count)
+        ]
+
+    def test_a_batch_costs_exactly_one_write(self):
+        """A batch submit would otherwise pay 105 lock-and-rewrite cycles for one
+        logical action, and a reader landing between them sees a partial batch."""
+        with unittest.mock.patch.object(
+            ledger_mod, "save_ledger", wraps=ledger_mod.save_ledger
+        ) as save:
+            ledger_mod.record_submissions(self._entries(5))
+        self.assertEqual(save.call_count, 1)
+
+    def test_order_is_preserved(self):
+        ledger_mod.record_submissions(self._entries(4))
+        self.assertEqual([r["job_id"] for r in load_ledger()], ["J0", "J1", "J2", "J3"])
+
+    def test_appends_to_what_is_already_tracked(self):
+        self._submit("OLD", submitted_at=1.0)
+        ledger_mod.record_submissions(self._entries(2))
+        self.assertEqual([r["job_id"] for r in load_ledger()], ["OLD", "J0", "J1"])
+
+    def test_entries_without_a_job_id_are_dropped_not_stored_blank(self):
+        entries = self._entries(2) + [{"job_id": "", "queue_host": "qh"}]
+        recorded = ledger_mod.record_submissions(entries)
+        self.assertEqual(len(recorded), 2)
+        self.assertEqual([r["job_id"] for r in load_ledger()], ["J0", "J1"])
+
+    def test_nothing_to_record_is_a_no_op(self):
+        self.assertEqual(ledger_mod.record_submissions([]), [])
+        self.assertFalse(self.path.exists())
+
+    def test_record_submission_still_works_through_the_batch_path(self):
+        self._submit("A", queue="gpu")
+        self.assertEqual([r["job_id"] for r in load_ledger()], ["A"])
+        self.assertIsNone(self._submit(""))
 
 
 if __name__ == "__main__":

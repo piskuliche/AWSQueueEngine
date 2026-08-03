@@ -103,6 +103,7 @@ class QueuePriorityTests(unittest.TestCase):
         self.assertIsNone(first["payload_size_bytes"])
         self.assertFalse(first["resume_first"])
         self.assertIsNone(first["resume_host"])
+        self.assertIsNone(first["array_id"])
 
         self.assertEqual(second["cmd"], "echo old-style")
         self.assertEqual(second["priority"], 0)
@@ -113,6 +114,7 @@ class QueuePriorityTests(unittest.TestCase):
         self.assertIsNone(second["payload_size_bytes"])
         self.assertFalse(second["resume_first"])
         self.assertIsNone(second["resume_host"])
+        self.assertIsNone(second["array_id"])
 
         self.assertEqual(third["cmd"], "legacy-normal")
         self.assertEqual(third["priority"], 0)
@@ -123,6 +125,7 @@ class QueuePriorityTests(unittest.TestCase):
         self.assertIsNone(third["payload_size_bytes"])
         self.assertFalse(third["resume_first"])
         self.assertIsNone(third["resume_host"])
+        self.assertIsNone(third["array_id"])
 
         self.assertEqual(fourth["cmd"], "legacy-default")
         self.assertEqual(fourth["payload"], "/tmp/x")
@@ -134,6 +137,7 @@ class QueuePriorityTests(unittest.TestCase):
         self.assertIsNone(fourth["payload_size_bytes"])
         self.assertFalse(fourth["resume_first"])
         self.assertIsNone(fourth["resume_host"])
+        self.assertIsNone(fourth["array_id"])
 
     def test_enqueue_item_persists_canonical_fields(self):
         queue.enqueue_item({"cmd": "job", "priority": "high", "hosts": "eci17"})
@@ -156,6 +160,7 @@ class QueuePriorityTests(unittest.TestCase):
                 "resume_first": False,
                 "resume_host": None,
                 "job_id": None,
+                "array_id": None,
                 "submit_failures": 0,
             },
         )
