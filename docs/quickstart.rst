@@ -16,6 +16,10 @@ Submit
    awsqe-client submit --priority 25 "python train.py --epochs 10"
    awsqe-client submit --preempt --priority 999 "bash urgent-job.sh"
 
+   # A whole folder of work: one job per matching directory, one invocation.
+   awsqe-client submit --payload-glob 'IDC*' "cd \$PAYLOAD_DIR && python run.py"
+   awsqe-client submit --payload-glob 'IDC*' --dry-run "..."   # list, submit nothing
+
    # Override the configured queue host for one command:
    awsqe-client submit --queue-host other-queue "python sweep.py"
 

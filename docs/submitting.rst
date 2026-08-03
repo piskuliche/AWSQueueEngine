@@ -58,6 +58,54 @@ S3 lifecycle rule on the payload prefix to clean up old archives.
 If a running job is requeued or preempted, the remote payload path is
 preserved, so the restarted job still receives the correct ``PAYLOAD_DIR``.
 
+.. _payload-glob:
+
+Submitting many payloads at once
+--------------------------------
+
+``--payload-glob PATTERN`` submits one job per matching directory from a single
+invocation:
+
+.. code-block:: bash
+
+   awsqe-client submit --payload-glob 'IDC*' "cd \$PAYLOAD_DIR && python run.py"
+   awsqe-client submit --payload-glob 'IDC*' --dry-run "..."   # list, submit nothing
+   awsqe-client submit --payload-glob 'IDC*' -j 8 "..."        # 8 parallel uploads
+
+**Quote the pattern.** Unquoted, the shell expands it before ``awsqe-client``
+ever sees it.
+
+This does the loop inside one process, which is where the real cost was: 105
+payloads submitted via a shell loop meant 105 interpreter startups, 105 serial
+tar-and-upload round trips to S3, and 105 separate SSH connections. Here the
+uploads run in a pool (``-j`` / ``--jobs``, default 4), the enqueues share one
+connection, and the ledger is written once.
+
+Behaviour worth knowing:
+
+* One invocation is one batch, and the array tag is **derived** from the
+  pattern and timestamp (``IDC-20260802-091402``). ``--array NAME`` overrides
+  it. See :doc:`tracking-jobs`.
+* ``--dry-run`` lists what would be submitted and stops — cheap insurance
+  before firing 105 jobs at the queue. It applies only to ``--payload-glob``;
+  a single submit has nothing to list.
+* Job ids are minted up front, so they follow directory order even though the
+  uploads finish out of order.
+* Only directories match. A stray file caught by ``IDC*`` is skipped.
+* ``--payload`` and ``--payload-glob`` cannot be combined — the glob already
+  submits one job per matched directory.
+
+.. warning::
+
+   **Partial failure is reported, never rolled back.** If payload 60 of 105
+   fails to upload, the other 104 are already real jobs on the queue. Both sets
+   are printed by name and the exit status is non-zero, so a driving script
+   notices — but nothing is undone for you.
+
+   Validation is the other way round: the queue host checks every item before
+   writing any of them, so a typo'd ``--queue`` fails the whole batch rather
+   than half-enqueueing it.
+
 Preemption and requeue
 ----------------------
 
