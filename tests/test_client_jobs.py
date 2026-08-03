@@ -829,12 +829,8 @@ class SubmitLedgerTests(_LedgerFixture):
         for key, value in overrides.items():
             setattr(args, key, value)
         with patch("awsqueueengine.client.cli.rpc_call", return_value={"job_id": "JOB-1"}), \
-             patch("awsqueueengine.client.cli.archive_payload_to_temp") as archive, \
-             patch("awsqueueengine.client.cli.upload_payload_archive_to_s3",
-                   return_value="s3://bucket/key.tar.gz"), \
-             patch("awsqueueengine.client.cli.sizeof_local_path_bytes", return_value=10):
-            archive.return_value = self.root_tmp / "archive.tar.gz"
-            archive.return_value.write_text("")
+             patch("awsqueueengine.client.cli.prepare_payload",
+                   return_value={"s3_uri": "s3://bucket/key.tar.gz", "size_bytes": 10}):
             with redirect_stdout(io.StringIO()):
                 client_cli.cmd_submit_remote(args, "python train.py")
         return ledger_mod.load_ledger()
@@ -901,13 +897,13 @@ class SubmitLedgerTests(_LedgerFixture):
         args.array = "ffpopt IDC"
         args.payload = str(self.root_tmp)
         with patch("awsqueueengine.client.cli.rpc_call") as rpc, \
-             patch("awsqueueengine.client.cli.archive_payload_to_temp") as archive:
+             patch("awsqueueengine.client.cli.prepare_payload") as prepare:
             out = io.StringIO()
             with self.assertRaises(SystemExit) as ctx, redirect_stdout(out):
                 client_cli.cmd_submit_remote(args, "python train.py")
         self.assertEqual(ctx.exception.code, 2)
         self.assertIn("--array", out.getvalue())
-        archive.assert_not_called()
+        prepare.assert_not_called()
         rpc.assert_not_called()
         self.assertEqual(ledger_mod.load_ledger(), [])
 
@@ -924,7 +920,7 @@ class QdelLedgerIntegrationTests(_LedgerFixture):
             queue = None
 
         with patch("awsqueueengine.client.cli.validate_qdel_selectors", return_value=None), \
-             patch("awsqueueengine.client.cli.qdel_selectors", return_value=(["A"], [], None)), \
+             patch("awsqueueengine.client.cli.qdel_selectors", return_value=(["A"], [], None, None)), \
              patch("awsqueueengine.client.cli.rpc_call",
                    return_value={"removed": [{"index": 1, "item": {"job_id": "A", "cmd": "x"}}]}):
             with redirect_stdout(io.StringIO()):

@@ -21,6 +21,7 @@ from ..shared.job_lookup import (
     enrich_selection_message,
     lookup_job_state,
     lookup_job_states,
+    running_members_of_array,
 )
 from ..shared.protocol import (
     PROTOCOL_VERSION,
@@ -32,6 +33,7 @@ from ..shared.queue import (
     QueueSelectionError,
     delete_queue_selection,
     enqueue_item,
+    enqueue_items,
     load_queue,
     normalize_job_item,
 )
@@ -50,6 +52,10 @@ from .monitor import clear_host_cooldowns, get_host_cooldowns
 #: request arrives on stdin rather than argv, so ARG_MAX doesn't apply; this is
 #: about bounding the response, which runs ~300 bytes per resolved job.
 MAX_JOB_INFO_BATCH = 500
+
+#: Ceiling on one `enqueue_many` call, mirroring MAX_JOB_INFO_BATCH. Items past
+#: it come back in `skipped` for the client to re-ask, rather than being dropped.
+MAX_ENQUEUE_BATCH = 500
 
 
 # ---------- helpers ----------
@@ -121,8 +127,69 @@ def _load_queue_host_map() -> dict[str, list[str]]:
 
 # ---------- handlers ----------
 
+def _validate_enqueue_params(params: dict, queue_host_map: dict) -> dict:
+    """Coerce and validate one enqueue request into a queue item.
+
+    Split out from :func:`handle_enqueue` so `enqueue_many` can validate a whole
+    batch before writing any of it, without a second copy of the rules. The
+    queue-host map is passed in rather than loaded here so a batch resolves it
+    once instead of per item.
+    """
+    params = _require_dict(params)
+    command = _require_str(params, "cmd")
+    queue_name = normalize_queue_name(_optional_str(params, "queue") or DEFAULT_QUEUE)
+    hosts = _optional_string_list(params, "hosts")
+    priority = _optional_int(params, "priority")
+    high_priority = _optional_bool(params, "high_priority")
+    preempt = _optional_bool(params, "preempt")
+    mps = _optional_bool(params, "mps")
+    payload = _optional_str(params, "payload")
+    payload_s3_uri = _optional_str(params, "payload_s3_uri")
+    payload_size_bytes = _optional_int(params, "payload_size_bytes")
+    job_id = _optional_str(params, "job_id") or new_job_tag()
+    array_id = _optional_str(params, "array_id")
+
+    if queue_name not in queue_host_map:
+        valid = ", ".join(sorted(queue_host_map)) if queue_host_map else "(none)"
+        raise RpcError("invalid_params", f"unknown queue {queue_name!r}. Valid queues: {valid}")
+
+    if hosts:
+        valid_hosts = set(queue_host_map.get(queue_name, []))
+        invalid = sorted({h for h in hosts if h not in valid_hosts})
+        if invalid:
+            raise RpcError("invalid_params", f"invalid host(s): {', '.join(invalid)}")
+
+    if priority is None:
+        priority = 100 if high_priority else 0
+
+    return {
+        "cmd": command,
+        "payload": None if payload_s3_uri else payload,
+        "priority": priority,
+        "queue": queue_name,
+        "hosts": hosts,
+        "preempt": preempt,
+        "mps": mps,
+        "payload_s3_uri": payload_s3_uri,
+        "payload_size_bytes": payload_size_bytes,
+        "job_id": job_id,
+        "array_id": array_id,
+    }
+
+
+def _enqueue_result(item: dict) -> dict:
+    return {
+        "job_id": item["job_id"],
+        "queue": item["queue"],
+        "hosts": item["hosts"],
+        "array_id": item["array_id"],
+    }
+
+
 def handle_enqueue(params: dict) -> dict:
     """Add one job to the queue.
+
+    See :func:`handle_enqueue_many` to submit a batch in a single write.
 
     Args:
         params: RPC params.
@@ -144,58 +211,63 @@ def handle_enqueue(params: dict) -> dict:
             * ``payload_size_bytes`` (int) — advisory size, used to pick scratch.
             * ``job_id`` (str) — caller-supplied id; a fresh tag is minted when
               absent, so callers that want to track the job should pass one.
+            * ``array_id`` (str) — batch tag, so ``qdel --array`` and
+              ``jobs --array`` can address the whole group.
 
     Returns:
-        ``{"job_id": str, "queue": str, "hosts": list[str] | None}`` — the id the
-        job was queued under, which is the caller's ``job_id`` when supplied.
+        ``{"job_id": ..., "queue": ..., "hosts": ..., "array_id": ...}`` — the
+        id the job was queued under, which is the caller's ``job_id`` when
+        supplied. ``hosts`` and ``array_id`` are ``None`` when not given.
 
     Raises:
         RpcError: ``invalid_params`` when ``cmd`` is blank, ``queue`` is not a
             configured queue, or a host does not belong to that queue;
             ``internal`` when the host's queue configuration is unreadable.
     """
+    item = _validate_enqueue_params(params, _load_queue_host_map())
+    enqueue_item(item)
+    return _enqueue_result(item)
+
+
+def handle_enqueue_many(params: dict) -> dict:
+    """Enqueue a batch of jobs in one call, and one queue write.
+
+    **All-or-nothing on validation.** Every item is checked before any is
+    written, and a single bad one fails the whole call. Every job in a
+    `--payload-glob` batch shares its `--queue` and `--hosts`, so a validation
+    failure is a whole-batch user error — half-enqueuing 105 jobs on a typo'd
+    queue name is the worst available outcome. The error names the offending
+    index, since the client submitted a list.
+
+    Partial failure lives on the *upload* side instead, where it belongs: by the
+    time a job reaches here its payload is already in S3.
+    """
     params = _require_dict(params)
-    command = _require_str(params, "cmd")
-    queue_name = normalize_queue_name(_optional_str(params, "queue") or DEFAULT_QUEUE)
-    hosts = _optional_string_list(params, "hosts")
-    priority = _optional_int(params, "priority")
-    high_priority = _optional_bool(params, "high_priority")
-    preempt = _optional_bool(params, "preempt")
-    mps = _optional_bool(params, "mps")
-    payload = _optional_str(params, "payload")
-    payload_s3_uri = _optional_str(params, "payload_s3_uri")
-    payload_size_bytes = _optional_int(params, "payload_size_bytes")
-    job_id = _optional_str(params, "job_id") or new_job_tag()
+    jobs = params.get("jobs")
+    if not isinstance(jobs, list):
+        raise RpcError("invalid_params", "param jobs must be a list of enqueue requests")
+    if not jobs:
+        raise RpcError("invalid_params", "param jobs must not be empty")
+
+    accepted, skipped = jobs[:MAX_ENQUEUE_BATCH], jobs[MAX_ENQUEUE_BATCH:]
 
     queue_host_map = _load_queue_host_map()
-    if queue_name not in queue_host_map:
-        valid = ", ".join(sorted(queue_host_map)) if queue_host_map else "(none)"
-        raise RpcError("invalid_params", f"unknown queue {queue_name!r}. Valid queues: {valid}")
+    items = []
+    for index, raw in enumerate(accepted):
+        try:
+            items.append(_validate_enqueue_params(raw, queue_host_map))
+        except RpcError as exc:
+            raise RpcError(exc.code, f"job {index}: {exc.message}") from exc
 
-    if hosts:
-        valid_hosts = set(queue_host_map.get(queue_name, []))
-        invalid = sorted({h for h in hosts if h not in valid_hosts})
-        if invalid:
-            raise RpcError("invalid_params", f"invalid host(s): {', '.join(invalid)}")
-
-    if priority is None:
-        priority = 100 if high_priority else 0
-
-    local_payload_path = None if payload_s3_uri else payload
-    item = {
-        "cmd": command,
-        "payload": local_payload_path,
-        "priority": priority,
-        "queue": queue_name,
-        "hosts": hosts,
-        "preempt": preempt,
-        "mps": mps,
-        "payload_s3_uri": payload_s3_uri,
-        "payload_size_bytes": payload_size_bytes,
-        "job_id": job_id,
+    enqueue_items(items)
+    return {
+        "results": [{"index": i, "ok": True, **_enqueue_result(item)}
+                    for i, item in enumerate(items)],
+        "enqueued": len(items),
+        # Indices past the cap, named rather than silently dropped, so the
+        # client can re-ask for them — the shape `job_info_batch` established.
+        "skipped": list(range(len(accepted), len(accepted) + len(skipped))),
     }
-    enqueue_item(item)
-    return {"job_id": job_id, "queue": queue_name, "hosts": hosts}
 
 
 def handle_list(params: dict) -> dict:
@@ -238,7 +310,7 @@ def handle_qstat(params: dict) -> dict:
 
 
 def handle_qdel(params: dict) -> dict:
-    """Delete queued jobs selected by job id, queue name, or (legacy) position.
+    """Delete queued jobs selected by job id, queue name, array name, or position.
 
     ``indices`` keeps its original meaning so an older client still works
     against this handler unchanged.
@@ -247,17 +319,23 @@ def handle_qdel(params: dict) -> dict:
     job_ids = _optional_string_list(params, "job_ids") or []
     indices = _optional_int_list(params, "indices")
     queue = _optional_str(params, "queue")
+    array_id = _optional_str(params, "array_id")
 
     try:
-        removed = delete_queue_selection(job_ids=job_ids, indices=indices, queue=queue)
+        removed = delete_queue_selection(
+            job_ids=job_ids, indices=indices, queue=queue, array_id=array_id,
+        )
     except QueueSelectionError as exc:
         raise RpcError(exc.code, enrich_selection_message(exc.message, exc.tokens)) from exc
 
-    return {
+    result = {
         "removed": [
             {"index": idx, "item": item, "selector": token} for idx, item, token in removed
         ]
     }
+    if array_id:
+        result["running"] = running_members_of_array(array_id)
+    return result
 
 
 def handle_deferred_list(params: dict) -> dict:
@@ -555,6 +633,7 @@ def handle_stats(params: dict) -> dict:
 #: ``docs/protocol.rst`` — ``tests/test_protocol_docs.py`` enforces that.
 METHODS: dict[str, Callable[[dict], dict]] = {
     "enqueue": handle_enqueue,
+    "enqueue_many": handle_enqueue_many,
     "list": handle_list,
     "qstat": handle_qstat,
     "qdel": handle_qdel,

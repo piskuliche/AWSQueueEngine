@@ -14,6 +14,7 @@ import time
 from datetime import datetime
 from pathlib import Path
 
+from ..shared.batch_view import render_grouped_queue, render_grouped_running
 from ..shared.cli_utils import (
     QDEL_HELP,
     add_qdel_arguments,
@@ -24,7 +25,11 @@ from ..shared.cli_utils import (
 from ..shared.config import HOSTS, HOSTS_FILE
 from ..shared.deferred_state import load_deferred_jobs, pop_all_deferred, pop_deferred_by_indices
 from ..shared.failure_state import load_failed_jobs
-from ..shared.job_lookup import enrich_selection_message, lookup_job_state
+from ..shared.job_lookup import (
+    enrich_selection_message,
+    lookup_job_state,
+    running_members_of_array,
+)
 from ..shared.paths import PIDFILE
 from ..shared.queue import (
     QueueSelectionError,
@@ -195,6 +200,7 @@ def cmd_submit_local(args, command):
         "payload_s3_uri": args.payload_s3_uri,
         "payload_size_bytes": args.payload_size_bytes,
         "job_id": job_id,
+        "array_id": getattr(args, "array", None),
     }
     enqueue_item(item)
     print("Enqueued:", item, flush=True)
@@ -216,13 +222,19 @@ def cmd_submit_local(args, command):
         print(f"Submitted {job_id}", flush=True)
 
 
-def cmd_list(args):
-    q = load_queue()
-    if not q:
+def _print_queue_jobs(jobs, positions=None):
+    """The queued-job listing.
+
+    `positions` overrides the leading number, and must be passed whenever the
+    caller renders a *subset*: that number is the 1-based queue position
+    `qdel --index` selects on, so re-deriving it with `enumerate` over a
+    filtered list would print positions that delete the wrong jobs.
+    """
+    if not jobs:
         print("(queue empty)", flush=True)
         return
-    for i, raw_item in enumerate(q, 1):
-        item = normalize_job_item(raw_item)
+    numbers = positions if positions is not None else range(1, len(jobs) + 1)
+    for i, item in zip(numbers, jobs):
         hosts_text = ",".join(item["hosts"]) if item["hosts"] else "-"
         payload_text = _payload_display_text(item)
         job_id_text = item.get("job_id") or "-"
@@ -235,8 +247,15 @@ def cmd_list(args):
         )
 
 
-def cmd_qstat(args):
-    running_jobs = load_running_jobs()
+def cmd_list(args):
+    jobs = [normalize_job_item(raw_item) for raw_item in load_queue()]
+    if getattr(args, "group", False):
+        render_grouped_queue(jobs, _print_queue_jobs)
+    else:
+        _print_queue_jobs(jobs)
+
+
+def _print_running_jobs(running_jobs):
     if not running_jobs:
         print("(no running jobs tracked)", flush=True)
         return
@@ -246,12 +265,11 @@ def cmd_qstat(args):
         flush=True,
     )
     for host in sorted(running_jobs):
-        raw_item = running_jobs[host]
-        item = normalize_job_item(raw_item)
+        item = running_jobs[host]
         hosts_text = ",".join(item["hosts"]) if item["hosts"] else "any"
         payload_text = _payload_display_text(item)
         cmd_text = str(item.get("cmd") or "")
-        dur_text = _format_elapsed(raw_item.get("started_at") if isinstance(raw_item, dict) else None)
+        dur_text = _format_elapsed(item.get("started_at"))
         job_id_text = item.get("job_id") or "-"
         print(
             f"{host:8}  {job_id_text:22}  {dur_text:8}  {item['priority']:5d}  {str(item['preempt']):7}  "
@@ -261,15 +279,30 @@ def cmd_qstat(args):
         )
 
 
+def cmd_qstat(args):
+    running = {}
+    for host, raw_item in load_running_jobs().items():
+        item = normalize_job_item(raw_item)
+        # normalize_job_item drops it; the flat renderer needs it for DUR.
+        item["started_at"] = raw_item.get("started_at") if isinstance(raw_item, dict) else None
+        running[host] = item
+    if getattr(args, "group", False):
+        render_grouped_running(running, _print_running_jobs)
+    else:
+        _print_running_jobs(running)
+
+
 def cmd_qdel(args):
     selector_error = validate_qdel_selectors(args)
     if selector_error:
         print(selector_error, flush=True)
         sys.exit(1)
 
-    job_ids, indices, queue = qdel_selectors(args)
+    job_ids, indices, queue, array_id = qdel_selectors(args)
     try:
-        removed_jobs = delete_queue_selection(job_ids=job_ids, indices=indices, queue=queue)
+        removed_jobs = delete_queue_selection(
+            job_ids=job_ids, indices=indices, queue=queue, array_id=array_id,
+        )
     except QueueSelectionError as exc:
         print(enrich_selection_message(exc.message, exc.tokens), flush=True)
         sys.exit(1)
@@ -285,6 +318,16 @@ def cmd_qdel(args):
             f"cmd={item['cmd']!r} payload={payload_text!r}",
             flush=True,
         )
+    if array_id:
+        # qdel only ever touched the queue; say what it could not reach.
+        running = running_members_of_array(array_id)
+        if running:
+            hosts_text = ", ".join(f"{m['job_id'] or '?'} on {m['host']}" for m in running)
+            print(
+                f"  {len(running)} member(s) of {array_id} are already running and were "
+                f"not touched: {hosts_text}.",
+                flush=True,
+            )
 
 
 def cmd_clear(args):
@@ -598,6 +641,8 @@ def _add_submit_subparser(sub):
     p.add_argument("--high-priority", action="store_true")
     p.add_argument("--preempt", action="store_true")
     p.add_argument("--mps", action="store_true", help="Wrap the command in the NVIDIA MPS launch/teardown script.")
+    p.add_argument("--array", default=None, metavar="NAME",
+                   help="Tag this job as part of batch NAME (see `qdel --array`).")
     p.add_argument("--payload-s3-uri", default=None)
     p.add_argument("--payload-size-bytes", type=int, default=None)
     p.add_argument("--job-id", default=None)
@@ -662,8 +707,12 @@ def build_parser():
     sub = parser.add_subparsers(dest="cmd")
 
     _add_submit_subparser(sub)
-    sub.add_parser("list", help="Show queued jobs")
-    sub.add_parser("qstat", help="Show running jobs tracked by monitor")
+    p_list = sub.add_parser("list", help="Show queued jobs")
+    p_list.add_argument("--group", action="store_true",
+                        help="Collapse each batch to one row; untagged jobs keep their positions.")
+    p_qstat = sub.add_parser("qstat", help="Show running jobs tracked by monitor")
+    p_qstat.add_argument("--group", action="store_true",
+                         help="Collapse each batch to one row.")
     _add_qdel_subparser(sub)
     sub.add_parser("clear", help="Clear the queue")
     sub.add_parser("deferred", help="Show deferred jobs")

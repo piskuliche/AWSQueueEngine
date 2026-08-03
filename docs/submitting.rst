@@ -95,9 +95,31 @@ position therefore removes the wrong ones.
    awsqe-client qdel 20260730-141530-a1b2c3 20260730-141602-9f0e11
    awsqe-client qdel 20260730-1415                               # unique prefix
    awsqe-client qdel --queue fast-gpus                           # a whole queue
+   awsqe-client qdel --array ffpopt-IDC                          # a whole batch
    awsqe-client qdel --index 2                                   # by position
 
-The three selectors cannot be combined in a single command. Nothing is removed
-unless every selector resolves, so an unknown or ambiguous job id leaves the
-queue untouched. ``qdel`` only removes *queued* jobs; use ``stop`` for one that
-has already started.
+The selectors cannot be combined in a single command. Nothing is removed unless
+every selector resolves, so an unknown or ambiguous job id leaves the queue
+untouched. ``qdel`` only removes *queued* jobs; use ``stop`` for one that has
+already started.
+
+Deleting a batch
+~~~~~~~~~~~~~~~~
+
+``--array NAME`` deletes every queued job tagged into that batch (see
+:doc:`tracking-jobs`). Unlike a job id, the name is matched **exactly** — a
+prefix would silently widen a destructive operation from one batch to every
+batch whose name starts the same way.
+
+Because ``qdel`` reaches only the queue, members that are already running are
+reported rather than killed:
+
+.. code-block:: text
+
+   Removed 97 job(s).
+     8 member(s) of ffpopt-IDC are already running and were not touched:
+     20260802-091500-a1b2c3 on eci5, ... Use `awsqe-client stop <host>` to kill them.
+
+``list --group`` and ``qstat --group`` collapse each batch to one row in the
+same way. That is opt-in rather than the default, because those are global
+views of everyone's jobs.

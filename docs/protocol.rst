@@ -31,6 +31,12 @@ docstring carries the full parameter and result detail.
      - ``invalid_params``, ``internal``
 
        :func:`~awsqueueengine.host.rpc.handle_enqueue`
+   * - ``enqueue_many``
+     - ``items``\* (list of ``enqueue`` param objects)
+     - ``enqueued``, per-item results
+     - ``invalid_params``, ``internal``
+
+       :func:`~awsqueueengine.host.rpc.handle_enqueue_many`
    * - ``list``
      - —
      - ``jobs`` (queue order)
@@ -40,8 +46,8 @@ docstring carries the full parameter and result detail.
      - ``running`` (keyed by host)
      - :func:`~awsqueueengine.host.rpc.handle_qstat`
    * - ``qdel``
-     - ``job_ids``, ``indices``, ``queue``
-     - ``removed``
+     - ``job_ids``, ``indices``, ``queue``, ``array_id``
+     - ``removed``, plus ``running`` for an ``array_id`` selector
      - ``invalid_params``, ``not_found``, ``conflict``
 
        :func:`~awsqueueengine.host.rpc.handle_qdel`
