@@ -3,6 +3,7 @@ import json
 from .paths import RUNNING_FILE
 from .queue import normalize_job_item
 from .state_io import warn_unreadable, write_json_atomic
+from .state_lock import state_lock
 
 
 def _normalize_started_at(value):
@@ -52,8 +53,16 @@ def load_running_jobs():
 
 
 def save_running_jobs(running_jobs):
+    """Persist the whole host→job map.
+
+    The monitor is the only writer today and it overwrites wholesale, so there
+    is no read-modify-write to lose — the lock is here so the invariant holds
+    uniformly across the state files and a second writer can't quietly become a
+    bug later.
+    """
     if not isinstance(running_jobs, dict):
-        write_json_atomic(RUNNING_FILE, {})
+        with state_lock():
+            write_json_atomic(RUNNING_FILE, {})
         return
 
     serializable = {}
@@ -64,4 +73,5 @@ def save_running_jobs(running_jobs):
         if not clean_host:
             continue
         serializable[clean_host] = normalize_running_item(job)
-    write_json_atomic(RUNNING_FILE, serializable)
+    with state_lock():
+        write_json_atomic(RUNNING_FILE, serializable)

@@ -473,8 +473,6 @@ class MonitorHostSourceTests(unittest.TestCase):
             ), patch(
                 "awsqueueengine.host.monitor.load_queue", return_value=[]
             ), patch(
-                "awsqueueengine.host.monitor.save_queue"
-            ), patch(
                 "awsqueueengine.host.monitor.save_running_jobs"
             ), patch(
                 "awsqueueengine.host.monitor.append_completed_records"

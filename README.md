@@ -521,6 +521,29 @@ sudo chmod 600 /etc/awsqe-host.env
 #   EnvironmentFile=/etc/awsqe-host.env
 ```
 
+### How concurrent state access works
+
+Every RPC runs in its own process — `awsqe-client` invokes
+`ssh <queue-host> awsqe-host rpc` per call — so `submit`, `qdel` and
+`requeue-deferred` are genuinely concurrent with the monitor daemon. Two rules
+keep that safe:
+
+- **Writes are atomic.** Each state file is written to `*.tmp.<pid>` and then
+  `os.replace`d over the target, so a reader sees either the whole old file or
+  the whole new one. Readers never block and never need the lock.
+- **Mutations are serialized** by `~/.awsqe/host/state.lock`, taken by the
+  monitor and by every RPC handler around each read-modify-write, with the read
+  happening *inside* the lock. Without that, a burst of submits landing while
+  the monitor dispatched could be acknowledged to the submitter and then erased
+  by the monitor writing back its older copy.
+
+Critical sections are local file I/O only — no SSH, no email — so contention is
+microseconds even during a 200-job burst. The lock is a `flock`, which the
+kernel releases if the holder dies, so a crashed process cannot wedge the host.
+
+`state.lock` is *not* `lock`: that one is the daemon singleton ("only one
+monitor may run"), held for the monitor's entire lifetime.
+
 ### State migration (one-shot, from Phase 5 onward)
 
 The queue host's state files moved from `~/.aws_slurm_like_*.json` to
@@ -533,7 +556,8 @@ The queue host's state files moved from `~/.aws_slurm_like_*.json` to
 ~/.awsqe/host/failed.json      # no legacy counterpart; created on first failure
 ~/.awsqe/host/deferred.json
 ~/.awsqe/host/monitor_state.json
-~/.awsqe/host/lock
+~/.awsqe/host/lock             # daemon singleton: "only one monitor may run"
+~/.awsqe/host/state.lock       # serializes state mutation; see below
 ~/.awsqe/host/pid
 ```
 
@@ -646,3 +670,15 @@ next alert-eligible event actually fire.)
 - `scripts/` — local-only utilities (smoke tests for remote queue host validation)
 - `tests/` — unit + subprocess tests
 - `setup.py` — packaging
+
+## Tests
+
+```bash
+pytest              # the default suite
+pytest -m slow      # plus the cross-process concurrency test
+```
+
+`-m slow` covers `tests/test_host_state_concurrency.py`, which spawns real
+submitter and dispatcher processes to prove the state lock actually excludes
+across processes. It takes a second or two and is excluded from the default run
+by `pytest.ini`.

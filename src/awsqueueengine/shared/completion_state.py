@@ -2,6 +2,7 @@ import json
 
 from .paths import COMPLETED_FILE
 from .state_io import warn_unreadable, write_json_atomic
+from .state_lock import state_lock
 
 
 def load_completed_jobs():
@@ -25,6 +26,7 @@ def save_completed_jobs(records):
 def append_completed_records(records):
     if not records:
         return
-    current = load_completed_jobs()
-    current.extend(records)
-    save_completed_jobs(current)
+    with state_lock():
+        current = load_completed_jobs()
+        current.extend(records)
+        save_completed_jobs(current)

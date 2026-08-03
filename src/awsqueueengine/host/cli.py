@@ -29,11 +29,11 @@ from ..shared.paths import PIDFILE
 from ..shared.queue import (
     QueueSelectionError,
     build_resume_item,
+    delete_queue_selection,
     enqueue_item,
     load_queue,
     normalize_job_item,
-    remove_queue_positions,
-    resolve_queue_selection,
+    requeue_front,
     save_queue,
 )
 from ..shared.queue_config import (
@@ -44,6 +44,7 @@ from ..shared.queue_config import (
 )
 from ..shared.run_info import format_epoch
 from ..shared.running_state import load_running_jobs
+from ..shared.state_lock import state_lock
 from ..shared.worker_actions import kill_managed_on_host, new_job_tag
 from .monitor import (
     acquire_monitor_lock,
@@ -267,14 +268,11 @@ def cmd_qdel(args):
         sys.exit(1)
 
     job_ids, indices, queue = qdel_selectors(args)
-    q = load_queue()
     try:
-        selection = resolve_queue_selection(q, job_ids=job_ids, indices=indices, queue=queue)
+        removed_jobs = delete_queue_selection(job_ids=job_ids, indices=indices, queue=queue)
     except QueueSelectionError as exc:
         print(enrich_selection_message(exc.message, exc.tokens), flush=True)
         sys.exit(1)
-
-    removed_jobs = remove_queue_positions(q, selection)
 
     print(f"Removed {len(removed_jobs)} job(s).", flush=True)
     for idx, item, _token in removed_jobs:
@@ -290,7 +288,11 @@ def cmd_qdel(args):
 
 
 def cmd_clear(args):
-    save_queue([])
+    # A wholesale overwrite, so there is nothing to re-read — but without the
+    # lock a dispatch already in progress would write its own copy back
+    # afterwards and resurrect the jobs this just cleared.
+    with state_lock():
+        save_queue([])
     print("Queue cleared.", flush=True)
 
 
@@ -354,34 +356,42 @@ def cmd_requeue_deferred(args):
         print("Provide deferred index(es) or pass --all.", flush=True)
         sys.exit(1)
 
-    jobs = load_deferred_jobs()
-    if not jobs:
-        print("(no deferred jobs)", flush=True)
-        return
+    # Mirrors the `requeue_deferred` RPC: validate, pop and enqueue under one
+    # lock, so the indices resolve against the list they are popped from and no
+    # job is ever observable in neither list.
+    moved = []
+    with state_lock():
+        jobs = load_deferred_jobs()
+        if not jobs:
+            print("(no deferred jobs)", flush=True)
+            return
 
-    if args.all:
-        popped_pairs = pop_all_deferred()
-    else:
-        invalid = [i for i in args.indices if i < 1 or i > len(jobs)]
-        if invalid:
-            print(
-                f"Invalid deferred index(es): {', '.join(str(i) for i in sorted(set(invalid)))}. "
-                f"Deferred size: {len(jobs)}",
-                flush=True,
-            )
-            sys.exit(1)
-        popped_pairs = pop_deferred_by_indices(args.indices)
+        if args.all:
+            popped_pairs = pop_all_deferred()
+        else:
+            invalid = [i for i in args.indices if i < 1 or i > len(jobs)]
+            if invalid:
+                print(
+                    f"Invalid deferred index(es): {', '.join(str(i) for i in sorted(set(invalid)))}. "
+                    f"Deferred size: {len(jobs)}",
+                    flush=True,
+                )
+                sys.exit(1)
+            popped_pairs = pop_deferred_by_indices(args.indices)
 
-    if not popped_pairs:
+        for idx, raw_item in popped_pairs:
+            item = normalize_job_item(raw_item)
+            item["submit_failures"] = 0
+            if not args.drop:
+                enqueue_item(item)
+            moved.append((idx, item))
+
+    if not moved:
         print("No deferred jobs were moved.", flush=True)
         return
 
     action_label = "Dropped" if args.drop else "Requeued"
-    for idx, raw_item in popped_pairs:
-        item = normalize_job_item(raw_item)
-        item["submit_failures"] = 0
-        if not args.drop:
-            enqueue_item(item)
+    for idx, item in moved:
         hosts_text = ",".join(item["hosts"]) if item["hosts"] else "-"
         payload_text = _payload_display_text(item)
         print(
@@ -390,7 +400,7 @@ def cmd_requeue_deferred(args):
             f"cmd={item['cmd']!r} payload={payload_text!r}",
             flush=True,
         )
-    print(f"{action_label} {len(popped_pairs)} deferred job(s).", flush=True)
+    print(f"{action_label} {len(moved)} deferred job(s).", flush=True)
 
 
 def cmd_requeue_running(args):
@@ -423,9 +433,7 @@ def cmd_requeue_running(args):
             continue
 
         resume_item = build_resume_item(running_item, host, priority=100, mps=mps_override)
-        q = load_queue()
-        q.insert(0, resume_item)
-        save_queue(q)
+        requeue_front(resume_item)
         requeued_count += 1
         mps_note = " with MPS enabled" if resume_item.get("mps") else ""
         print(

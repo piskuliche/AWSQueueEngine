@@ -3,6 +3,7 @@ import json
 from .paths import QUEUE_FILE
 from .queue_config import DEFAULT_QUEUE, host_is_eligible_for_item, normalize_queue_name
 from .state_io import warn_unreadable, write_json_atomic
+from .state_lock import state_lock
 
 DEFAULT_PRIORITY = 0
 DEFAULT_PREEMPT = False
@@ -212,9 +213,27 @@ def build_resume_item(job_item, host, priority=None, mps=None):
 
 
 def enqueue_item(item):
-    q = load_queue()
-    q.append(normalize_job_item(item))
-    save_queue(q)
+    """Append one job to the back of the queue."""
+    with state_lock():
+        q = load_queue()
+        q.append(normalize_job_item(item))
+        save_queue(q)
+
+
+def requeue_front(item):
+    """Put a job back at the head of the queue — it should run next."""
+    with state_lock():
+        q = load_queue()
+        q.insert(0, normalize_job_item(item))
+        save_queue(q)
+
+
+def requeue_back(item):
+    """Put a job back at the tail of the queue — let everything else go first."""
+    with state_lock():
+        q = load_queue()
+        q.append(normalize_job_item(item))
+        save_queue(q)
 
 
 # ---------- qdel selection ----------
@@ -336,12 +355,67 @@ def remove_queue_positions(q, selection):
 
     Takes the ``[(position, token), ...]`` from :func:`resolve_queue_selection`
     and returns ``[(index_1based, item, token), ...]`` in ascending queue order.
+
+    Operates on the list you hand it, so ``q`` must have been loaded under the
+    state lock — see :func:`delete_queue_selection`, which is what callers
+    should reach for.
     """
     removed = []
     for pos, token in sorted(selection, reverse=True):
         removed.append((pos + 1, normalize_job_item(q.pop(pos)), token))
     save_queue(q)
     return sorted(removed, key=lambda entry: entry[0])
+
+
+def delete_queue_selection(job_ids=None, indices=None, queue=None):
+    """Resolve a qdel selector and remove what it matches, atomically.
+
+    The whole point is that resolution and removal see the *same* queue.
+    Resolving against a copy loaded before the lock means a concurrent dispatch
+    can shift every position between the two steps, and `qdel 3` then deletes
+    somebody else's job. Raises :class:`QueueSelectionError` unchanged, having
+    touched nothing.
+    """
+    with state_lock():
+        q = load_queue()
+        selection = resolve_queue_selection(q, job_ids=job_ids, indices=indices, queue=queue)
+        return remove_queue_positions(q, selection)
+
+
+def claim_queued_job(job_id, fallback_item=None):
+    """Remove one specific queued job, or return ``None`` if it is already gone.
+
+    For a caller that picked a job from a queue snapshot and now wants to act on
+    it — today only the monitor's preemption path. Between the snapshot and the
+    claim the job may have been dispatched, qdel'd, or shifted position, so the
+    entry is re-found by identity rather than by the index it used to sit at.
+
+    ``fallback_item`` covers queue entries written before job ids existed: with
+    no id to match on, the normalized item itself is the identity.
+    """
+    with state_lock():
+        q = load_queue()
+        position = _find_queued_position(q, job_id, fallback_item)
+        if position is None:
+            return None
+        item = normalize_job_item(q.pop(position))
+        save_queue(q)
+        return item
+
+
+def _find_queued_position(q, job_id, fallback_item=None):
+    if job_id:
+        for pos, raw_item in enumerate(q):
+            if normalize_job_item(raw_item).get("job_id") == job_id:
+                return pos
+        return None
+    if fallback_item is None:
+        return None
+    wanted = normalize_job_item(fallback_item)
+    for pos, raw_item in enumerate(q):
+        if normalize_job_item(raw_item) == wanted:
+            return pos
+    return None
 
 
 def _is_host_eligible(item, host, queue_host_map=None):
@@ -382,15 +456,22 @@ def _dequeue_index(q, idx):
 
 def dequeue():
     """Dequeue the highest-priority job (FIFO tie-breaker)."""
-    q = load_queue()
-    if not q:
-        return None
-    return _dequeue_index(q, _select_best_index(q))
+    with state_lock():
+        q = load_queue()
+        if not q:
+            return None
+        return _dequeue_index(q, _select_best_index(q))
 
 
 def dequeue_for_host(host, queue_host_map=None):
-    """Dequeue the highest-priority job eligible for the provided host."""
-    q = load_queue()
-    if not q:
-        return None
-    return _dequeue_index(q, _select_best_index(q, host=host, queue_host_map=queue_host_map))
+    """Dequeue the highest-priority job eligible for the provided host.
+
+    Load, select and pop all happen under one lock: selecting from a copy read
+    beforehand would write back a queue that has forgotten anything enqueued in
+    between.
+    """
+    with state_lock():
+        q = load_queue()
+        if not q:
+            return None
+        return _dequeue_index(q, _select_best_index(q, host=host, queue_host_map=queue_host_map))

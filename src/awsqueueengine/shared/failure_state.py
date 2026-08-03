@@ -12,6 +12,7 @@ import json
 
 from .paths import FAILED_FILE
 from .state_io import warn_unreadable, write_json_atomic
+from .state_lock import state_lock
 
 MAX_FAILED_RECORDS = 1000
 
@@ -37,6 +38,7 @@ def save_failed_jobs(records):
 def append_failed_records(records):
     if not records:
         return
-    current = load_failed_jobs()
-    current.extend(records)
-    save_failed_jobs(current)
+    with state_lock():
+        current = load_failed_jobs()
+        current.extend(records)
+        save_failed_jobs(current)
