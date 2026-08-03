@@ -51,9 +51,9 @@ Jobs and identity
 Transport and workers
 ---------------------
 
-.. automodule:: awsqueueengine.shared.protocol
-
-.. automodule:: awsqueueengine.shared.rpc_client
+:mod:`~awsqueueengine.shared.protocol` and
+:mod:`~awsqueueengine.shared.rpc_client` are documented on the
+:doc:`/protocol` page, alongside the method table they belong with.
 
 .. automodule:: awsqueueengine.shared.ssh_utils
 
