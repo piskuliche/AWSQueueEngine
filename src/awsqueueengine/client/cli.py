@@ -13,6 +13,7 @@ import sys
 from datetime import datetime
 from pathlib import Path
 
+from ..shared.array_id import normalize_array_id, validate_array_id
 from ..shared.cli_utils import (
     QDEL_HELP,
     add_qdel_arguments,
@@ -324,6 +325,71 @@ def _render_tracked_jobs(records, total=None):
         print(f"{len(records)} of {total} tracked job(s).", flush=True)
 
 
+def _shared_or_marker(values):
+    """One column, one value: the shared name, ``-`` for none, ``*`` for several.
+
+    A batch usually goes to one queue and one host, and saying so is worth a
+    column. When it doesn't, the row must not pick a member's value and imply
+    the rest agree.
+    """
+    if not values:
+        return "-"
+    return values[0] if len(values) == 1 else "*"
+
+
+def _group_jobs_text(group, *, filtered=False):
+    """The JOBS cell: how many are shown, over how many the batch was submitted with.
+
+    The two differ once the ledger's cap has evicted finished members, and only
+    for a batch submitted in one invocation (a shell loop never knew its own
+    size). A bare count there would under-report a batch that ran in full.
+
+    Suppressed entirely under a filter: ``4/142`` is true of an evicted batch
+    but reads as the same claim when it was ``--status failed`` that narrowed
+    it, and those mean opposite things.
+    """
+    size = group.get("array_size")
+    if size and size != group["count"] and not filtered:
+        return f"{group['count']}/{size}"
+    return str(group["count"])
+
+
+def _render_grouped_jobs(groups, ungrouped, total=None, *, filtered=False):
+    """The batch view: one row per `array_id`, then the ungrouped jobs as usual.
+
+    The ungrouped remainder is rendered by :func:`_render_tracked_jobs` rather
+    than by a second copy of its format string, so "jobs without a batch tag
+    look exactly as they did before" holds by construction.
+    """
+    if not groups:
+        # Nothing tagged: this is the pre-batch listing, down to the footer rule.
+        # Delegating rather than falling through is what keeps that true.
+        _render_tracked_jobs(ungrouped, total=total)
+        return
+
+    batched = 0
+    print(f"{'SUBMITTED':20}  {'ARRAY':24}  {'JOBS':>6}  {'QUEUE':12}  STATUS", flush=True)
+    for group in groups:
+        batched += group["count"]
+        summary = " · ".join(f"{count} {status}" for status, count in group["status_counts"])
+        print(
+            f"{(format_epoch(group['submitted_at']) or '-'):20}  "
+            f"{group['array_id'][:24]:24}  {_group_jobs_text(group, filtered=filtered):>6}  "
+            f"{_shared_or_marker(group['queues'])[:12]:12}  {summary}",
+            flush=True,
+        )
+    if ungrouped:
+        print("", flush=True)
+        _render_tracked_jobs(ungrouped, total=None)
+
+    if total is not None:
+        shown = batched + len(ungrouped)
+        print(
+            f"{shown} of {total} tracked job(s); {batched} in {len(groups)} batch(es).",
+            flush=True,
+        )
+
+
 # ---------- tracked-job refresh ----------
 
 #: A host with a smaller batch cap than ours answers with the remainder in
@@ -480,6 +546,13 @@ def cmd_submit_remote(args, command):
         print("--hosts-file is not supported with --queue-host; host validation happens on the queue host.", flush=True)
         sys.exit(1)
 
+    # Before the upload: a rejected name should not cost a tar-and-push to S3.
+    try:
+        array_id = validate_array_id(getattr(args, "array", None))
+    except ValueError as exc:
+        print(f"--array: {exc}", flush=True)
+        sys.exit(2)
+
     payload_s3_uri = None
     payload_size_bytes = None
     archive_path = None
@@ -524,6 +597,12 @@ def cmd_submit_remote(args, command):
         params["payload_s3_uri"] = payload_s3_uri
     if payload_size_bytes is not None:
         params["payload_size_bytes"] = payload_size_bytes
+    if array_id:
+        # Sent even though only a newer queue host stores it: handlers read named
+        # params and never reject extras, so today's host drops it harmlessly —
+        # and a batch submitted before the host is upgraded is then already
+        # correct on the wire rather than permanently invisible to `qdel --array`.
+        params["array_id"] = array_id
 
     result = _rpc(args, "enqueue", params)
     # Trust the server's job_id if it differs (it shouldn't, since we provided one).
@@ -538,6 +617,7 @@ def cmd_submit_remote(args, command):
             "queue": queue_name,
             "cmd": command,
             "payload_s3_uri": payload_s3_uri or "",
+            "array_id": array_id or "",
         },
     )
     # run.info only exists when there's a payload directory to put it in, so
@@ -550,6 +630,7 @@ def cmd_submit_remote(args, command):
         # Absolute: the row has to still mean something listed from another cwd.
         payload=str(Path(args.payload).expanduser().resolve()) if args.payload else "",
         payload_s3_uri=payload_s3_uri or "",
+        array_id=array_id or "",
     )
     print(f"Submitted {job_id}", flush=True)
 
@@ -813,11 +894,47 @@ def _expand_queue_filter(tokens):
     return wanted or None
 
 
+def _expand_array_filter(tokens):
+    """Batch tags from repeated and/or comma-separated ``--array`` tokens.
+
+    Lenient where `submit --array` is strict: this only selects rows, so a name
+    that matches nothing is an answer, not an error worth refusing to run over.
+    """
+    if not tokens:
+        return None
+    wanted = {
+        normalize_array_id(part)
+        for token in tokens for part in str(token).split(",") if part.strip()
+    }
+    return {name for name in wanted if name} or None
+
+
+def _limit_grouped_rows(groups, ungrouped, limit):
+    """Apply ``--limit`` to *rendered rows*, batches counting as one row each.
+
+    Limiting the records before grouping instead would make ``-n 50`` render
+    ``JOBS 50`` for a 142-job batch — the one number in that row a reader has no
+    way to second-guess. Rows are taken newest-first across both kinds so a
+    batch can't crowd out a more recent ungrouped job or vice versa.
+    """
+    if not limit or limit <= 0:
+        return groups, ungrouped
+    rows = [(g["last_submitted_at"], True, g) for g in groups]
+    rows += [(r["submitted_at"], False, r) for r in ungrouped]
+    rows.sort(key=lambda row: row[0], reverse=True)
+    kept = rows[:limit]
+    return (
+        [row[2] for row in kept if row[1]],
+        [row[2] for row in kept if not row[1]],
+    )
+
+
 def _forget_tracked_jobs(args, records):
     """`--forget` / `--forget-before`: stop tracking, all-or-nothing."""
     conflicting = [
         flag for flag, value in (
             ("--status", args.status), ("--queue", getattr(args, "queue", None)),
+            ("--array", getattr(args, "array", None)),
             ("--since", args.since), ("--until", args.until),
         ) if value
     ]
@@ -886,6 +1003,7 @@ def cmd_jobs(args):
         print(f"--status: {exc}", flush=True)
         sys.exit(2)
     queues = _expand_queue_filter(getattr(args, "queue", None))
+    arrays = _expand_array_filter(getattr(args, "array", None))
     since = _parse_time_arg(args.since, "--since") if args.since else None
     # A bare date as an upper bound means "through that day", not "up to its 00:00".
     until = _parse_time_arg(args.until, "--until", end_of_day=True) if args.until else None
@@ -903,18 +1021,42 @@ def cmd_jobs(args):
         if states and ledger.apply_states(states):
             records = ledger.load_ledger()
 
-    selected = ledger.filter_records(records, statuses=statuses, queues=queues,
-                                     since=since, until=until, limit=args.limit)
+    # Three ways to end up with the flat listing. `--array` and `--fetch-logs`
+    # imply it rather than erroring: naming one batch means you want to see
+    # inside it, and a per-job log path has nowhere to go on a batch row.
+    fetch_logs = bool(getattr(args, "fetch_logs", False))
+    expand = bool(getattr(args, "expand", False)) or bool(arrays) or fetch_logs
 
-    if getattr(args, "fetch_logs", False) and selected:
+    selected = ledger.filter_records(
+        records, statuses=statuses, queues=queues, arrays=arrays,
+        since=since, until=until,
+        # Grouped, the limit counts rows and is applied after grouping instead.
+        limit=args.limit if expand else None,
+    )
+
+    groups = None
+    if expand:
+        displayed = selected
+    else:
+        groups, ungrouped = ledger.group_by_array(selected)
+        groups, ungrouped = _limit_grouped_rows(groups, ungrouped, args.limit)
+        displayed = [r for group in groups for r in group["records"]] + ungrouped
+
+    if fetch_logs and displayed:
         # Scoped to what's on screen, not the whole ledger.
-        _, warnings = fetch_tracked_logs(selected)
+        _, warnings = fetch_tracked_logs(displayed)
         for warning in warnings:
             print(f"[WARN] {warning}", file=sys.stderr, flush=True)
         by_id = {r["job_id"]: r for r in ledger.load_ledger()}
-        selected = [by_id.get(r["job_id"], r) for r in selected]
+        displayed = [by_id.get(r["job_id"], r) for r in displayed]
 
-    _render_tracked_jobs(selected, total=len(records))
+    if groups is None:
+        _render_tracked_jobs(displayed, total=len(records))
+    else:
+        _render_grouped_jobs(
+            groups, ungrouped, total=len(records),
+            filtered=bool(statuses or queues or since is not None or until is not None),
+        )
 
 
 def cmd_qdel_remote(args):
@@ -1118,6 +1260,11 @@ def build_parser():
     p_submit.add_argument("--high-priority", action="store_true")
     p_submit.add_argument("--preempt", action="store_true")
     p_submit.add_argument("--mps", action="store_true", help="Wrap the command in the NVIDIA MPS launch/teardown script.")
+    p_submit.add_argument(
+        "--array", default=None, metavar="NAME",
+        help="Tag this job as part of batch NAME, so `jobs` shows the batch as one "
+             "row. Letters, digits, '.', '_' and '-'; up to 64 characters.",
+    )
     p_submit.add_argument("--queue-host", default=None)
     p_submit.add_argument("--hosts-file", default=None)
     p_submit.add_argument("command", nargs=argparse.REMAINDER)
@@ -1167,6 +1314,16 @@ def build_parser():
         help="Filter by queue name; repeatable and comma-separated.",
     )
     p_jobs.add_argument(
+        "--array", action="append", default=None, metavar="NAME",
+        help="Only jobs tagged with batch NAME, listed individually; repeatable "
+             "and comma-separated.",
+    )
+    p_jobs.add_argument(
+        "--expand", "--no-group", dest="expand", action="store_true",
+        help="List every job separately instead of collapsing each batch to one "
+             "row. Implied by --array and --fetch-logs.",
+    )
+    p_jobs.add_argument(
         "--since", default=None, metavar="WHEN",
         help="Only jobs submitted at/after WHEN: YYYY-MM-DD, 'YYYY-MM-DD HH:MM', "
              "or a relative span like 30m/24h/7d/2w.",
@@ -1178,7 +1335,8 @@ def build_parser():
     )
     p_jobs.add_argument(
         "--limit", "-n", type=int, default=50,
-        help="How many rows, newest first (default 50; 0 shows all)",
+        help="How many rows, newest first (default 50; 0 shows all). A collapsed "
+             "batch is one row however many jobs it holds.",
     )
     p_jobs.add_argument(
         "--no-refresh", action="store_true",

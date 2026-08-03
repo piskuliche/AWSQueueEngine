@@ -27,6 +27,7 @@ from contextlib import contextmanager
 from pathlib import Path
 
 from ..shared.job_status import (
+    ALL_STATUSES,
     FAILED,
     MISSING,
     SUBMITTED,
@@ -49,7 +50,13 @@ MAX_TRACKED_RECORDS = 2000
 
 #: Fields the client owns. A refresh from the queue host never overwrites these
 #: (the host has no opinion about them, and for `queue_host` it can't).
-_CLIENT_OWNED = ("job_id", "submitted_at", "queue_host", "payload", "payload_s3_uri")
+#:
+#: `array_id` is here even though the queue host learns it too: the submitter
+#: chose the tag, so the host's copy is derivative. Keeping it client-owned also
+#: sidesteps the one asymmetry in `merge_host_fields` — empty values never
+#: overwrite, so a host-owned tag could never *clear* a stale one, only replace
+#: it with a different one, silently.
+_CLIENT_OWNED = ("job_id", "submitted_at", "queue_host", "payload", "payload_s3_uri", "array_id")
 
 #: Written by the host only while a job is failed; a retry that succeeds must
 #: not leave the previous attempt's fields behind.
@@ -213,12 +220,20 @@ def _quarantine(path):
 
 # ---------- mutations ----------
 
-def record_submission(*, job_id, queue_host, queue=None, cmd="", payload="",
-                      payload_s3_uri="", submitted_at=None, path=None):
-    """Start tracking a freshly enqueued job. Returns the record, or ``None``.
+def build_submission_record(*, job_id, queue_host, queue=None, cmd="", payload="",
+                            payload_s3_uri="", array_id="", array_size=None,
+                            submitted_at=None):
+    """The record shape for a freshly enqueued job, or ``None`` without an id.
 
-    A failure here must never fail the submit: by the time this runs the job is
-    already on the queue host, so we warn and carry on rather than raise.
+    Split out from :func:`record_submission` so a batch submit can build many
+    records and write them in one locked cycle without the shape being defined
+    twice.
+
+    `array_size` is how many jobs the batch was submitted with, recorded only
+    when the submitter knows — a one-invocation batch submit does, a shell loop
+    calling submit N times does not. It exists so the grouped view can say
+    ``130/142`` when the 2000-record cap has evicted part of a finished batch,
+    rather than quietly reporting a smaller batch than was actually run.
     """
     if not job_id:
         return None
@@ -230,15 +245,34 @@ def record_submission(*, job_id, queue_host, queue=None, cmd="", payload="",
         "cmd": cmd or "",
         "payload": str(payload or ""),
         "payload_s3_uri": payload_s3_uri or "",
+        "array_id": array_id or "",
         "status": SUBMITTED,
         "updated_at": 0.0,
     }
+    if array_size:
+        record["array_size"] = int(array_size)
+    return record
+
+
+def record_submission(*, path=None, **fields):
+    """Start tracking a freshly enqueued job. Returns the record, or ``None``.
+
+    A failure here must never fail the submit: by the time this runs the job is
+    already on the queue host, so we warn and carry on rather than raise.
+    """
+    record = build_submission_record(**fields)
+    if record is None:
+        return None
     target = path or LEDGER_PATH
     try:
         with _mutating(target) as records:
             records.append(record)
     except OSError as exc:
-        print(f"[WARN] could not record {job_id} in {target}: {exc}", file=sys.stderr, flush=True)
+        print(
+            f"[WARN] could not record {record['job_id']} in {target}: {exc}",
+            file=sys.stderr,
+            flush=True,
+        )
         return None
     return record
 
@@ -421,14 +455,15 @@ def merge_state(record, state, *, now=None):
     return merged
 
 
-def filter_records(records, *, statuses=None, queues=None, since=None, until=None, limit=None):
+def filter_records(records, *, statuses=None, queues=None, arrays=None,
+                   since=None, until=None, limit=None):
     """Filter and sort tracked jobs for display: newest submission first.
 
     `since` is inclusive and `until` exclusive, both against ``submitted_at``
     (the *client's* clock — the host's timestamps are strings in the host's
-    zone and are never compared here). `queues` is matched case-insensitively;
-    callers should normalize the names first. `limit` is applied last; ``0``,
-    ``None`` or a negative value means no limit.
+    zone and are never compared here). `queues` and `arrays` are matched
+    case-insensitively; callers should normalize the names first. `limit` is
+    applied last; ``0``, ``None`` or a negative value means no limit.
     """
     selected = list(records)
     if statuses:
@@ -436,6 +471,9 @@ def filter_records(records, *, statuses=None, queues=None, since=None, until=Non
     if queues:
         wanted = {str(q).casefold() for q in queues}
         selected = [r for r in selected if str(r.get("queue") or "").casefold() in wanted]
+    if arrays:
+        wanted = {str(a).casefold() for a in arrays}
+        selected = [r for r in selected if str(r.get("array_id") or "").casefold() in wanted]
     if since is not None:
         selected = [r for r in selected if r["submitted_at"] >= since]
     if until is not None:
@@ -445,3 +483,81 @@ def filter_records(records, *, statuses=None, queues=None, since=None, until=Non
     if limit and limit > 0:
         selected = selected[:limit]
     return selected
+
+
+# ---------- batch grouping ----------
+
+def summarize_statuses(records):
+    """``[(status, count), ...]`` for a batch, in a fixed order.
+
+    Ordered by :data:`~awsqueueengine.shared.job_status.ALL_STATUSES` rather
+    than by count, so the summary cell for a batch doesn't reshuffle itself
+    between two runs a second apart. A status this client doesn't know (a newer
+    queue host invented it) sorts last rather than being dropped.
+    """
+    counts = {}
+    for record in records:
+        status = str(record.get("status") or "")
+        counts[status] = counts.get(status, 0) + 1
+    order = {name: index for index, name in enumerate(ALL_STATUSES)}
+    return sorted(counts.items(), key=lambda kv: (order.get(kv[0], len(order)), kv[0]))
+
+
+def _distinct(records, key):
+    """Distinct non-empty values of `key`, in first-seen order."""
+    seen = []
+    for record in records:
+        value = str(record.get(key) or "")
+        if value and value not in seen:
+            seen.append(value)
+    return seen
+
+
+def group_by_array(records):
+    """Split `records` into ``(groups, ungrouped)`` for the batch view.
+
+    A batch is grouped on ``array_id`` alone, never on ``(array_id, queue)``:
+    splitting one batch across rows because two of its jobs went to different
+    queues would recreate exactly the noise the grouped view exists to remove.
+    Heterogeneity is reported inside the row instead — see ``queues`` and
+    ``queue_hosts``, which callers render as the single shared name or a marker.
+
+    Groups are ordered by their *most recent* submission so a batch still being
+    submitted stays at the top, matching :func:`filter_records`' newest-first
+    contract; ``submitted_at`` on the group is the *earliest*, which is when the
+    user fired the batch off. Ungrouped records keep the order they arrived in.
+    """
+    order = []
+    by_array = {}
+    ungrouped = []
+    for record in records:
+        array_id = str(record.get("array_id") or "")
+        if not array_id:
+            ungrouped.append(record)
+            continue
+        if array_id not in by_array:
+            by_array[array_id] = []
+            order.append(array_id)
+        by_array[array_id].append(record)
+
+    groups = []
+    for array_id in order:
+        members = by_array[array_id]
+        stamps = [r["submitted_at"] for r in members]
+        # The largest recorded size wins: every member of a batch submitted in
+        # one invocation carries the same value, but a record whose batch was
+        # partly evicted is still worth believing over a missing value.
+        sizes = [r.get("array_size") for r in members if isinstance(r.get("array_size"), int)]
+        groups.append({
+            "array_id": array_id,
+            "count": len(members),
+            "array_size": max(sizes) if sizes else None,
+            "submitted_at": min(stamps),
+            "last_submitted_at": max(stamps),
+            "status_counts": summarize_statuses(members),
+            "queues": _distinct(members, "queue"),
+            "queue_hosts": _distinct(members, "queue_host"),
+            "records": members,
+        })
+    groups.sort(key=lambda g: g["last_submitted_at"], reverse=True)
+    return groups, ungrouped

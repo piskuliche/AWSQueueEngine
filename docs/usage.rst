@@ -155,6 +155,8 @@ write no ``run.info`` anywhere).
    awsqe-client jobs --status queued,running --until 2026-07-30
    awsqe-client jobs --queue zeke-queue        # one queue
    awsqe-client jobs --queue gpu,bigmem        # several
+   awsqe-client jobs --array ffpopt-IDC       # list one batch's jobs individually
+   awsqe-client jobs --expand                 # never collapse batches into one row
    awsqe-client jobs --no-refresh             # local state only, no SSH
    awsqe-client jobs --fetch-logs             # pull shown jobs' logs off their workers
    awsqe-client jobs --cat 20260730-1415      # print one job's log to the screen
@@ -179,6 +181,47 @@ case-insensitively, so what you can submit to is what you can filter on.
 or a relative span (``30m``, ``24h``, ``7d``, ``2w``), and filter on submission
 time in the submitter's local timezone. As an upper bound a bare date means the
 *end* of that day, so ``--until 2026-07-30`` includes the 30th.
+
+Batches
+~~~~~~~
+
+``submit --array NAME`` tags a job as part of a batch, so that a shell loop
+submitting a folder of work does not drown out everything else in ``jobs``:
+
+.. code-block:: bash
+
+   for IDC in IDC*; do
+       awsqe-client submit --queue production --array ffpopt-IDC \
+           --payload "${PWD}/$IDC/" \
+           "source ~/flowrc && cd \$PAYLOAD_DIR && python run_fe.py"
+   done
+
+``jobs`` then collapses each batch to a single row, above the untagged jobs::
+
+   SUBMITTED             ARRAY                       JOBS  QUEUE         STATUS
+   2026-08-02 09:14:02   ffpopt-IDC                   142  production    130 completed · 9 failed · 3 running
+
+Grouping is on by default; untagged jobs list exactly as they did before. The
+row's ``SUBMITTED`` is the batch's *earliest* job — when you fired it off —
+while batches sort by their most recent, so one still being submitted stays at
+the top. ``--limit``/``-n`` counts rendered rows, so a collapsed batch is one
+row however many jobs it holds. A batch spanning more than one queue shows
+``*`` rather than picking one of them.
+
+``--array NAME`` drills into a batch and lists its jobs individually;
+``--expand`` (or ``--no-group``) turns grouping off entirely, and
+``--fetch-logs`` implies it, since a per-job log path has nowhere to go on a
+batch row. The other filters compose, and the batch row reflects what survived
+them — ``jobs --array ffpopt-IDC --status failed --fetch-logs`` is the practical
+way to read the tracebacks out of a batch.
+
+Names are letters, digits, ``.``, ``_`` and ``-``, up to 64 characters, with no
+punctuation at either end. An unusable name is **rejected** rather than quietly
+rewritten. This deliberately differs from queue names, which are sanitized
+silently: an array name is something the user types back in at ``jobs --array``
+and (once the queue host carries the tag) ``qdel --array``, so a silent rewrite
+at submit would leave those matching nothing. Reusing a name appends to that
+batch; ``--since`` separates the runs.
 
 The ledger is per machine and holds 2000 jobs, evicting only the oldest
 *finished* ones. An unreachable queue host degrades to last-known statuses with

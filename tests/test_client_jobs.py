@@ -23,6 +23,8 @@ class _JobsArgs:
     def __init__(self, **kwargs):
         self.status = None
         self.queue = None
+        self.array = None
+        self.expand = False
         self.since = None
         self.until = None
         self.limit = 50
@@ -87,6 +89,28 @@ class ParserTests(unittest.TestCase):
         self.assertEqual(args.limit, 5)
         self.assertTrue(args.no_refresh)
         self.assertEqual(args.queue_host, "qh")
+
+    def test_grouping_is_on_by_default(self):
+        args = client_cli.build_parser().parse_args(["jobs"])
+        self.assertFalse(args.expand)
+        self.assertIsNone(args.array)
+
+    def test_expand_and_no_group_are_the_same_flag(self):
+        for flag in ("--expand", "--no-group"):
+            args = client_cli.build_parser().parse_args(["jobs", flag])
+            self.assertTrue(args.expand, flag)
+
+    def test_array_is_repeatable(self):
+        args = client_cli.build_parser().parse_args(
+            ["jobs", "--array", "a", "--array", "b,c"]
+        )
+        self.assertEqual(args.array, ["a", "b,c"])
+
+    def test_submit_takes_a_single_array_tag(self):
+        args = client_cli.build_parser().parse_args(
+            ["submit", "--array", "ffpopt-IDC", "python", "t.py"]
+        )
+        self.assertEqual(args.array, "ffpopt-IDC")
 
     def test_forget_flags(self):
         args = client_cli.build_parser().parse_args(
@@ -299,6 +323,136 @@ class RenderTests(_LedgerFixture):
         ledger_mod.apply_state("A", {"status": "queued", "queue_position": 3})
         out, _ = self._run(_JobsArgs(no_refresh=True))
         self.assertIn("q#3", out)
+
+
+class GroupedRenderTests(_LedgerFixture):
+    """The batch view. Grouping is on by default, so the load-bearing assertion
+    here is that a ledger with no tagged jobs still renders byte-for-byte as it
+    did before batches existed."""
+
+    def _batch(self, name, count, *, base=1000.0, queue=None, **kwargs):
+        for i in range(count):
+            self._submit(f"{name}-{i}", submitted_at=base + i, array_id=name,
+                         queue=queue, **kwargs)
+
+    def _array_row(self, out, name):
+        """The batch row for `name`, excluding the header line."""
+        rows = [line for line in out.splitlines()
+                if name in line.split() and not line.startswith("SUBMITTED")]
+        self.assertEqual(len(rows), 1, out)
+        return rows[0]
+
+    def test_an_untagged_ledger_renders_exactly_as_the_flat_listing(self):
+        self._submit("A", submitted_at=100.0)
+        self._submit("B", submitted_at=200.0)
+        grouped, _ = self._run(_JobsArgs(no_refresh=True))
+        expanded, _ = self._run(_JobsArgs(no_refresh=True, expand=True))
+        self.assertEqual(grouped, expanded)
+
+    def test_an_untagged_filtered_listing_keeps_the_original_footer_rule(self):
+        self._submit("A", submitted_at=100.0)
+        self._submit("B", submitted_at=200.0)
+        out, _ = self._run(_JobsArgs(no_refresh=True, limit=1))
+        self.assertIn("1 of 2 tracked job(s).", out)
+
+    def test_a_batch_collapses_to_one_row(self):
+        self._batch("ffpopt-IDC", 5)
+        out, _ = self._run(_JobsArgs(no_refresh=True))
+        self.assertIn("ARRAY", out)
+        self.assertIn("ffpopt-IDC", out)
+        # Not one row per job.
+        self.assertEqual(sum(1 for line in out.splitlines() if "ffpopt-IDC" in line), 1)
+        for i in range(5):
+            self.assertNotIn(f"ffpopt-IDC-{i} ", out)
+
+    def test_the_row_summarizes_the_statuses(self):
+        self._batch("b", 3)
+        ledger_mod.apply_state("b-0", {"status": "completed"})
+        ledger_mod.apply_state("b-1", {"status": "failed"})
+        out, _ = self._run(_JobsArgs(no_refresh=True))
+        self.assertIn("1 submitted", out)
+        self.assertIn("1 completed", out)
+        self.assertIn("1 failed", out)
+
+    def test_expand_lists_every_job_individually(self):
+        self._batch("b", 3)
+        out, _ = self._run(_JobsArgs(no_refresh=True, expand=True))
+        self.assertNotIn("ARRAY", out)
+        for i in range(3):
+            self.assertIn(f"b-{i}", out)
+
+    def test_array_filter_drills_into_one_batch_and_implies_expand(self):
+        self._batch("keep", 2, base=1000.0)
+        self._batch("drop", 2, base=2000.0)
+        out, _ = self._run(_JobsArgs(no_refresh=True, array=["keep"]))
+        self.assertNotIn("ARRAY", out)
+        self.assertIn("keep-0", out)
+        self.assertNotIn("drop-0", out)
+
+    def test_array_filter_is_case_insensitive_and_comma_separated(self):
+        self._batch("one", 1, base=1000.0)
+        self._batch("two", 1, base=2000.0)
+        out, _ = self._run(_JobsArgs(no_refresh=True, array=["ONE,two"]))
+        self.assertIn("one-0", out)
+        self.assertIn("two-0", out)
+
+    def test_batches_and_loose_jobs_appear_in_the_same_listing(self):
+        self._batch("b", 3, base=1000.0)
+        self._submit("loose", submitted_at=5000.0)
+        out, _ = self._run(_JobsArgs(no_refresh=True))
+        self.assertIn("ARRAY", out)
+        self.assertIn("loose", out)
+        self.assertIn("4 of 4 tracked job(s); 3 in 1 batch(es).", out)
+
+    def test_limit_counts_rows_not_records(self):
+        """`-n 1` over a 5-job batch must not render `JOBS 1` — the one number
+        in that row a reader has no way to second-guess."""
+        self._batch("b", 5)
+        out, _ = self._run(_JobsArgs(no_refresh=True, limit=1))
+        row = self._array_row(out, "b")
+        self.assertIn("5", row.split())
+        self.assertIn("5 of 5 tracked job(s); 5 in 1 batch(es).", out)
+
+    def test_limit_takes_the_newest_rows_across_both_kinds(self):
+        self._batch("old", 2, base=100.0)
+        self._submit("new", submitted_at=9000.0)
+        out, _ = self._run(_JobsArgs(no_refresh=True, limit=1))
+        self.assertIn("new", out)
+        self.assertNotIn("old", out)
+
+    def test_status_filter_narrows_the_batch_row(self):
+        self._batch("b", 3)
+        ledger_mod.apply_state("b-0", {"status": "failed"})
+        out, _ = self._run(_JobsArgs(no_refresh=True, status=["failed"]))
+        self.assertIn("1 failed", out)
+        self.assertIn("1 of 3 tracked job(s); 1 in 1 batch(es).", out)
+
+    def test_a_filtered_row_never_shows_the_submitted_size_fraction(self):
+        """`1/142` is true of an evicted batch and false of a filtered one, and
+        the row cannot say which."""
+        self._batch("b", 3, array_size=142)
+        ledger_mod.apply_state("b-0", {"status": "failed"})
+        filtered, _ = self._run(_JobsArgs(no_refresh=True, status=["failed"]))
+        self.assertNotIn("/142", filtered)
+        unfiltered, _ = self._run(_JobsArgs(no_refresh=True))
+        self.assertIn("3/142", unfiltered)
+
+    def test_a_batch_spanning_two_queues_is_marked_rather_than_picking_one(self):
+        self._submit("m-0", submitted_at=100.0, array_id="m", queue="gpu")
+        self._submit("m-1", submitted_at=200.0, array_id="m", queue="default")
+        out, _ = self._run(_JobsArgs(no_refresh=True))
+        row = self._array_row(out, "m")
+        self.assertIn("*", row)
+        self.assertNotIn("gpu", row)
+
+    def test_a_batch_on_one_queue_names_it(self):
+        self._batch("b", 2, queue="gpu")
+        out, _ = self._run(_JobsArgs(no_refresh=True))
+        self.assertIn("gpu", out)
+
+    def test_empty_ledger_still_says_no_tracked_jobs(self):
+        out, _ = self._run(_JobsArgs(no_refresh=True))
+        self.assertIn("(no tracked jobs)", out)
 
 
 class FilterErrorTests(_LedgerFixture):
@@ -667,6 +821,7 @@ class SubmitLedgerTests(_LedgerFixture):
         high_priority = False
         preempt = False
         mps = False
+        array = None
         queue_host = "queuebox"
 
     def _submit_remote(self, **overrides):
@@ -712,6 +867,49 @@ class SubmitLedgerTests(_LedgerFixture):
         self.assertEqual(records[0]["job_id"], "JOB-1")
         self.assertEqual(records[0]["cmd"], "python train.py")
         self.assertEqual(records[0]["queue_host"], "queuebox")
+
+    def test_array_tag_is_recorded(self):
+        records = self._submit_remote(array="ffpopt-IDC")
+        self.assertEqual(records[0]["array_id"], "ffpopt-IDC")
+
+    def test_untagged_submit_records_an_empty_tag(self):
+        records = self._submit_remote()
+        self.assertEqual(records[0]["array_id"], "")
+
+    def test_array_tag_is_sent_to_the_queue_host_too(self):
+        """Sent from day one so a batch submitted before the host understands
+        `array_id` is still correct on the wire, not permanently untaggable."""
+        args = self._SubmitArgs()
+        args.array = "ffpopt-IDC"
+        with patch("awsqueueengine.client.cli.rpc_call",
+                   return_value={"job_id": "JOB-1"}) as rpc:
+            with redirect_stdout(io.StringIO()):
+                client_cli.cmd_submit_remote(args, "python train.py")
+        self.assertEqual(rpc.call_args[0][2]["array_id"], "ffpopt-IDC")
+
+    def test_no_array_id_param_is_sent_when_untagged(self):
+        args = self._SubmitArgs()
+        with patch("awsqueueengine.client.cli.rpc_call",
+                   return_value={"job_id": "JOB-1"}) as rpc:
+            with redirect_stdout(io.StringIO()):
+                client_cli.cmd_submit_remote(args, "python train.py")
+        self.assertNotIn("array_id", rpc.call_args[0][2])
+
+    def test_a_bad_array_name_is_rejected_before_anything_is_uploaded(self):
+        """The name is checked first: a typo must not cost a tar-and-push to S3."""
+        args = self._SubmitArgs()
+        args.array = "ffpopt IDC"
+        args.payload = str(self.root_tmp)
+        with patch("awsqueueengine.client.cli.rpc_call") as rpc, \
+             patch("awsqueueengine.client.cli.archive_payload_to_temp") as archive:
+            out = io.StringIO()
+            with self.assertRaises(SystemExit) as ctx, redirect_stdout(out):
+                client_cli.cmd_submit_remote(args, "python train.py")
+        self.assertEqual(ctx.exception.code, 2)
+        self.assertIn("--array", out.getvalue())
+        archive.assert_not_called()
+        rpc.assert_not_called()
+        self.assertEqual(ledger_mod.load_ledger(), [])
 
 
 class QdelLedgerIntegrationTests(_LedgerFixture):

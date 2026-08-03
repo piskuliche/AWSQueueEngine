@@ -432,6 +432,41 @@ class CliSubmitTests(unittest.TestCase):
         self.assertEqual(res.returncode, 0)
         self.assertEqual(self._read_ledger(), [])
 
+    def test_remote_submit_records_the_array_tag_and_forwards_it(self):
+        """The tag reaches both the ledger and the wire, through a real process."""
+        capture_path = self.home_path / "ssh_args.txt"
+        stdin_path = self.home_path / "ssh_stdin.txt"
+        fake_ssh_dir = self._make_fake_ssh_rpc(
+            capture_path, stdin_path, result={"job_id": "JOB-A1", "queue": "gpu"},
+        )
+
+        res = self._run_cli_with_path_prefix(
+            fake_ssh_dir, "submit", "--queue-host", "queuebox", "--queue", "gpu",
+            "--array", "ffpopt-IDC", "echo", "hi",
+        )
+
+        self.assertEqual(res.returncode, 0)
+        self.assertEqual(self._read_ledger()[0]["array_id"], "ffpopt-IDC")
+        request = json.loads(stdin_path.read_text())
+        self.assertEqual(request["params"]["array_id"], "ffpopt-IDC")
+
+    def test_remote_submit_rejects_a_bad_array_name_without_contacting_the_host(self):
+        capture_path = self.home_path / "ssh_args.txt"
+        stdin_path = self.home_path / "ssh_stdin.txt"
+        fake_ssh_dir = self._make_fake_ssh_rpc(
+            capture_path, stdin_path, result={"job_id": "JOB-NO"},
+        )
+
+        res = self._run_cli_with_path_prefix(
+            fake_ssh_dir, "submit", "--queue-host", "queuebox",
+            "--array", "ffpopt IDC", "echo", "hi",
+        )
+
+        self.assertEqual(res.returncode, 2)
+        self.assertIn("--array", res.stdout)
+        self.assertFalse(stdin_path.exists())
+        self.assertEqual(self._read_ledger(), [])
+
     def test_remote_submit_forwards_mps_flag_over_ssh(self):
         capture_path = self.home_path / "ssh_args.txt"
         stdin_path = self.home_path / "ssh_stdin.txt"

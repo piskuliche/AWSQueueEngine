@@ -114,6 +114,8 @@ awsqe-client jobs                        # everything this machine submitted, ne
 awsqe-client jobs --status active        # still submitted, queued or running
 awsqe-client jobs --status failed --since 7d
 awsqe-client jobs --queue zeke-queue     # one queue (repeatable, comma-separated)
+awsqe-client jobs --array ffpopt-IDC     # list one batch's jobs individually
+awsqe-client jobs --expand               # never collapse batches into one row
 awsqe-client jobs --no-refresh           # skip the queue-host round trip
 awsqe-client jobs --fetch-logs           # pull each shown job's log off its worker
 awsqe-client jobs --cat 20260730-1415    # print one job's log to the screen
@@ -314,7 +316,56 @@ Filters:
   relative span (`30m`, `24h`, `7d`, `2w`). They filter on submission time, in
   **your** local timezone. As an upper bound a bare date means the *end* of
   that day, so `--until 2026-07-30` includes the 30th.
-- `--limit` / `-n` caps the rows (default 50; `0` for all).
+- `--limit` / `-n` caps the rows (default 50; `0` for all). A collapsed batch is
+  **one row** however many jobs it holds — see below.
+
+#### Batches
+
+Submitting a folder of work means a shell loop, one `submit` per subdirectory.
+At a hundred-odd jobs those drown out everything else in `jobs`. Tag them at
+submit and they collapse to one row:
+
+```bash
+cd ffpopt
+for IDC in IDC*; do
+    awsqe-client submit --queue production --priority -100 --mps \
+        --array ffpopt-IDC --payload "${PWD}/$IDC/" \
+        "source ~/flowrc && cd \$PAYLOAD_DIR && python run_fe.py"
+done
+```
+
+```
+$ awsqe-client jobs
+SUBMITTED             ARRAY                       JOBS  QUEUE         STATUS
+2026-08-02 09:14:02   ffpopt-IDC                   142  production    130 completed · 9 failed · 3 running
+2026-08-01 16:40:11   sweep-b                       20  fast-gpus     20 completed
+
+SUBMITTED             JOB                     STATUS      HOST      QUEUE         DUR       CMD
+2026-08-02 11:02:55   20260802-110255-7ac1e0  running     eci7      default       -         python train.py
+163 of 163 tracked job(s); 162 in 2 batch(es).
+```
+
+- Grouping is **on by default**. Untagged jobs list exactly as they always have,
+  below the batch rows.
+- `SUBMITTED` on a batch row is when you fired it off — the *earliest* of its
+  jobs — but batches sort by their most recent, so one still being submitted
+  stays at the top.
+- `--array NAME` drills into one batch and lists its jobs individually;
+  `--expand` (or `--no-group`) turns grouping off entirely. `--fetch-logs`
+  implies expansion, since a log path has nowhere to go on a batch row.
+- The other filters compose, and the batch row reflects what survived them:
+  `jobs --array ffpopt-IDC --status failed --fetch-logs` is the practical way to
+  read the tracebacks out of a batch.
+- A batch that went to more than one queue shows `*` in the `QUEUE` column
+  rather than picking one of them.
+
+Names are letters, digits, `.`, `_` and `-`, up to 64 characters. An unusable
+name is **rejected** rather than quietly rewritten — unlike a queue name, an
+array name is something you type back in at `jobs --array` and (once the queue
+host carries the tag) `qdel --array`, and a silent rewrite at submit would leave
+those matching nothing with nothing on screen to explain why.
+
+Reusing a name is legal and appends to that batch; `--since` separates the runs.
 
 #### Job logs
 
