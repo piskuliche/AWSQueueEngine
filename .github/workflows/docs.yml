@@ -52,18 +52,22 @@ jobs:
           path: docs/_build/html
           retention-days: 7
 
+      # Gated on "not a PR" rather than "is a push", so that a manual
+      # workflow_dispatch can also deploy — which is the escape hatch when a
+      # push races Pages enablement, or when you need to republish unchanged
+      # content.
       - uses: actions/configure-pages@v6
-        if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+        if: github.event_name != 'pull_request' && github.ref == 'refs/heads/main'
 
       # Artifact-based deploy, so no .nojekyll is needed for _static/_sources.
       - uses: actions/upload-pages-artifact@v5
-        if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+        if: github.event_name != 'pull_request' && github.ref == 'refs/heads/main'
         with:
           path: docs/_build/html
 
   deploy:
     needs: build
-    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    if: github.event_name != 'pull_request' && github.ref == 'refs/heads/main'
     runs-on: ubuntu-latest
     permissions:
       pages: write
