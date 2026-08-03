@@ -33,6 +33,7 @@ from ..shared.job_status import (
     SUBMITTED,
     is_terminal,
 )
+from ..shared.state_io import write_json_atomic
 from .config import CONFIG_DIR
 
 try:  # pragma: no cover — exercised implicitly on POSIX
@@ -142,14 +143,8 @@ def prune_records(records):
 def save_ledger(records, path=None):
     """Atomically write the ledger, pruning first. Returns the path written."""
     target = path or LEDGER_PATH
-    target.parent.mkdir(parents=True, exist_ok=True)
     payload = {"version": LEDGER_VERSION, "jobs": prune_records(records)}
-    # `.tmp.<pid>` rather than a shared `.tmp`, so a stale temp file left by a
-    # killed process can never become the source of somebody else's replace.
-    tmp = target.with_suffix(target.suffix + f".tmp.{os.getpid()}")
-    tmp.write_text(json.dumps(payload, indent=2) + "\n")
-    os.replace(tmp, target)
-    return target
+    return write_json_atomic(target, payload)
 
 
 # ---------- locking ----------

@@ -30,12 +30,10 @@ from ..shared.protocol import (
 )
 from ..shared.queue import (
     QueueSelectionError,
+    delete_queue_selection,
     enqueue_item,
     load_queue,
     normalize_job_item,
-    remove_queue_positions,
-    resolve_queue_selection,
-    save_queue,
 )
 from ..shared.queue_config import (
     DEFAULT_QUEUE,
@@ -43,6 +41,7 @@ from ..shared.queue_config import (
     normalize_queue_name,
 )
 from ..shared.running_state import load_running_jobs
+from ..shared.state_lock import state_lock
 from ..shared.worker_actions import new_job_tag, tail_remote_log
 from .monitor import clear_host_cooldowns, get_host_cooldowns
 
@@ -195,13 +194,11 @@ def handle_qdel(params: dict) -> dict:
     indices = _optional_int_list(params, "indices")
     queue = _optional_str(params, "queue")
 
-    q = load_queue()
     try:
-        selection = resolve_queue_selection(q, job_ids=job_ids, indices=indices, queue=queue)
+        removed = delete_queue_selection(job_ids=job_ids, indices=indices, queue=queue)
     except QueueSelectionError as exc:
         raise RpcError(exc.code, enrich_selection_message(exc.message, exc.tokens)) from exc
 
-    removed = remove_queue_positions(q, selection)
     return {
         "removed": [
             {"index": idx, "item": item, "selector": token} for idx, item, token in removed
@@ -233,29 +230,34 @@ def handle_requeue_deferred(params: dict) -> dict:
     if not all_flag and not indices:
         raise RpcError("invalid_params", "provide indices or set all=true")
 
-    jobs = load_deferred_jobs()
-    if not jobs:
-        return {"moved": [], "action": "dropped" if drop else "requeued"}
-
-    if all_flag:
-        popped = pop_all_deferred()
-    else:
-        size = len(jobs)
-        invalid = [i for i in indices if i < 1 or i > size]
-        if invalid:
-            raise RpcError(
-                "conflict",
-                f"invalid deferred index(es): {', '.join(str(i) for i in sorted(set(invalid)))}; size {size}",
-            )
-        popped = pop_deferred_by_indices(indices)
-
+    # One lock across validate → pop → enqueue: the indices must be resolved
+    # against the same deferred list they are popped from, and a job must never
+    # be observable in neither list. The helpers below lock too; the lock is
+    # reentrant precisely so this can hold it across them.
     moved = []
-    for idx, raw_item in popped:
-        item = normalize_job_item(raw_item)
-        item["submit_failures"] = 0
-        if not drop:
-            enqueue_item(item)
-        moved.append({"index": idx, "item": item})
+    with state_lock():
+        jobs = load_deferred_jobs()
+        if not jobs:
+            return {"moved": [], "action": "dropped" if drop else "requeued"}
+
+        if all_flag:
+            popped = pop_all_deferred()
+        else:
+            size = len(jobs)
+            invalid = [i for i in indices if i < 1 or i > size]
+            if invalid:
+                raise RpcError(
+                    "conflict",
+                    f"invalid deferred index(es): {', '.join(str(i) for i in sorted(set(invalid)))}; size {size}",
+                )
+            popped = pop_deferred_by_indices(indices)
+
+        for idx, raw_item in popped:
+            item = normalize_job_item(raw_item)
+            item["submit_failures"] = 0
+            if not drop:
+                enqueue_item(item)
+            moved.append({"index": idx, "item": item})
     return {"moved": moved, "action": "dropped" if drop else "requeued"}
 
 

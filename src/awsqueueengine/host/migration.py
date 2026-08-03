@@ -28,6 +28,7 @@ from ..shared.paths import (
     QUEUE_FILE,
     RUNNING_FILE,
 )
+from ..shared.state_io import write_json_atomic
 
 
 # Each entry: (legacy path, new path).
@@ -152,8 +153,7 @@ def _stamp_migrated_at(state_file: Path) -> None:
         except Exception:
             data = {}
     data["migrated_at"] = time.time()
-    state_file.parent.mkdir(parents=True, exist_ok=True)
-    state_file.write_text(json.dumps(data, indent=2))
+    write_json_atomic(state_file, data)
 
 
 def render_summary(result: MigrationResult, *, dry_run: bool) -> str:

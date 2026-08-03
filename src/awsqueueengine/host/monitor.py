@@ -12,7 +12,15 @@ from ..shared.deferred_state import append_deferred_job
 from ..shared.failure_state import append_failed_records
 from ..shared.host_status import status_all
 from ..shared.job_outcome import classify_failure, fetch_job_outcome
-from ..shared.queue import build_resume_item, dequeue_for_host, load_queue, save_queue, normalize_job_item
+from ..shared.queue import (
+    build_resume_item,
+    claim_queued_job,
+    dequeue_for_host,
+    load_queue,
+    normalize_job_item,
+    requeue_back,
+    requeue_front,
+)
 from ..shared.queue_config import (
     QueueConfigSource,
     host_is_eligible_for_item,
@@ -20,6 +28,8 @@ from ..shared.queue_config import (
 )
 from ..shared.paths import LOCK_FILE, MONITOR_STATE_FILE
 from ..shared.running_state import load_running_jobs, save_running_jobs
+from ..shared.state_io import warn_unreadable, write_json_atomic
+from ..shared.state_lock import state_lock
 from ..shared.worker_actions import kill_managed_on_host
 from .config import (
     ALERT_DAILY_EMAIL_LIMIT,
@@ -120,18 +130,6 @@ class _MonitorHostSource:
 
 def _host_is_eligible(job_item, host, queue_host_map=None):
     return host_is_eligible_for_item(job_item, host, queue_host_map)
-
-
-def _requeue_front(job_item):
-    q = load_queue()
-    q.insert(0, normalize_job_item(job_item))
-    save_queue(q)
-
-
-def _requeue_back(job_item):
-    q = load_queue()
-    q.append(normalize_job_item(job_item))
-    save_queue(q)
 
 
 def _build_status_text(status_rows, running_jobs, queue_items):
@@ -308,14 +306,14 @@ def _load_monitor_state():
     try:
         data = json.loads(MONITOR_STATE_FILE.read_text())
         return data if isinstance(data, dict) else {}
-    except Exception:
+    except Exception as exc:
+        warn_unreadable(MONITOR_STATE_FILE, exc)
         return {}
 
 
 def _save_monitor_state(state):
     try:
-        MONITOR_STATE_FILE.parent.mkdir(parents=True, exist_ok=True)
-        MONITOR_STATE_FILE.write_text(json.dumps(state, indent=2))
+        write_json_atomic(MONITOR_STATE_FILE, state)
     except Exception as exc:
         print(f"[WARN] Could not save monitor state: {exc}", flush=True)
 
@@ -340,11 +338,15 @@ def _load_host_disabled_until():
 
 
 def _save_host_disabled_until(host_disabled_until):
-    state = _load_monitor_state()
     now_ts = time.time()
     cleaned = {h: float(ts) for h, ts in host_disabled_until.items() if float(ts) > now_ts}
-    state["host_disabled_until"] = cleaned
-    _save_monitor_state(state)
+    # monitor_state.json holds more than cooldowns (migrated_at, the daily
+    # summary date), so this is a read-modify-write like any other: the monitor
+    # disabling a host races the `enable_host` RPC clearing one.
+    with state_lock():
+        state = _load_monitor_state()
+        state["host_disabled_until"] = cleaned
+        _save_monitor_state(state)
 
 
 def get_host_cooldowns():
@@ -354,17 +356,18 @@ def get_host_cooldowns():
 
 def clear_host_cooldowns(hosts=None, all_hosts=False):
     """Remove cooldown entries. Returns the list of host names actually cleared."""
-    current = _load_host_disabled_until()
-    if all_hosts:
-        cleared = sorted(current.keys())
-        current = {}
-    else:
-        cleared = []
-        for host in hosts or []:
-            if host in current:
-                cleared.append(host)
-                current.pop(host, None)
-    _save_host_disabled_until(current)
+    with state_lock():
+        current = _load_host_disabled_until()
+        if all_hosts:
+            cleared = sorted(current.keys())
+            current = {}
+        else:
+            cleared = []
+            for host in hosts or []:
+                if host in current:
+                    cleared.append(host)
+                    current.pop(host, None)
+        _save_host_disabled_until(current)
     return cleared
 
 
@@ -533,7 +536,7 @@ def _launch_job_on_host(host, job_item, running_jobs):
 
         if reason in ("host_storage", "host_transport"):
             item["submit_failures"] = 0
-            _requeue_back(item)
+            requeue_back(item)
             print(f"  Requeued job at back of queue; {host} flagged for cooldown ({reason}).", flush=True)
             return {
                 "launched": False,
@@ -600,7 +603,7 @@ def _launch_job_on_host(host, job_item, running_jobs):
             }
 
         print(f"  Requeuing job (failure {failures}/{MAX_SUBMIT_FAILURES}).", flush=True)
-        _requeue_front(item)
+        requeue_front(item)
         return {
             "launched": False,
             "reason": "job",
@@ -871,6 +874,10 @@ def monitor_loop(hosts, poll_interval=CHECK_INTERVAL, stop_event: threading.Even
                     )
                     break  # job-side failure: avoid retrying the same requeued job on other free hosts this cycle
 
+            # Read-only snapshot: the alerts below and the preemption choice
+            # only need an approximate view, and everything after this point
+            # sends email or talks to a host over SSH. Writing this list back
+            # after all that is what used to erase jobs submitted mid-cycle.
             queue_items = load_queue()
             queue_len = len(queue_items)
             low_queue_alert_sent, empty_queue_alert_sent = _reset_queue_alert_state(
@@ -920,33 +927,47 @@ def monitor_loop(hosts, poll_interval=CHECK_INTERVAL, stop_event: threading.Even
                 queue_host_map=queue_host_map,
             )
             if preempt_queue_idx is not None and preempt_item and victim_host:
-                queue_items.pop(preempt_queue_idx)
-                save_queue(queue_items)
-                print(
-                    f"[{time.strftime('%H:%M:%S')}] Preempting host {victim_host} for job: "
-                    f"{str(preempt_item.get('cmd') or '')[:120]}",
-                    flush=True,
+                # `queue_items` is a snapshot taken before the alerts above, so
+                # the target may have been dispatched or qdel'd since. Claim it
+                # by identity under the state lock rather than popping the
+                # position it held back then, and stand down if it is gone —
+                # killing a host for a job that no longer exists helps nobody.
+                claimed_item = claim_queued_job(
+                    preempt_item.get("job_id"), fallback_item=preempt_item
                 )
-                interrupted_job = running_jobs.get(victim_host)
-                kill_result = kill_managed_on_host(victim_host)
-                if kill_result.get("rc") != 0:
+                if claimed_item is None:
                     print(
-                        f"  Failed to preempt host {victim_host}: {kill_result.get('err') or kill_result.get('out')}",
+                        "  Preemption target is no longer queued (dispatched or deleted); "
+                        f"leaving {victim_host} alone this cycle.",
                         flush=True,
                     )
-                    _requeue_front(preempt_item)
                 else:
-                    running_jobs.pop(victim_host, None)
-                    save_running_jobs(running_jobs)
-                    if interrupted_job:
-                        resume_item = build_resume_item(interrupted_job, victim_host)
-                        _requeue_front(resume_item)
+                    print(
+                        f"[{time.strftime('%H:%M:%S')}] Preempting host {victim_host} for job: "
+                        f"{str(claimed_item.get('cmd') or '')[:120]}",
+                        flush=True,
+                    )
+                    interrupted_job = running_jobs.get(victim_host)
+                    kill_result = kill_managed_on_host(victim_host)
+                    if kill_result.get("rc") != 0:
                         print(
-                            f"  Requeued interrupted job for {victim_host}: "
-                            f"{str(resume_item.get('cmd') or '')[:120]}",
+                            f"  Failed to preempt host {victim_host}: "
+                            f"{kill_result.get('err') or kill_result.get('out')}",
                             flush=True,
                         )
-                    _launch_job_on_host(victim_host, preempt_item, running_jobs)
+                        requeue_front(claimed_item)
+                    else:
+                        running_jobs.pop(victim_host, None)
+                        save_running_jobs(running_jobs)
+                        if interrupted_job:
+                            resume_item = build_resume_item(interrupted_job, victim_host)
+                            requeue_front(resume_item)
+                            print(
+                                f"  Requeued interrupted job for {victim_host}: "
+                                f"{str(resume_item.get('cmd') or '')[:120]}",
+                                flush=True,
+                            )
+                        _launch_job_on_host(victim_host, claimed_item, running_jobs)
             stop_event.wait(poll_interval)
     except KeyboardInterrupt:
         print("\nMonitor stopped by user.", flush=True)
