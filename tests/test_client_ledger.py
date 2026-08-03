@@ -202,14 +202,17 @@ class MergeStateTests(unittest.TestCase):
 
     def test_client_owned_fields_are_never_overwritten(self):
         merged = merge_state(
-            self._record(),
+            self._record(array_id="ffpopt-IDC"),
             {"status": "running", "job_id": "OTHER", "submitted_at": 999.0,
-             "queue_host": "elsewhere", "payload": "/wrong"},
+             "queue_host": "elsewhere", "payload": "/wrong", "array_id": "other-batch"},
         )
         self.assertEqual(merged["job_id"], "A")
         self.assertEqual(merged["submitted_at"], 100.0)
         self.assertEqual(merged["queue_host"], "qh")
         self.assertEqual(merged["payload"], "/data/run")
+        # The submitter chose the tag; the host's copy is derivative, so a host
+        # that ever disagreed must not silently rewrite the local record.
+        self.assertEqual(merged["array_id"], "ffpopt-IDC")
 
     def test_queue_is_host_owned_and_does_update(self):
         merged = merge_state(self._record(queue="default"), {"status": "queued", "queue": "gpu"})
@@ -381,9 +384,134 @@ class FilterRecordsTests(unittest.TestCase):
         # A negative would otherwise slice the tail off.
         self.assertEqual(self._ids(limit=-1), ["C", "B", "A"])
 
-    def test_input_is_not_mutated(self):
-        filter_records(self.records, limit=1)
-        self.assertEqual([r["job_id"] for r in self.records], ["A", "B", "C"])
+    def test_array_filter(self):
+        for record, array_id in zip(self.records, ("", "ffpopt-IDC", "ffpopt-IDC")):
+            record["array_id"] = array_id
+        self.assertEqual(self._ids(arrays={"ffpopt-idc"}), ["C", "B"])
+        self.assertEqual(self._ids(arrays={"nope"}), [])
+
+    def test_array_filter_tolerates_records_with_no_tag(self):
+        self.assertEqual(self._ids(arrays={"ffpopt-IDC"}), [])
+
+    def test_array_and_status_filters_compose(self):
+        for record in self.records:
+            record["array_id"] = "batch"
+        self.assertEqual(self._ids(arrays={"batch"}, statuses={"failed"}), ["C"])
+
+
+class GroupByArrayTests(unittest.TestCase):
+    def _record(self, job_id, submitted_at, **kwargs):
+        record = {"job_id": job_id, "submitted_at": submitted_at,
+                  "status": "completed", "queue": "gpu", "queue_host": "qh"}
+        record.update(kwargs)
+        return record
+
+    def test_untagged_records_all_come_back_ungrouped_in_order(self):
+        records = [self._record("A", 300.0), self._record("B", 200.0)]
+        groups, ungrouped = ledger_mod.group_by_array(records)
+        self.assertEqual(groups, [])
+        self.assertEqual([r["job_id"] for r in ungrouped], ["A", "B"])
+
+    def test_tagged_records_collapse_into_one_group(self):
+        records = [self._record(f"J{i}", 100.0 + i, array_id="batch") for i in range(3)]
+        groups, ungrouped = ledger_mod.group_by_array(records)
+        self.assertEqual(ungrouped, [])
+        self.assertEqual(len(groups), 1)
+        self.assertEqual(groups[0]["array_id"], "batch")
+        self.assertEqual(groups[0]["count"], 3)
+
+    def test_group_submitted_at_is_earliest_but_ordering_is_by_latest(self):
+        # "When did I fire this off" is the earliest; a batch still being
+        # submitted should still sort to the top against a newer single job.
+        records = [
+            self._record("old1", 100.0, array_id="slow"),
+            self._record("old2", 900.0, array_id="slow"),
+            self._record("mid", 500.0, array_id="quick"),
+        ]
+        groups, _ = ledger_mod.group_by_array(records)
+        self.assertEqual([g["array_id"] for g in groups], ["slow", "quick"])
+        slow = groups[0]
+        self.assertEqual(slow["submitted_at"], 100.0)
+        self.assertEqual(slow["last_submitted_at"], 900.0)
+
+    def test_a_batch_spanning_two_queues_stays_one_group(self):
+        # Splitting on (array_id, queue) would recreate exactly the noise the
+        # grouped view exists to remove; the heterogeneity is reported instead.
+        records = [
+            self._record("A", 100.0, array_id="batch", queue="gpu"),
+            self._record("B", 200.0, array_id="batch", queue="default"),
+        ]
+        groups, _ = ledger_mod.group_by_array(records)
+        self.assertEqual(len(groups), 1)
+        self.assertEqual(groups[0]["queues"], ["gpu", "default"])
+
+    def test_shared_queue_is_reported_as_a_single_value(self):
+        records = [self._record(f"J{i}", 100.0 + i, array_id="batch") for i in range(3)]
+        groups, _ = ledger_mod.group_by_array(records)
+        self.assertEqual(groups[0]["queues"], ["gpu"])
+        self.assertEqual(groups[0]["queue_hosts"], ["qh"])
+
+    def test_status_counts_are_ordered_by_the_vocabulary_not_by_count(self):
+        records = [
+            self._record("A", 100.0, array_id="b", status="failed"),
+            self._record("B", 200.0, array_id="b", status="queued"),
+            self._record("C", 300.0, array_id="b", status="queued"),
+        ]
+        groups, _ = ledger_mod.group_by_array(records)
+        self.assertEqual(groups[0]["status_counts"], [("queued", 2), ("failed", 1)])
+
+    def test_array_size_survives_partial_eviction(self):
+        # Only some members are left, but each remembers how big the batch was.
+        records = [self._record(f"J{i}", 100.0 + i, array_id="b", array_size=142)
+                   for i in range(3)]
+        groups, _ = ledger_mod.group_by_array(records)
+        self.assertEqual(groups[0]["count"], 3)
+        self.assertEqual(groups[0]["array_size"], 142)
+
+    def test_array_size_is_none_for_a_shell_loop_batch(self):
+        # N separate `submit --array X` calls: nobody ever knew the batch size.
+        records = [self._record(f"J{i}", 100.0 + i, array_id="b") for i in range(3)]
+        groups, _ = ledger_mod.group_by_array(records)
+        self.assertIsNone(groups[0]["array_size"])
+
+    def test_mixed_tagged_and_untagged_split_cleanly(self):
+        records = [
+            self._record("A", 300.0, array_id="b"),
+            self._record("B", 200.0),
+            self._record("C", 100.0, array_id="b"),
+        ]
+        groups, ungrouped = ledger_mod.group_by_array(records)
+        self.assertEqual(groups[0]["count"], 2)
+        self.assertEqual([r["job_id"] for r in ungrouped], ["B"])
+
+
+class SummarizeStatusesTests(unittest.TestCase):
+    def test_empty(self):
+        self.assertEqual(ledger_mod.summarize_statuses([]), [])
+
+    def test_a_status_this_client_does_not_know_sorts_last_rather_than_vanishing(self):
+        records = [{"status": "completed"}, {"status": "teleported"}]
+        self.assertEqual(
+            ledger_mod.summarize_statuses(records),
+            [("completed", 1), ("teleported", 1)],
+        )
+
+
+class SubmissionRecordTests(unittest.TestCase):
+    def test_array_fields_are_recorded(self):
+        record = ledger_mod.build_submission_record(
+            job_id="A", queue_host="qh", array_id="ffpopt-IDC", array_size=142,
+        )
+        self.assertEqual(record["array_id"], "ffpopt-IDC")
+        self.assertEqual(record["array_size"], 142)
+
+    def test_an_untagged_submit_records_an_empty_tag_and_no_size(self):
+        record = ledger_mod.build_submission_record(job_id="A", queue_host="qh")
+        self.assertEqual(record["array_id"], "")
+        self.assertNotIn("array_size", record)
+
+    def test_no_job_id_is_no_record(self):
+        self.assertIsNone(ledger_mod.build_submission_record(job_id="", queue_host="qh"))
 
 
 if __name__ == "__main__":

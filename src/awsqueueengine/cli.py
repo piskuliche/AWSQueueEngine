@@ -45,6 +45,10 @@ def _build_parser():
     p_submit.add_argument("--high-priority", action="store_true")
     p_submit.add_argument("--preempt", action="store_true")
     p_submit.add_argument("--mps", action="store_true", help="Wrap the command in the NVIDIA MPS launch/teardown script.")
+    p_submit.add_argument(
+        "--array", default=None, metavar="NAME",
+        help="Tag this job as part of batch NAME (see `awsqe-client jobs`).",
+    )
     p_submit.add_argument("--queue-host", default=None)
     p_submit.add_argument("--payload-s3-uri", default=None, help=argparse.SUPPRESS)
     p_submit.add_argument("--payload-size-bytes", type=int, default=None, help=argparse.SUPPRESS)
