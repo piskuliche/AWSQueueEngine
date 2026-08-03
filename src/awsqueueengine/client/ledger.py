@@ -254,27 +254,43 @@ def build_submission_record(*, job_id, queue_host, queue=None, cmd="", payload="
     return record
 
 
+def record_submissions(entries, path=None):
+    """Track many freshly enqueued jobs in one locked read-modify-write.
+
+    `entries` are :func:`build_submission_record` kwarg dicts. A batch submit
+    would otherwise pay 105 lock-and-rewrite cycles for one logical action, and
+    a reader landing between them would see a partial batch.
+
+    Same contract as :func:`record_submission`: never raises, because by the
+    time this runs the jobs are already on the queue host.
+    """
+    records_to_add = [r for r in (build_submission_record(**e) for e in entries) if r]
+    if not records_to_add:
+        return []
+    target = path or LEDGER_PATH
+    try:
+        with _mutating(target) as records:
+            records.extend(records_to_add)
+    except OSError as exc:
+        print(
+            f"[WARN] could not record {len(records_to_add)} job(s) in {target}: {exc}",
+            file=sys.stderr,
+            flush=True,
+        )
+        return []
+    return records_to_add
+
+
 def record_submission(*, path=None, **fields):
     """Start tracking a freshly enqueued job. Returns the record, or ``None``.
 
     A failure here must never fail the submit: by the time this runs the job is
     already on the queue host, so we warn and carry on rather than raise.
     """
-    record = build_submission_record(**fields)
-    if record is None:
+    if not fields.get("job_id"):
         return None
-    target = path or LEDGER_PATH
-    try:
-        with _mutating(target) as records:
-            records.append(record)
-    except OSError as exc:
-        print(
-            f"[WARN] could not record {record['job_id']} in {target}: {exc}",
-            file=sys.stderr,
-            flush=True,
-        )
-        return None
-    return record
+    recorded = record_submissions([fields], path=path)
+    return recorded[0] if recorded else None
 
 
 def apply_states(states, path=None):

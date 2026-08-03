@@ -7,6 +7,7 @@ S3 settings come from ``~/.awsqe/client/config.toml`` (managed via
 Resolution precedence is **CLI flag > env var > config > error**.
 """
 import argparse
+import glob
 import os
 import shutil
 import sys
@@ -69,8 +70,8 @@ from .config import (
     set_value,
     unset_value,
 )
-from .staging import sizeof_local_path_bytes, where_is_next_submit
-from .submit import archive_payload_to_temp, upload_payload_archive_to_s3
+from .staging import where_is_next_submit
+from .submit import prepare_payload, upload_payloads_parallel
 
 
 # ---------- helpers ----------
@@ -556,27 +557,19 @@ def cmd_submit_remote(args, command):
 
     payload_s3_uri = None
     payload_size_bytes = None
-    archive_path = None
     if args.payload:
         client_cfg = load_config()
-        bucket = effective_s3_bucket(client_cfg)
-        prefix = effective_s3_prefix(client_cfg)
-        payload_path = Path(args.payload).expanduser()
-        payload_size_bytes = sizeof_local_path_bytes(payload_path)
         try:
-            archive_path = archive_payload_to_temp(payload_path)
-            payload_s3_uri = upload_payload_archive_to_s3(
-                archive_path, payload_path.name, bucket=bucket, prefix=prefix,
+            prepared = prepare_payload(
+                args.payload,
+                bucket=effective_s3_bucket(client_cfg),
+                prefix=effective_s3_prefix(client_cfg),
             )
         except Exception as exc:
             print(f"Remote submit payload upload failed: {exc}", flush=True)
             sys.exit(1)
-        finally:
-            if archive_path:
-                try:
-                    archive_path.unlink()
-                except OSError:
-                    pass
+        payload_s3_uri = prepared["s3_uri"]
+        payload_size_bytes = prepared["size_bytes"]
 
     job_id = getattr(args, "job_id", None) or new_job_tag()
     queue_name = getattr(args, "queue", None) or getattr(args, "host_set", None) or DEFAULT_QUEUE
@@ -634,6 +627,201 @@ def cmd_submit_remote(args, command):
         array_id=array_id or "",
     )
     print(f"Submitted {job_id}", flush=True)
+
+
+def _mint_job_ids(count):
+    """`count` distinct job ids, minted up front.
+
+    Up front so ids follow directory order even though the uploads finish out
+    of order. Distinct because `new_job_tag` is a second-resolution timestamp
+    plus six hex characters: minting 105 inside one second carries a small but
+    real birthday collision, and a collision would put two ledger records and
+    two queue entries under one id, which `find_record` and `_resolve_job_ids`
+    both handle badly.
+    """
+    seen = set()
+    job_ids = []
+    while len(job_ids) < count:
+        tag = new_job_tag()
+        if tag in seen:
+            continue
+        seen.add(tag)
+        job_ids.append(tag)
+    return job_ids
+
+
+def _resolve_payload_glob(pattern):
+    """Directories matching `pattern`, sorted. Exits if it matches nothing.
+
+    Sorted so job ids follow directory order. Directories only: a payload is a
+    directory to archive, and silently submitting a job for a stray file that
+    happened to match `IDC*` would be worse than saying so.
+    """
+    expanded = os.path.expanduser(pattern)
+    matches = sorted(Path(hit) for hit in glob.glob(expanded) if os.path.isdir(hit))
+    if not matches:
+        skipped = [hit for hit in glob.glob(expanded) if not os.path.isdir(hit)]
+        detail = f" ({len(skipped)} non-directory match(es) ignored)" if skipped else ""
+        print(f"--payload-glob matched no directories: {pattern}{detail}", flush=True)
+        sys.exit(1)
+    return matches
+
+
+def _enqueue_many(args, jobs):
+    """`enqueue_many`, falling back to N x `enqueue` against an older host.
+
+    Re-asks for anything the host reports in `skipped`, the way
+    :func:`_job_info_batch` does, so a host with a smaller cap still gets the
+    whole batch.
+    """
+    results = []
+    pending = list(enumerate(jobs))
+    for _ in range(_MAX_BATCH_ROUNDS):
+        if not pending:
+            break
+        try:
+            result = _rpc_raw(args, "enqueue_many", {"jobs": [job for _, job in pending]})
+        except RpcError as exc:
+            if exc.code != "unknown_method":
+                raise
+            print(
+                f"[WARN] {args.queue_host} has no enqueue_many (older awsqe-host); "
+                f"falling back to {len(pending)} individual submit(s). Upgrade the host.",
+                file=sys.stderr,
+                flush=True,
+            )
+            for _index, job in pending:
+                results.append(_rpc_raw(args, "enqueue", job))
+            return results
+        results.extend(result.get("results") or [])
+        skipped = set(result.get("skipped") or [])
+        pending = [pending[i] for i in sorted(skipped) if i < len(pending)]
+    return results
+
+
+def _rpc_raw(args, method, params):
+    """`rpc_call` without the exit-on-error wrapper, so a batch can report."""
+    return rpc_call(args.queue_host, method, params)
+
+
+def cmd_submit_batch(args, command):
+    """`submit --payload-glob`: one process, one job per matched directory.
+
+    The shell loop this replaces pays 105 interpreter startups, 105 serial
+    tar-and-upload round trips and 105 SSH connections. Here the uploads run in
+    a pool, the enqueues share one connection, and the ledger is written once.
+    """
+    if args.hosts_file:
+        print("--hosts-file is not supported with --queue-host; host validation happens on the queue host.", flush=True)
+        sys.exit(1)
+
+    payloads = _resolve_payload_glob(args.payload_glob)
+    try:
+        # One invocation is exactly one batch, so the tag can be derived rather
+        # than typed. Timestamped, so it never collides with a hand-typed name
+        # or with an earlier run of the same glob.
+        array_id = validate_array_id(
+            getattr(args, "array", None)
+            or f"{_sanitized_glob_stem(args.payload_glob)}-{datetime.now():%Y%m%d-%H%M%S}"
+        )
+    except ValueError as exc:
+        print(f"--array: {exc}", flush=True)
+        sys.exit(2)
+
+    queue_name = getattr(args, "queue", None) or getattr(args, "host_set", None) or DEFAULT_QUEUE
+    hosts_param = _parse_cli_host_values(getattr(args, "hosts", None)) or None
+    job_ids = _mint_job_ids(len(payloads))
+
+    if args.dry_run:
+        print(f"Would submit {len(payloads)} job(s) as array {array_id} to queue {queue_name}:", flush=True)
+        for job_id, payload in zip(job_ids, payloads):
+            print(f"  {job_id}  {payload}", flush=True)
+        print(f"Command: {command}", flush=True)
+        return
+
+    client_cfg = load_config()
+    uploads = upload_payloads_parallel(
+        payloads,
+        bucket=effective_s3_bucket(client_cfg),
+        prefix=effective_s3_prefix(client_cfg),
+        max_workers=args.jobs,
+    )
+
+    ready, failed = [], []
+    for job_id, payload, upload in zip(job_ids, payloads, uploads):
+        if isinstance(upload, Exception):
+            failed.append((payload, upload))
+        else:
+            ready.append((job_id, payload, upload))
+
+    if not ready:
+        print(f"All {len(failed)} payload upload(s) failed; nothing was submitted.", flush=True)
+        for payload, exc in failed:
+            print(f"  {payload}: {exc}", flush=True)
+        sys.exit(1)
+
+    jobs = []
+    for job_id, _payload, upload in ready:
+        job = {
+            "cmd": command,
+            "queue": queue_name,
+            "job_id": job_id,
+            "preempt": bool(getattr(args, "preempt", False)),
+            "mps": bool(getattr(args, "mps", False)),
+            "payload_s3_uri": upload["s3_uri"],
+            "payload_size_bytes": upload["size_bytes"],
+            "array_id": array_id,
+        }
+        if hosts_param:
+            job["hosts"] = hosts_param
+        if args.priority is not None:
+            job["priority"] = args.priority
+        elif args.high_priority:
+            job["high_priority"] = True
+        jobs.append(job)
+
+    try:
+        results = _enqueue_many(args, jobs)
+    except RpcTransportError as exc:
+        print(f"RPC transport error talking to {args.queue_host}: {exc.detail}", flush=True, file=sys.stderr)
+        # The uploads already happened; say so rather than implying a clean slate.
+        print(f"{len(ready)} payload(s) are in S3 but nothing was enqueued.", flush=True, file=sys.stderr)
+        sys.exit(1)
+    except RpcError as exc:
+        print(f"RPC error from {args.queue_host}: {exc.code}: {exc.message}", flush=True, file=sys.stderr)
+        print(f"{len(ready)} payload(s) are in S3 but nothing was enqueued.", flush=True, file=sys.stderr)
+        sys.exit(1)
+
+    # One locked write for the whole batch, not one per job.
+    ledger.record_submissions([
+        {
+            "job_id": result.get("job_id") or job_id,
+            "queue_host": args.queue_host,
+            "queue": queue_name,
+            "cmd": command,
+            "payload": str(Path(payload).expanduser().resolve()),
+            "payload_s3_uri": upload["s3_uri"],
+            "array_id": array_id,
+            # Known here and only here: a shell loop never knows its own size.
+            "array_size": len(ready),
+        }
+        for (job_id, payload, upload), result in zip(ready, results)
+    ])
+
+    print(f"Submitted {len(results)} job(s) as array {array_id}.", flush=True)
+    if failed:
+        # Never rolled back: by now the successes are real jobs on the queue.
+        print(f"{len(failed)} payload(s) failed to upload and were NOT submitted:", flush=True)
+        for payload, exc in failed:
+            print(f"  {payload}: {exc}", flush=True)
+        sys.exit(1)
+
+
+def _sanitized_glob_stem(pattern):
+    """A usable array-name stem from a glob like ``IDC*`` or ``runs/IDC*``."""
+    stem = Path(pattern).name.replace("*", "").replace("?", "")
+    cleaned = "".join(ch if ch.isalnum() or ch in "._-" else "_" for ch in stem).strip("._-")
+    return cleaned or "batch"
 
 
 def cmd_tail(args):
@@ -1288,6 +1476,20 @@ def build_parser():
 
     p_submit = sub.add_parser("submit", help="Archive a payload, upload to S3, and enqueue on the queue host")
     p_submit.add_argument("--payload", "-p", default=None)
+    p_submit.add_argument(
+        "--payload-glob", default=None, metavar="PATTERN",
+        help="Submit one job per directory matching PATTERN, in one invocation: "
+             "uploads run in parallel and the enqueues share one connection. "
+             "Quote it so the shell doesn't expand it first.",
+    )
+    p_submit.add_argument(
+        "--jobs", "-j", type=int, default=None, metavar="N",
+        help="Parallel uploads for --payload-glob (default 4).",
+    )
+    p_submit.add_argument(
+        "--dry-run", action="store_true",
+        help="With --payload-glob, list what would be submitted and stop.",
+    )
     p_submit.add_argument("--hosts", action="append", default=None)
     p_submit.add_argument("--host-set", default=None)
     p_submit.add_argument("--queue", default=None)
@@ -1460,13 +1662,25 @@ def dispatch(args, parser=None):
         if not command:
             print("No command provided.", flush=True)
             sys.exit(1)
+        payload_glob = getattr(args, "payload_glob", None)
+        if payload_glob and args.payload:
+            print("--payload and --payload-glob cannot be combined; "
+                  "--payload-glob already submits one job per matched directory.", flush=True)
+            sys.exit(2)
         if args.payload:
             payload_path = Path(args.payload).expanduser()
             if not payload_path.exists():
                 print(f"Payload not found on local filesystem: {payload_path}", flush=True)
                 sys.exit(1)
+        if not payload_glob and getattr(args, "dry_run", False):
+            print("--dry-run applies to --payload-glob; a single submit has nothing to list.",
+                  flush=True)
+            sys.exit(2)
         _resolve_queue_host(args, "submit")
-        cmd_submit_remote(args, command)
+        if payload_glob:
+            cmd_submit_batch(args, command)
+        else:
+            cmd_submit_remote(args, command)
     elif cmd == "tail":
         cmd_tail(args)
     elif cmd == "stop":

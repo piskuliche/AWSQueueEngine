@@ -114,6 +114,8 @@ awsqe-client jobs                        # everything this machine submitted, ne
 awsqe-client jobs --status active        # still submitted, queued or running
 awsqe-client jobs --status failed --since 7d
 awsqe-client jobs --queue zeke-queue     # one queue (repeatable, comma-separated)
+awsqe-client submit --payload-glob 'IDC*' "cd \$PAYLOAD_DIR && python run.py"
+awsqe-client submit --payload-glob 'IDC*' --dry-run "..."   # list, submit nothing
 awsqe-client jobs --array ffpopt-IDC     # list one batch's jobs individually
 awsqe-client jobs --expand               # never collapse batches into one row
 awsqe-client jobs --no-refresh           # skip the queue-host round trip
@@ -332,10 +334,17 @@ submit and they collapse to one row:
 
 ```bash
 cd ffpopt
+awsqe-client submit --payload-glob 'IDC*' --queue production --priority -100 --mps \
+    "source ~/flowrc && cd \$PAYLOAD_DIR && python run_fe.py"
+```
+
+One invocation is one batch, so the tag is derived for you
+(`IDC-20260802-091402`); `--array NAME` overrides it. The equivalent shell loop
+still works and takes `--array` per job:
+
+```bash
 for IDC in IDC*; do
-    awsqe-client submit --queue production --priority -100 --mps \
-        --array ffpopt-IDC --payload "${PWD}/$IDC/" \
-        "source ~/flowrc && cd \$PAYLOAD_DIR && python run_fe.py"
+    awsqe-client submit --array ffpopt-IDC --payload "${PWD}/$IDC/" ... ;
 done
 ```
 
@@ -363,6 +372,21 @@ SUBMITTED             JOB                     STATUS      HOST      QUEUE       
   read the tracebacks out of a batch.
 - A batch that went to more than one queue shows `*` in the `QUEUE` column
   rather than picking one of them.
+
+`--payload-glob` does the loop inside one process, which is where the real cost
+was: 105 payloads submitted the old way meant 105 interpreter startups, 105
+serial tar-and-upload round trips to S3, and 105 separate SSH connections. Here
+the uploads run in a pool (`-j`, default 4), the enqueues share one connection,
+and the ledger is written once.
+
+- `--dry-run` lists what would be submitted and stops — cheap insurance before
+  firing 105 jobs at the queue.
+- Job ids are minted up front, so they follow directory order even though the
+  uploads finish out of order.
+- **Partial failure is reported, never rolled back.** If payload 60 of 105 fails
+  to upload, the other 104 are already real jobs on the queue; both sets are
+  printed by name and the exit status is non-zero so a driving script notices.
+- Only directories match; a stray file caught by `IDC*` is skipped.
 
 Names are letters, digits, `.`, `_` and `-`, up to 64 characters. An unusable
 name is **rejected** rather than quietly rewritten — unlike a queue name, an

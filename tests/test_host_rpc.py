@@ -2,6 +2,7 @@
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 from awsqueueengine.host import rpc
 from awsqueueengine.shared import queue as queue_mod
@@ -622,6 +623,107 @@ class EnqueueTests(_StateFixture):
         })
         self.assertFalse(resp["ok"])
         self.assertEqual(resp["error"]["code"], "invalid_params")
+
+    def test_enqueue_many_enqueues_the_whole_batch_in_order(self):
+        resp = rpc.dispatch({
+            "version": 1, "method": "enqueue_many",
+            "params": {"jobs": [
+                {"cmd": f"job {i}", "queue": "default", "job_id": f"J{i}"}
+                for i in range(3)
+            ]},
+        })
+        self.assertTrue(resp["ok"], resp)
+        self.assertEqual(resp["result"]["enqueued"], 3)
+        self.assertEqual([r["job_id"] for r in resp["result"]["results"]],
+                         ["J0", "J1", "J2"])
+        self.assertEqual([item["job_id"] for item in queue_mod.load_queue()],
+                         ["J0", "J1", "J2"])
+
+    def test_enqueue_many_writes_the_queue_once(self):
+        """The host has no lock around state mutation, so a batch doing one
+        read-modify-write instead of N shrinks that window rather than widening
+        it (issue #21)."""
+        with patch.object(queue_mod, "save_queue", wraps=queue_mod.save_queue) as save:
+            rpc.dispatch({
+                "version": 1, "method": "enqueue_many",
+                "params": {"jobs": [{"cmd": f"j{i}", "queue": "default"} for i in range(10)]},
+            })
+        self.assertEqual(save.call_count, 1)
+
+    def test_enqueue_many_is_all_or_nothing_on_a_bad_queue(self):
+        """Every job in a --payload-glob batch shares its --queue, so a bad one
+        is a whole-batch user error; half-enqueuing 105 jobs is the worst
+        available outcome."""
+        resp = rpc.dispatch({
+            "version": 1, "method": "enqueue_many",
+            "params": {"jobs": [
+                {"cmd": "ok", "queue": "default"},
+                {"cmd": "bad", "queue": "nope"},
+                {"cmd": "ok2", "queue": "default"},
+            ]},
+        })
+        self.assertFalse(resp["ok"])
+        self.assertEqual(resp["error"]["code"], "invalid_params")
+        self.assertIn("job 1", resp["error"]["message"])
+        self.assertIn("unknown queue", resp["error"]["message"])
+        self.assertEqual(queue_mod.load_queue(), [])
+
+    def test_enqueue_many_is_all_or_nothing_on_a_missing_command(self):
+        resp = rpc.dispatch({
+            "version": 1, "method": "enqueue_many",
+            "params": {"jobs": [{"cmd": "ok", "queue": "default"}, {"queue": "default"}]},
+        })
+        self.assertFalse(resp["ok"])
+        self.assertIn("job 1", resp["error"]["message"])
+        self.assertEqual(queue_mod.load_queue(), [])
+
+    def test_enqueue_many_carries_every_per_job_field(self):
+        resp = rpc.dispatch({
+            "version": 1, "method": "enqueue_many",
+            "params": {"jobs": [{
+                "cmd": "run", "queue": "fast", "job_id": "J", "array_id": "batch",
+                "hosts": ["eci10"], "priority": -100, "mps": True, "preempt": True,
+                "payload_s3_uri": "s3://b/k.tar.gz", "payload_size_bytes": 42,
+            }]},
+        })
+        self.assertTrue(resp["ok"], resp)
+        item = queue_mod.load_queue()[0]
+        self.assertEqual(item["array_id"], "batch")
+        self.assertEqual(item["hosts"], ["eci10"])
+        self.assertEqual(item["priority"], -100)
+        self.assertTrue(item["mps"])
+        self.assertEqual(item["payload_s3_uri"], "s3://b/k.tar.gz")
+        self.assertEqual(item["payload_size_bytes"], 42)
+
+    def test_enqueue_many_mints_ids_for_jobs_that_do_not_supply_one(self):
+        resp = rpc.dispatch({
+            "version": 1, "method": "enqueue_many",
+            "params": {"jobs": [{"cmd": "a", "queue": "default"},
+                                {"cmd": "b", "queue": "default"}]},
+        })
+        self.assertTrue(resp["ok"], resp)
+        job_ids = [r["job_id"] for r in resp["result"]["results"]]
+        self.assertTrue(all(job_ids))
+        self.assertEqual(len(set(job_ids)), 2)
+
+    def test_enqueue_many_names_the_overflow_rather_than_dropping_it(self):
+        with patch.object(rpc, "MAX_ENQUEUE_BATCH", 2):
+            resp = rpc.dispatch({
+                "version": 1, "method": "enqueue_many",
+                "params": {"jobs": [{"cmd": f"j{i}", "queue": "default"} for i in range(5)]},
+            })
+        self.assertTrue(resp["ok"], resp)
+        self.assertEqual(resp["result"]["enqueued"], 2)
+        self.assertEqual(resp["result"]["skipped"], [2, 3, 4])
+        self.assertEqual(len(queue_mod.load_queue()), 2)
+
+    def test_enqueue_many_rejects_a_non_list_or_empty_jobs_param(self):
+        for jobs in (None, "nope", {}, []):
+            resp = rpc.dispatch({
+                "version": 1, "method": "enqueue_many", "params": {"jobs": jobs},
+            })
+            self.assertFalse(resp["ok"], jobs)
+            self.assertEqual(resp["error"]["code"], "invalid_params")
 
     def test_enqueue_rejects_unknown_queue(self):
         resp = rpc.dispatch({

@@ -580,7 +580,7 @@ class CliSubmitTests(unittest.TestCase):
 
         from awsqueueengine.client import cli as client_cli
 
-        with patch("awsqueueengine.client.cli.upload_payload_archive_to_s3", return_value="s3://bucket/key.tar.gz") as upload, patch(
+        with patch("awsqueueengine.client.submit.upload_payload_archive_to_s3", return_value="s3://bucket/key.tar.gz") as upload, patch(
             "awsqueueengine.client.cli.rpc_call", side_effect=fake_rpc_call
         ):
             client_cli.cmd_submit_remote(Args(), "bash run.sh")
