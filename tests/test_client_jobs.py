@@ -13,6 +13,7 @@ from unittest.mock import patch
 
 from awsqueueengine.client import cli as client_cli
 from awsqueueengine.client import ledger as ledger_mod
+from awsqueueengine.client import logs as logs_mod
 from awsqueueengine.shared.protocol import RpcError, RpcTransportError
 
 
@@ -26,6 +27,8 @@ class _JobsArgs:
         self.until = None
         self.limit = 50
         self.no_refresh = False
+        self.fetch_logs = False
+        self.log = None
         self.forget = None
         self.forget_before = None
         self.queue_host = None
@@ -429,6 +432,161 @@ class ForgetTests(_LedgerFixture):
     def test_forget_makes_no_rpc_calls(self):
         self._submit("A")
         self._run(_JobsArgs(forget=["A"]))   # rpc=None raises if called
+
+
+class FetchLogsTests(_LedgerFixture):
+    """`jobs --fetch-logs` / `--log`, with scp stubbed out."""
+
+    def setUp(self):
+        super().setUp()
+        self.logroot = Path(self.tmpdir.name) / "logs"
+        self._orig_logdir = logs_mod.LOG_DIR
+        logs_mod.LOG_DIR = self.logroot
+
+    def tearDown(self):
+        logs_mod.LOG_DIR = self._orig_logdir
+        super().tearDown()
+
+    def _finished(self, job_id, *, host="eci7", status="completed"):
+        self._submit(job_id)
+        ledger_mod.apply_state(job_id, {"status": status, "host": host,
+                                        "finished_at": "2026-07-31 18:10:14"})
+
+    def _run_with_scp(self, args, *, returncode=0, stderr="", body="log body\n"):
+        calls = []
+
+        def fake_fetch(job_id, host, *, dest=None, root=None, timeout=None, runner=None):
+            calls.append((job_id, host))
+            if returncode == 0:
+                path = logs_mod.local_log_path(job_id, root=root)
+                path.parent.mkdir(parents=True, exist_ok=True)
+                path.write_text(body)
+                return {"ok": True, "path": str(path), "reason": "", "detail": ""}
+            lowered = stderr.lower()
+            reason = "missing" if "no such file" in lowered else "error"
+            return {"ok": False, "path": None, "reason": reason, "detail": stderr}
+
+        out, err = io.StringIO(), io.StringIO()
+        with patch.object(logs_mod, "fetch_log", side_effect=fake_fetch), \
+             patch.object(logs_mod, "scp_available", return_value=True), \
+             patch("awsqueueengine.client.cli.rpc_call",
+                   side_effect=RuntimeError("unexpected RPC")), \
+             patch("awsqueueengine.client.cli.effective_queue_host", return_value=None):
+            with redirect_stdout(out), redirect_stderr(err):
+                client_cli.cmd_jobs(args)
+        return out.getvalue(), err.getvalue(), calls
+
+    def test_parser_wires_the_flags(self):
+        args = client_cli.build_parser().parse_args(["jobs", "--fetch-logs"])
+        self.assertTrue(args.fetch_logs)
+        args = client_cli.build_parser().parse_args(["jobs", "--log", "JOB-A"])
+        self.assertEqual(args.log, "JOB-A")
+
+    def test_fetch_logs_pulls_and_records_the_path(self):
+        self._finished("J1")
+        out, _, calls = self._run_with_scp(_JobsArgs(no_refresh=True, fetch_logs=True))
+        self.assertEqual(calls, [("J1", "eci7")])
+        record = ledger_mod.load_ledger()[0]
+        self.assertTrue(record["log_path"].endswith("J1.log"))
+        self.assertIn("log: ", out)
+
+    def test_second_run_does_not_refetch_a_cached_log(self):
+        self._finished("J1")
+        self._run_with_scp(_JobsArgs(no_refresh=True, fetch_logs=True))
+        _, _, calls = self._run_with_scp(_JobsArgs(no_refresh=True, fetch_logs=True))
+        self.assertEqual(calls, [])
+
+    def test_a_rerun_invalidates_the_cache(self):
+        self._finished("J1", host="eci3")
+        self._run_with_scp(_JobsArgs(no_refresh=True, fetch_logs=True))
+        # Requeued onto another worker: same job id, different attempt.
+        ledger_mod.apply_state("J1", {"status": "failed", "host": "eci7",
+                                      "finished_at": "2026-08-01 09:00:00"})
+        _, _, calls = self._run_with_scp(_JobsArgs(no_refresh=True, fetch_logs=True))
+        self.assertEqual(calls, [("J1", "eci7")])
+
+    def test_running_jobs_are_refetched_every_time(self):
+        self._finished("J1", status="running")
+        self._run_with_scp(_JobsArgs(no_refresh=True, fetch_logs=True))
+        _, _, calls = self._run_with_scp(_JobsArgs(no_refresh=True, fetch_logs=True))
+        self.assertEqual(calls, [("J1", "eci7")])
+
+    def test_a_vanished_remote_log_is_remembered_and_not_retried(self):
+        self._finished("J1")
+        _, err, _ = self._run_with_scp(
+            _JobsArgs(no_refresh=True, fetch_logs=True),
+            returncode=1, stderr="scp: /home/ubuntu/manager_jobs/J1.log: No such file or directory",
+        )
+        self.assertIn("no log left on eci7", err)
+        _, _, calls = self._run_with_scp(_JobsArgs(no_refresh=True, fetch_logs=True))
+        self.assertEqual(calls, [], "a known-missing log must not be re-requested")
+
+    def test_a_transfer_error_is_warned_but_retried_next_time(self):
+        self._finished("J1")
+        _, err, _ = self._run_with_scp(
+            _JobsArgs(no_refresh=True, fetch_logs=True),
+            returncode=255, stderr="ssh: Could not resolve hostname eci7",
+        )
+        self.assertIn("could not fetch log", err)
+        _, _, calls = self._run_with_scp(_JobsArgs(no_refresh=True, fetch_logs=True))
+        self.assertEqual(calls, [("J1", "eci7")])
+
+    def test_fetching_is_scoped_to_the_displayed_rows_not_the_whole_ledger(self):
+        for i in range(5):
+            self._finished(f"J{i}")
+        _, _, calls = self._run_with_scp(_JobsArgs(no_refresh=True, fetch_logs=True, limit=2))
+        self.assertEqual(len(calls), 2)
+
+    def test_queued_jobs_with_no_worker_are_skipped(self):
+        self._submit("QUEUED")
+        ledger_mod.apply_state("QUEUED", {"status": "queued", "queue_position": 1})
+        _, _, calls = self._run_with_scp(_JobsArgs(no_refresh=True, fetch_logs=True))
+        self.assertEqual(calls, [])
+
+    def test_no_log_line_rendered_when_nothing_was_fetched(self):
+        self._finished("J1")
+        out, _, _ = self._run_with_scp(_JobsArgs(no_refresh=True))
+        self.assertNotIn("log: ", out)
+
+    def test_log_flag_prints_a_bare_path_for_piping(self):
+        self._finished("J1")
+        out, _, calls = self._run_with_scp(_JobsArgs(log="J1"))
+        self.assertEqual(calls, [("J1", "eci7")])
+        self.assertEqual(out.strip(), str(logs_mod.local_log_path("J1", root=self.logroot)))
+
+    def test_log_flag_accepts_a_prefix(self):
+        self._finished("20260731-181013-cfd2e8")
+        out, _, _ = self._run_with_scp(_JobsArgs(log="20260731-1810"))
+        self.assertIn("20260731-181013-cfd2e8.log", out)
+
+    def test_log_flag_on_an_unknown_job_exits_1(self):
+        with self.assertRaises(SystemExit) as ctx:
+            self._run_with_scp(_JobsArgs(log="NOPE"))
+        self.assertEqual(ctx.exception.code, 1)
+
+    def test_log_flag_on_a_job_with_no_worker_exits_1(self):
+        self._submit("QUEUED")
+        with self.assertRaises(SystemExit) as ctx:
+            self._run_with_scp(_JobsArgs(log="QUEUED"))
+        self.assertEqual(ctx.exception.code, 1)
+
+    def test_missing_scp_warns_once_and_does_not_crash(self):
+        self._finished("J1")
+        out, err = io.StringIO(), io.StringIO()
+        with patch.object(logs_mod, "scp_available", return_value=False), \
+             patch("awsqueueengine.client.cli.effective_queue_host", return_value=None):
+            with redirect_stdout(out), redirect_stderr(err):
+                client_cli.cmd_jobs(_JobsArgs(no_refresh=True, fetch_logs=True))
+        self.assertIn("not found on PATH", err.getvalue())
+        self.assertIn("J1", out.getvalue())
+
+    def test_forget_deletes_the_cached_log(self):
+        self._finished("J1")
+        self._run_with_scp(_JobsArgs(no_refresh=True, fetch_logs=True))
+        cached = logs_mod.local_log_path("J1", root=self.logroot)
+        self.assertTrue(cached.exists())
+        self._run(_JobsArgs(forget=["J1"]))
+        self.assertFalse(cached.exists(), "a forgotten job must not leave an orphan log")
 
 
 class SubmitLedgerTests(_LedgerFixture):

@@ -49,6 +49,7 @@ from ..shared.timespec import parse_time_spec
 from ..shared.worker_actions import kill_managed_on_host, new_job_tag, tail_remote_log
 from . import config as client_config
 from . import ledger
+from . import logs as job_logs
 from .config import (
     CONFIG_PATH,
     KEY_SCHEMA,
@@ -314,6 +315,10 @@ def _render_tracked_jobs(records, total=None):
                 f"(see `awsqe-client failed --job-id {job_id} --log`)",
                 flush=True,
             )
+        # Only present once the log has actually been fetched, so this stays
+        # quiet for anyone not using --fetch-logs.
+        if record.get("log_path"):
+            print(f"{'':20}  log: {record['log_path']}", flush=True)
     if total is not None and total != len(records):
         print(f"{len(records)} of {total} tracked job(s).", flush=True)
 
@@ -696,6 +701,70 @@ def cmd_failed_remote(args):
     _render_failed_jobs(result.get("jobs") or [], show_log=bool(args.log))
 
 
+def fetch_tracked_logs(records):
+    """Pull worker logs for the given records. Returns ``(fetched, [warning, ...])``.
+
+    One scp per job, so callers pass the *displayed* slice rather than the whole
+    ledger — fetching 2000 logs because you listed 50 rows would be a nasty
+    surprise. Never raises: a log you can't get is a warning, not a failure of
+    the listing.
+    """
+    wanted = [r for r in records if job_logs.should_fetch(r)]
+    if not wanted:
+        return 0, []
+    if not job_logs.scp_available():
+        job_logs.warn_no_scp()
+        return 0, []
+
+    fetched = 0
+    warnings = []
+    for record in wanted:
+        job_id, host = record["job_id"], record["host"]
+        result = job_logs.fetch_log(job_id, host)
+        key = job_logs.cache_key(record)
+        if result["ok"]:
+            ledger.record_log_result(job_id, log_path=result["path"], fetched_for=key)
+            fetched += 1
+        elif result["reason"] == "missing":
+            # Remember it, keyed to this attempt, so we stop asking. A requeue
+            # changes the key and we look again.
+            ledger.record_log_result(job_id, missing_for=key)
+            warnings.append(f"{job_id}: no log left on {host} (worker recycled or cleaned)")
+        else:
+            warnings.append(f"{job_id}: could not fetch log from {host}: {result['detail']}")
+    job_logs.prune_log_cache()
+    return fetched, warnings
+
+
+def _show_one_log(args, records):
+    """`jobs --log <job-id>`: print the local path, fetching it if needed."""
+    try:
+        record = ledger.find_record(args.log, records=records)
+    except ledger.LedgerSelectionError as exc:
+        print(exc.message, flush=True)
+        sys.exit(1)
+    if record is None:
+        print(f"no tracked job matching: {args.log}", flush=True)
+        sys.exit(1)
+    if not record.get("host"):
+        print(
+            f"{record['job_id']} has no worker recorded yet (status "
+            f"{record.get('status')}); nothing to fetch.",
+            flush=True,
+        )
+        sys.exit(1)
+
+    if job_logs.should_fetch(record):
+        _, warnings = fetch_tracked_logs([record])
+        for warning in warnings:
+            print(f"[WARN] {warning}", file=sys.stderr, flush=True)
+        record = ledger.find_record(record["job_id"]) or record
+    if not record.get("log_path"):
+        sys.exit(1)
+    # Bare path on stdout so it composes: less "$(awsqe-client jobs --log X)"
+    print(record["log_path"], flush=True)
+
+
 def _parse_time_arg(text, flag, *, end_of_day=False):
     try:
         return parse_time_spec(text, end_of_day=end_of_day)
@@ -762,7 +831,14 @@ def _forget_tracked_jobs(args, records):
                 flush=True,
             )
 
+    # Capture the ids being dropped by date before they're gone, so their
+    # cached logs go too rather than lingering as orphans.
+    dropped = {r["job_id"] for r in resolved}
+    if before is not None:
+        dropped |= {r["job_id"] for r in records if r["submitted_at"] < before}
+
     removed = ledger.forget(job_ids=[r["job_id"] for r in resolved], before=before)
+    job_logs.forget_logs(dropped)
     print(f"Forgot {removed} tracked job(s).", flush=True)
 
 
@@ -771,6 +847,9 @@ def cmd_jobs(args):
 
     if args.forget or args.forget_before:
         _forget_tracked_jobs(args, records)
+        return
+    if getattr(args, "log", None):
+        _show_one_log(args, records)
         return
 
     try:
@@ -796,11 +875,18 @@ def cmd_jobs(args):
         if states and ledger.apply_states(states):
             records = ledger.load_ledger()
 
-    _render_tracked_jobs(
-        ledger.filter_records(records, statuses=statuses, queues=queues,
-                              since=since, until=until, limit=args.limit),
-        total=len(records),
-    )
+    selected = ledger.filter_records(records, statuses=statuses, queues=queues,
+                                     since=since, until=until, limit=args.limit)
+
+    if getattr(args, "fetch_logs", False) and selected:
+        # Scoped to what's on screen, not the whole ledger.
+        _, warnings = fetch_tracked_logs(selected)
+        for warning in warnings:
+            print(f"[WARN] {warning}", file=sys.stderr, flush=True)
+        by_id = {r["job_id"]: r for r in ledger.load_ledger()}
+        selected = [by_id.get(r["job_id"], r) for r in selected]
+
+    _render_tracked_jobs(selected, total=len(records))
 
 
 def cmd_qdel_remote(args):
@@ -1069,6 +1155,15 @@ def build_parser():
     p_jobs.add_argument(
         "--no-refresh", action="store_true",
         help="Show recorded state without querying the queue host",
+    )
+    p_jobs.add_argument(
+        "--fetch-logs", action="store_true",
+        help="Copy each displayed job's log off its worker (skipping any already "
+             "cached) and show the local path.",
+    )
+    p_jobs.add_argument(
+        "--log", default=None, metavar="JOB_ID",
+        help="Print the local path to one job's log, fetching it first if needed.",
     )
     p_jobs.add_argument(
         "--forget", action="append", default=None, metavar="JOB_ID",

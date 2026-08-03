@@ -156,6 +156,8 @@ write no ``run.info`` anywhere).
    awsqe-client jobs --queue zeke-queue        # one queue
    awsqe-client jobs --queue gpu,bigmem        # several
    awsqe-client jobs --no-refresh             # local state only, no SSH
+   awsqe-client jobs --fetch-logs             # pull shown jobs' logs off their workers
+   awsqe-client jobs --log 20260730-1415      # print the local path to one log
    awsqe-client jobs -n 10                    # ten most recent (0 for all)
    awsqe-client jobs --forget 20260730-1415   # stop tracking; does NOT cancel
    awsqe-client jobs --forget-before 2026-01-01
@@ -181,6 +183,22 @@ The ledger is per machine and holds 2000 jobs, evicting only the oldest
 *finished* ones. An unreachable queue host degrades to last-known statuses with
 a warning rather than an error, and a queue host predating the batched lookup
 falls back to one round trip per job.
+
+``--fetch-logs`` copies each displayed job's log from the worker that ran it
+into ``~/.awsqe/client/logs/``, going client-to-worker over ``scp`` rather than
+through the queue host. It is opt-in (one connection per job) and scoped to the
+displayed rows. The cache is keyed on the worker and finish time, so a requeued
+job re-fetches instead of serving the previous attempt, and running jobs are
+always re-fetched. A log the worker no longer has is recorded as such so it is
+not retried on every run. The cache is capped at 512 MB.
+
+.. warning::
+
+   The exit status recorded for a job is the **shell's** exit status, which for
+   a ``;``-chained command is the status of the *last* one. ``python run.py;
+   rm -rf $PAYLOAD_DIR`` reports success whenever the ``rm`` succeeds, even if
+   the job crashed. Use ``&&`` between the steps, or capture the status
+   (``rc=$?``) before the cleanup and ``exit $rc``.
 
 Queue Targeting
 ---------------

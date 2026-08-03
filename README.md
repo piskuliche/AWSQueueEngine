@@ -115,6 +115,8 @@ awsqe-client jobs --status active        # still submitted, queued or running
 awsqe-client jobs --status failed --since 7d
 awsqe-client jobs --queue zeke-queue     # one queue (repeatable, comma-separated)
 awsqe-client jobs --no-refresh           # skip the queue-host round trip
+awsqe-client jobs --fetch-logs           # pull each shown job's log off its worker
+awsqe-client jobs --log 20260730-1415    # print the local path to one job's log
 awsqe-client jobs --forget 20260730-1415 # stop tracking (does NOT cancel)
 awsqe-client info --job-id 20260730-1415 # refresh one job without a payload dir
 
@@ -225,6 +227,36 @@ the jobs in flight across one upgrade.
 
 The failure history is capped at the 1000 most recent records.
 
+#### Your command's exit status is what gets recorded
+
+The status written to `<job_id>.rc` is the **shell's** exit status, which with
+`;`-chained commands is the status of the *last* one. A trailing cleanup step
+therefore hides whatever went wrong before it:
+
+```bash
+# python fails (exit 1), rm succeeds (exit 0) -> the shell exits 0
+# -> recorded as COMPLETED, no failure record, no alert
+cd $PAYLOAD_DIR; python run_fe.py; rm -rf $PAYLOAD_DIR
+```
+
+Chain with `&&` instead. The status is then the first failure's, and the payload
+directory survives for you to inspect:
+
+```bash
+cd $PAYLOAD_DIR && python run_fe.py && rm -rf $PAYLOAD_DIR
+```
+
+If cleanup has to happen either way, capture the status first:
+
+```bash
+cd $PAYLOAD_DIR; python run_fe.py; rc=$?; rm -rf $PAYLOAD_DIR; exit $rc
+```
+
+Nothing on the queue host can detect this — a shell that exits 0 finished
+successfully as far as any caller can tell. `awsqe-client jobs --fetch-logs` is
+the practical check: pull the logs and look for tracebacks in jobs that claim to
+have completed.
+
 ### Tracked jobs
 
 `list`, `qstat` and `failed` are **global** views: the queue host records no
@@ -282,6 +314,39 @@ Filters:
   **your** local timezone. As an upper bound a bare date means the *end* of
   that day, so `--until 2026-07-30` includes the 30th.
 - `--limit` / `-n` caps the rows (default 50; `0` for all).
+
+#### Job logs
+
+`--fetch-logs` copies each displayed job's log off the worker that ran it into
+`~/.awsqe/client/logs/<job_id>.log`, and prints the local path under the row:
+
+```
+2026-08-01 10:51:39   20260731-181013-cfd2e8  completed   eci3      production    00:00:06  python run_fe.py
+                      log: /home/you/.awsqe/client/logs/20260731-181013-cfd2e8.log
+```
+
+`awsqe-client jobs --log <id-or-prefix>` prints just the path, fetching first if
+needed, so it composes: `less "$(awsqe-client jobs --log 20260731-1810)"`.
+
+Fetching goes **client → worker** over `scp`, not through the queue host, so it
+needs SSH access to the ecis (the same access `awsqe-client tail`/`stop`/`status`
+already assume). It's opt-in because it costs one connection per job, and it's
+scoped to the rows actually displayed — `-n 5 --fetch-logs` fetches five logs,
+not your whole history.
+
+Already-fetched logs are skipped, but the cache is keyed on **which worker and
+which finish time**, not just the job id. A requeued job truncates its log and
+may land on a different worker, so a rerun re-fetches rather than serving the
+previous attempt. Running jobs are always re-fetched, since their log is still
+being written. When a worker no longer has the log — recycled, or
+`manager_jobs` cleaned — that's recorded so it isn't retried every run:
+
+```
+[WARN] 19990101-000000-deadbe: no log left on eci3 (worker recycled or cleaned)
+```
+
+The cache is capped at 512 MB, dropping the oldest first, and `--forget` deletes
+a job's cached log along with its ledger entry.
 
 The ledger holds 2000 jobs, dropping the oldest *finished* ones past that —
 jobs still in flight are never evicted. `--forget <job-id-or-prefix>` and

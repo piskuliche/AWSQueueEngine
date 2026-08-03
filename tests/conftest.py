@@ -19,14 +19,18 @@ from pathlib import Path
 import pytest
 
 from awsqueueengine.client import ledger as ledger_mod
+from awsqueueengine.client import logs as logs_mod
 
 
 @pytest.fixture(autouse=True)
 def _never_touch_the_real_ledger():
-    original = ledger_mod.LEDGER_PATH
+    original_ledger = ledger_mod.LEDGER_PATH
+    original_logs = logs_mod.LOG_DIR
     with tempfile.TemporaryDirectory() as tmp:
         ledger_mod.LEDGER_PATH = Path(tmp) / "jobs.json"
+        logs_mod.LOG_DIR = Path(tmp) / "logs"
         try:
             yield
         finally:
-            ledger_mod.LEDGER_PATH = original
+            ledger_mod.LEDGER_PATH = original_ledger
+            logs_mod.LOG_DIR = original_logs

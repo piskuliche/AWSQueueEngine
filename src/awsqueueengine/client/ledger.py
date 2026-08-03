@@ -272,6 +272,34 @@ def apply_state(job_id, state, path=None):
     return bool(job_id) and apply_states({job_id: state}, path=path) > 0
 
 
+def record_log_result(job_id, *, log_path=None, fetched_for=None, missing_for=None, path=None):
+    """Remember the outcome of a log fetch against a tracked job.
+
+    `fetched_for` / `missing_for` carry the attempt identity (see
+    ``logs.cache_key``) so a requeue invalidates both the cached copy and the
+    "there is no log" answer, rather than either sticking forever.
+    """
+    if not job_id:
+        return False
+    changed = False
+    try:
+        with _mutating(path) as records:
+            for record in records:
+                if record["job_id"] != job_id:
+                    continue
+                if log_path:
+                    record["log_path"] = str(log_path)
+                    record["log_fetched_for"] = fetched_for
+                    record.pop("log_missing_for", None)
+                elif missing_for:
+                    record["log_missing_for"] = missing_for
+                changed = True
+    except OSError as exc:
+        print(f"[WARN] could not update {path or LEDGER_PATH}: {exc}", file=sys.stderr, flush=True)
+        return False
+    return changed
+
+
 def mark_status(job_ids, status, path=None):
     """Force a status onto tracked records. Returns how many changed."""
     wanted = {job_id for job_id in (job_ids or []) if job_id}
