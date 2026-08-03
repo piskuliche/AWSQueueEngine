@@ -1,5 +1,7 @@
 SPHINXBUILD ?= sphinx-build
-SPHINXOPTS  ?=
+# Warnings are errors. A renamed or deleted module silently emptied the API
+# reference once already; this is what stops it happening again.
+SPHINXOPTS  ?= -W
 SOURCEDIR    = .
 BUILDDIR     = _build
 
