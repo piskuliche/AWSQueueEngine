@@ -10,20 +10,31 @@ import unittest
 from pathlib import Path
 from unittest.mock import patch
 
+from awsqueueengine.client import ledger as ledger_mod
+
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 # Phase 5 moved state files under ~/.awsqe/host/. The subprocess tests below
 # point HOME at a tempdir, so the daemon writes/reads them at <tempdir>/.awsqe/host/.
 QUEUE_FILE_REL = Path(".awsqe") / "host" / "queue.json"
 RUNNING_FILE_REL = Path(".awsqe") / "host" / "running.json"
+# The client's own tracked-job ledger, alongside its config.
+LEDGER_FILE_REL = Path(".awsqe") / "client" / "jobs.json"
 
 
 class CliSubmitTests(unittest.TestCase):
     def setUp(self):
         self.tmpdir = tempfile.TemporaryDirectory()
         self.home_path = Path(self.tmpdir.name)
+        # Only the subprocess helpers below override $HOME; the in-process
+        # tests call client CLI handlers directly, and those now touch the
+        # tracked-job ledger. Without this they would write to the developer's
+        # real ~/.awsqe/client/jobs.json.
+        self._original_ledger = ledger_mod.LEDGER_PATH
+        ledger_mod.LEDGER_PATH = self.home_path / ".awsqe" / "client" / "jobs.json"
 
     def tearDown(self):
+        ledger_mod.LEDGER_PATH = self._original_ledger
         self.tmpdir.cleanup()
 
     def _run_cli(self, *args, env_extra=None):
@@ -369,6 +380,57 @@ class CliSubmitTests(unittest.TestCase):
         self.assertEqual(params["cmd"], "echo hello world")
         self.assertEqual(params["hosts"], ["eci17"])
         self.assertEqual(params["priority"], 5)
+
+    def _read_ledger(self):
+        ledger_file = self.home_path / LEDGER_FILE_REL
+        if not ledger_file.exists():
+            return []
+        return json.loads(ledger_file.read_text())["jobs"]
+
+    def test_remote_submit_records_the_job_in_the_client_ledger(self):
+        """End-to-end through a real process, so ~/.awsqe/client/jobs.json is resolved for real."""
+        capture_path = self.home_path / "ssh_args.txt"
+        stdin_path = self.home_path / "ssh_stdin.txt"
+        fake_ssh_dir = self._make_fake_ssh_rpc(
+            capture_path, stdin_path,
+            result={"job_id": "JOB-42", "queue": "gpu", "hosts": ["eci17"]},
+        )
+
+        res = self._run_cli_with_path_prefix(
+            fake_ssh_dir, "submit", "--queue-host", "queuebox", "--queue", "gpu",
+            "echo", "hello world",
+        )
+
+        self.assertEqual(res.returncode, 0)
+        tracked = self._read_ledger()
+        self.assertEqual(len(tracked), 1)
+        self.assertEqual(tracked[0]["job_id"], "JOB-42")
+        self.assertEqual(tracked[0]["queue_host"], "queuebox")
+        self.assertEqual(tracked[0]["queue"], "gpu")
+        self.assertEqual(tracked[0]["cmd"], "echo hello world")
+        self.assertEqual(tracked[0]["status"], "submitted")
+        self.assertEqual(tracked[0]["payload"], "")
+
+    def test_payloadless_submit_is_tracked_even_though_it_writes_no_run_info(self):
+        """The gap this closes: without --payload there was previously no record at all."""
+        capture_path = self.home_path / "ssh_args.txt"
+        stdin_path = self.home_path / "ssh_stdin.txt"
+        fake_ssh_dir = self._make_fake_ssh_rpc(
+            capture_path, stdin_path, result={"job_id": "JOB-NP", "queue": "default"},
+        )
+
+        res = self._run_cli_with_path_prefix(
+            fake_ssh_dir, "submit", "--queue-host", "queuebox", "sleep", "300",
+        )
+
+        self.assertEqual(res.returncode, 0)
+        self.assertEqual([r["job_id"] for r in self._read_ledger()], ["JOB-NP"])
+
+    def test_local_submit_does_not_touch_the_client_ledger(self):
+        """A host-side submit isn't this client's job to track."""
+        res = self._run_cli("submit", "echo", "hello")
+        self.assertEqual(res.returncode, 0)
+        self.assertEqual(self._read_ledger(), [])
 
     def test_remote_submit_forwards_mps_flag_over_ssh(self):
         capture_path = self.home_path / "ssh_args.txt"

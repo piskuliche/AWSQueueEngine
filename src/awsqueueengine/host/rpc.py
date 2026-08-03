@@ -17,7 +17,11 @@ from ..shared.deferred_state import (
     pop_deferred_by_indices,
 )
 from ..shared.failure_state import load_failed_jobs
-from ..shared.job_lookup import enrich_selection_message, lookup_job_state
+from ..shared.job_lookup import (
+    enrich_selection_message,
+    lookup_job_state,
+    lookup_job_states,
+)
 from ..shared.protocol import (
     PROTOCOL_VERSION,
     RpcError,
@@ -41,6 +45,12 @@ from ..shared.queue_config import (
 from ..shared.running_state import load_running_jobs
 from ..shared.worker_actions import new_job_tag, tail_remote_log
 from .monitor import clear_host_cooldowns, get_host_cooldowns
+
+
+#: Ceiling on how many job ids one `job_info_batch` call will resolve. The
+#: request arrives on stdin rather than argv, so ARG_MAX doesn't apply; this is
+#: about bounding the response, which runs ~300 bytes per resolved job.
+MAX_JOB_INFO_BATCH = 500
 
 
 # ---------- helpers ----------
@@ -303,6 +313,28 @@ def handle_job_info(params: dict) -> dict:
     return {"state": state}
 
 
+def handle_job_info_batch(params: dict) -> dict:
+    """Resolve many job ids in one round trip, for the client's tracked-job list.
+
+    ``states`` holds an entry for every id we processed, with an explicit
+    ``null`` for ids the host has no record of — so the client can tell "not
+    found" from "the host didn't answer for this one".
+    """
+    params = _require_dict(params)
+    job_ids = _optional_string_list(params, "job_ids") or []
+    # _optional_string_list drops blanks but doesn't strip, and _require_str's
+    # convention is that a param is its stripped value.
+    cleaned = [job_id.strip() for job_id in job_ids if job_id.strip()]
+    if not cleaned:
+        raise RpcError("invalid_params", "job_ids must be a non-empty list of strings")
+    unique = list(dict.fromkeys(cleaned))
+    accepted, skipped = unique[:MAX_JOB_INFO_BATCH], unique[MAX_JOB_INFO_BATCH:]
+    # Unlike the row/line clamps elsewhere in this module, silently dropping
+    # part of a *set* of ids would look like "the host has no record of those".
+    # Name them so the client can re-ask.
+    return {"states": lookup_job_states(accepted), "skipped": skipped}
+
+
 def handle_tail(params: dict) -> dict:
     params = _require_dict(params)
     host = _require_str(params, "host")
@@ -368,6 +400,7 @@ METHODS: dict[str, Callable[[dict], dict]] = {
     "list_cooldowns": handle_list_cooldowns,
     "enable_host": handle_enable_host,
     "job_info": handle_job_info,
+    "job_info_batch": handle_job_info_batch,
     "tail": handle_tail,
     "stats": handle_stats,
 }

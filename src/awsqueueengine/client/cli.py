@@ -8,6 +8,7 @@ Resolution precedence is **CLI flag > env var > config > error**.
 """
 import argparse
 import os
+import shutil
 import sys
 from datetime import datetime
 from pathlib import Path
@@ -22,6 +23,14 @@ from ..shared.cli_utils import (
 from ..shared.config import HOSTS, HOSTS_FILE
 from ..shared.host_status import status_all
 from ..shared.job_lookup import lookup_job_state
+from ..shared.job_status import (
+    ALL_STATUSES,
+    DELETED,
+    FAILED,
+    QUEUED,
+    expand_status_filter,
+    is_terminal,
+)
 from ..shared.protocol import RpcError, RpcTransportError
 from ..shared.queue_config import (
     DEFAULT_QUEUE,
@@ -37,8 +46,11 @@ from ..shared.run_info import (
     write_local_run_info,
     write_run_info_file,
 )
+from ..shared.timespec import parse_time_spec
 from ..shared.worker_actions import kill_managed_on_host, new_job_tag, tail_remote_log
 from . import config as client_config
+from . import ledger
+from . import logs as job_logs
 from .config import (
     CONFIG_PATH,
     KEY_SCHEMA,
@@ -266,6 +278,141 @@ def _render_failed_jobs(jobs, show_log=False):
                 print(f"{'':20}  |  {line}", flush=True)
 
 
+def _tracked_dur_text(record):
+    """One column doing double duty: elapsed for finished jobs, position for queued.
+
+    Running jobs get "-": the host reports ``started_at`` as preformatted text
+    in *its* timezone, so the client can't subtract it from its own clock.
+    """
+    if record.get("status") == QUEUED:
+        position = record.get("queue_position")
+        return f"q#{position}" if position else "-"
+    return record.get("duration") or "-"
+
+
+def _render_tracked_jobs(records, total=None):
+    if not records:
+        # "did my filter match nothing" and "have I submitted anything" are
+        # different questions; answer whichever one was asked.
+        print("(no tracked jobs)" if not total else "(no tracked jobs match the filter)", flush=True)
+        return
+    print(
+        f"{'SUBMITTED':20}  {'JOB':22}  {'STATUS':10}  {'HOST':8}  {'QUEUE':12}  {'DUR':8}  CMD",
+        flush=True,
+    )
+    for record in records:
+        job_id = record.get("job_id") or "-"
+        print(
+            f"{(format_epoch(record.get('submitted_at')) or '-'):20}  {job_id:22}  "
+            f"{(record.get('status') or '-')[:10]:10}  {(record.get('host') or '-')[:8]:8}  "
+            f"{(record.get('queue') or '-')[:12]:12}  {_tracked_dur_text(record)[:8]:8}  "
+            f"{str(record.get('cmd') or '')}",
+            flush=True,
+        )
+        if record.get("status") == FAILED:
+            exit_text = record.get("exit_code") or "-"
+            print(
+                f"{'':20}  -> {record.get('failure_reason') or 'unknown'} exit={exit_text} "
+                f"(see `awsqe-client failed --job-id {job_id} --log`)",
+                flush=True,
+            )
+        # Only present once the log has actually been fetched, so this stays
+        # quiet for anyone not using --fetch-logs.
+        if record.get("log_path"):
+            print(f"{'':20}  log: {record['log_path']}", flush=True)
+    if total is not None and total != len(records):
+        print(f"{len(records)} of {total} tracked job(s).", flush=True)
+
+
+# ---------- tracked-job refresh ----------
+
+#: A host with a smaller batch cap than ours answers with the remainder in
+#: `skipped`; re-ask until it stops, but never spin.
+_MAX_BATCH_ROUNDS = 20
+
+
+def _job_info_one_by_one(host, job_ids):
+    """N x `job_info`, for a queue host predating `job_info_batch`.
+
+    An application error for one job is that job's answer; a transport error
+    means ssh itself is broken, so it propagates rather than retrying 200 more.
+    """
+    states = {}
+    for job_id in job_ids:
+        try:
+            states[job_id] = rpc_call(host, "job_info", {"job_id": job_id}).get("state")
+        except RpcError:
+            states[job_id] = None
+    return states
+
+
+def _job_info_batch(host, job_ids):
+    """Resolve `job_ids` against `host`, falling back on an older queue host."""
+    states = {}
+    pending = list(job_ids)
+    for _ in range(_MAX_BATCH_ROUNDS):
+        if not pending:
+            break
+        try:
+            result = rpc_call(host, "job_info_batch", {"job_ids": pending})
+        except RpcError as exc:
+            if exc.code != "unknown_method":
+                raise
+            print(
+                f"[WARN] {host} has no job_info_batch (older awsqe-host); falling back to "
+                f"{len(pending)} individual lookup(s). Upgrade the host, or use --no-refresh.",
+                file=sys.stderr,
+                flush=True,
+            )
+            states.update(_job_info_one_by_one(host, pending))
+            return states
+        states.update(result.get("states") or {})
+        pending = [job_id for job_id in (result.get("skipped") or []) if job_id not in states]
+    return states
+
+
+def refresh_tracked_jobs(records, *, override_host=None, default_queue_host=None):
+    """Ask each job's queue host for its current state.
+
+    Returns ``({job_id: state|None}, [warning, ...])``. Never exits: the point
+    of the ledger is that it is local, so an unreachable queue host still has
+    to leave the user with their list and a last-known status for every job.
+    """
+    by_host = {}
+    for record in records:
+        if is_terminal(record.get("status")):
+            continue
+        host = override_host or record.get("queue_host") or default_queue_host
+        if host:
+            by_host.setdefault(host, []).append(record["job_id"])
+
+    states = {}
+    warnings = []
+    for host in sorted(by_host):
+        job_ids = by_host[host]
+        try:
+            host_states = _job_info_batch(host, job_ids)
+        except RpcTransportError as exc:
+            warnings.append(f"could not reach {host}: {exc.detail} "
+                            f"({len(job_ids)} job(s) not refreshed)")
+            continue
+        except RpcError as exc:
+            warnings.append(f"{host} refused the request: {exc.code}: {exc.message} "
+                            f"({len(job_ids)} job(s) not refreshed)")
+            continue
+        if host_states and all(state is None for state in host_states.values()):
+            # The host writes its state files with a plain write_text, so a read
+            # landing mid-rewrite legitimately sees an empty queue. Flipping
+            # every live job to `missing` on that evidence is worse than waiting.
+            warnings.append(
+                f"{host} has no record of any of its {len(job_ids)} tracked job(s); "
+                f"treating that as a bad read rather than marking them all missing"
+            )
+            continue
+        states.update(host_states)
+    return states, warnings
+
+
 # ---------- subcommand handlers ----------
 
 def _status_hosts_from_map(args, queue_host_map):
@@ -393,6 +540,17 @@ def cmd_submit_remote(args, command):
             "payload_s3_uri": payload_s3_uri or "",
         },
     )
+    # run.info only exists when there's a payload directory to put it in, so
+    # this is the only record a payload-less submit leaves behind.
+    ledger.record_submission(
+        job_id=job_id,
+        queue_host=args.queue_host,
+        queue=queue_name,
+        cmd=command,
+        # Absolute: the row has to still mean something listed from another cwd.
+        payload=str(Path(args.payload).expanduser().resolve()) if args.payload else "",
+        payload_s3_uri=payload_s3_uri or "",
+    )
     print(f"Submitted {job_id}", flush=True)
 
 
@@ -420,7 +578,38 @@ def cmd_where(args):
     where_is_next_submit()
 
 
-def cmd_info(args):
+def _info_target_from_job_id(args, token):
+    """Resolve `info --job-id` against the ledger: (job_id, info_path, existing, queue_host).
+
+    ``run.info`` becomes optional here — the job is selected by id, and a
+    payload directory is only somewhere to *write* the refreshed state if the
+    job happens to have one that still exists.
+    """
+    try:
+        record = ledger.find_record(token)
+    except ledger.LedgerSelectionError as exc:
+        print(exc.message, flush=True)
+        sys.exit(1)
+    if record is None:
+        print(
+            f"No tracked job matching {token!r}. Run `awsqe-client jobs` to see what "
+            "this machine has submitted.",
+            flush=True,
+        )
+        sys.exit(1)
+
+    payload_text = args.payload or record.get("payload") or ""
+    payload_dir = Path(payload_text).expanduser() if payload_text else None
+    info_path = payload_dir / "run.info" if payload_dir and payload_dir.is_dir() else None
+    existing = read_run_info_file(info_path) if info_path and info_path.exists() else {}
+    queue_host = (
+        args.queue_host or record.get("queue_host") or effective_queue_host(None) or "local"
+    )
+    return record["job_id"], info_path, existing, queue_host
+
+
+def _info_target_from_payload(args):
+    """The original payload-directory path: run.info is required and names the job."""
     payload_dir = Path(args.payload).expanduser() if args.payload else Path.cwd()
     info_path = payload_dir / "run.info"
     if not info_path.exists():
@@ -438,6 +627,18 @@ def cmd_info(args):
         or effective_queue_host(None)
         or "local"
     )
+    return job_id, info_path, existing, queue_host
+
+
+def cmd_info(args):
+    # getattr, not args.job_id: the legacy `awsqueueengine info` shim declares
+    # no --job-id and calls straight into here.
+    token = getattr(args, "job_id", None)
+    if token:
+        job_id, info_path, existing, queue_host = _info_target_from_job_id(args, token)
+    else:
+        job_id, info_path, existing, queue_host = _info_target_from_payload(args)
+
     if queue_host == "local":
         state = lookup_job_state(job_id)
     else:
@@ -451,19 +652,20 @@ def cmd_info(args):
     if not state:
         print(f"Job {job_id} not found in queue host state (queued/running/completed/failed).", flush=True)
         sys.exit(1)
-    merged = dict(existing)
-    for key, value in state.items():
-        if value is None or value == "":
-            continue
-        merged[key] = value
-    # A retry that succeeded shouldn't leave the previous attempt's failure
-    # fields sitting in run.info.
-    if merged.get("status") != "failed":
-        for key in ("failure_reason", "failure_detail", "exit_code"):
-            merged.pop(key, None)
-    write_run_info_file(info_path, merged)
+
+    merged = ledger.merge_host_fields(existing, state)
+    # Update-only: looking a job up must not start tracking one this machine
+    # never submitted. Also the way to re-check a job the ledger considers
+    # terminal, which `jobs` skips on refresh.
+    ledger.apply_state(job_id, state)
+
+    if info_path is not None:
+        write_run_info_file(info_path, merged)
+        location = f"Updated {info_path}"
+    else:
+        location = f"Job {job_id}"
     print(
-        f"Updated {info_path}: status={merged.get('status', '?')} "
+        f"{location}: status={merged.get('status', '?')} "
         f"host={merged.get('host', '-')} remote_payload={merged.get('remote_payload_path', '-')}",
         flush=True,
     )
@@ -498,6 +700,221 @@ def cmd_failed_remote(args):
         params["job_id"] = args.job_id
     result = _rpc(args, "failed_list", params)
     _render_failed_jobs(result.get("jobs") or [], show_log=bool(args.log))
+
+
+def fetch_tracked_logs(records):
+    """Pull worker logs for the given records. Returns ``(fetched, [warning, ...])``.
+
+    One scp per job, so callers pass the *displayed* slice rather than the whole
+    ledger — fetching 2000 logs because you listed 50 rows would be a nasty
+    surprise. Never raises: a log you can't get is a warning, not a failure of
+    the listing.
+    """
+    wanted = [r for r in records if job_logs.should_fetch(r)]
+    if not wanted:
+        return 0, []
+    if not job_logs.scp_available():
+        job_logs.warn_no_scp()
+        return 0, []
+
+    fetched = 0
+    warnings = []
+    for record in wanted:
+        job_id, host = record["job_id"], record["host"]
+        result = job_logs.fetch_log(job_id, host)
+        key = job_logs.cache_key(record)
+        if result["ok"]:
+            ledger.record_log_result(job_id, log_path=result["path"], fetched_for=key)
+            fetched += 1
+        elif result["reason"] == "missing":
+            # Remember it, keyed to this attempt, so we stop asking. A requeue
+            # changes the key and we look again.
+            ledger.record_log_result(job_id, missing_for=key)
+            warnings.append(f"{job_id}: no log left on {host} (worker recycled or cleaned)")
+        else:
+            warnings.append(f"{job_id}: could not fetch log from {host}: {result['detail']}")
+    job_logs.prune_log_cache()
+    return fetched, warnings
+
+
+def _dump_log(path):
+    """Stream a cached log to stdout.
+
+    Streamed rather than read whole: a job log is unbounded, and `--cat` on a
+    multi-gigabyte run should not need to hold it in memory first.
+    """
+    try:
+        # errors="replace": a job's stdout is whatever it wrote, not necessarily
+        # valid UTF-8, and that is no reason to refuse to show it.
+        with open(path, "r", errors="replace") as handle:
+            shutil.copyfileobj(handle, sys.stdout)
+    except BrokenPipeError:
+        # `--cat X | head` closes the pipe early. That's the caller being done,
+        # not a failure; exit quietly without a traceback on interpreter close.
+        os._exit(0)
+    except OSError as exc:
+        print(f"could not read {path}: {exc}", file=sys.stderr, flush=True)
+        sys.exit(1)
+
+
+def _show_one_log(args, records, token, *, dump=False):
+    """`jobs --log` / `jobs --cat`: locate one job's log, fetching it if needed."""
+    try:
+        record = ledger.find_record(token, records=records)
+    except ledger.LedgerSelectionError as exc:
+        print(exc.message, flush=True)
+        sys.exit(1)
+    if record is None:
+        print(f"no tracked job matching: {token}", flush=True)
+        sys.exit(1)
+    if not record.get("host"):
+        print(
+            f"{record['job_id']} has no worker recorded yet (status "
+            f"{record.get('status')}); nothing to fetch.",
+            flush=True,
+        )
+        sys.exit(1)
+
+    if job_logs.should_fetch(record):
+        _, warnings = fetch_tracked_logs([record])
+        for warning in warnings:
+            print(f"[WARN] {warning}", file=sys.stderr, flush=True)
+        record = ledger.find_record(record["job_id"]) or record
+    if not record.get("log_path"):
+        sys.exit(1)
+
+    if dump:
+        _dump_log(record["log_path"])
+    else:
+        # Bare path on stdout so it composes: less "$(awsqe-client jobs --log X)"
+        print(record["log_path"], flush=True)
+
+
+def _parse_time_arg(text, flag, *, end_of_day=False):
+    try:
+        return parse_time_spec(text, end_of_day=end_of_day)
+    except ValueError as exc:
+        print(f"{flag}: {exc}", flush=True)
+        sys.exit(2)
+
+
+def _expand_queue_filter(tokens):
+    """Queue names from repeated and/or comma-separated ``--queue`` tokens.
+
+    Normalized the same way the queue host normalizes a submitted queue name,
+    so what you can submit to is what you can filter on.
+    """
+    if not tokens:
+        return None
+    wanted = {
+        normalize_queue_name(part)
+        for token in tokens for part in str(token).split(",") if part.strip()
+    }
+    return wanted or None
+
+
+def _forget_tracked_jobs(args, records):
+    """`--forget` / `--forget-before`: stop tracking, all-or-nothing."""
+    conflicting = [
+        flag for flag, value in (
+            ("--status", args.status), ("--queue", getattr(args, "queue", None)),
+            ("--since", args.since), ("--until", args.until),
+        ) if value
+    ]
+    if conflicting:
+        print(
+            f"--forget/--forget-before cannot be combined with {', '.join(conflicting)}; "
+            "forgetting is an action, not a filter.",
+            flush=True,
+        )
+        sys.exit(2)
+
+    before = _parse_time_arg(args.forget_before, "--forget-before") if args.forget_before else None
+
+    resolved = []
+    missing = []
+    for token in args.forget or []:
+        try:
+            record = ledger.find_record(token, records=records)
+        except ledger.LedgerSelectionError as exc:
+            print(exc.message, flush=True)
+            sys.exit(1)
+        if record is None:
+            missing.append(token)
+        else:
+            resolved.append(record)
+    # All-or-nothing, like qdel: a typo in one token must not half-apply.
+    if missing:
+        print(f"no tracked job matching: {', '.join(missing)}", flush=True)
+        sys.exit(1)
+
+    for record in resolved:
+        if not is_terminal(record.get("status")):
+            print(
+                f"  note: {record['job_id']} is {record.get('status')}; forgetting it here "
+                "does not cancel it (use `qdel`).",
+                flush=True,
+            )
+
+    # Capture the ids being dropped by date before they're gone, so their
+    # cached logs go too rather than lingering as orphans.
+    dropped = {r["job_id"] for r in resolved}
+    if before is not None:
+        dropped |= {r["job_id"] for r in records if r["submitted_at"] < before}
+
+    removed = ledger.forget(job_ids=[r["job_id"] for r in resolved], before=before)
+    job_logs.forget_logs(dropped)
+    print(f"Forgot {removed} tracked job(s).", flush=True)
+
+
+def cmd_jobs(args):
+    records = ledger.load_ledger()
+
+    if args.forget or args.forget_before:
+        _forget_tracked_jobs(args, records)
+        return
+    if getattr(args, "log", None):
+        _show_one_log(args, records, args.log)
+        return
+    if getattr(args, "cat", None):
+        _show_one_log(args, records, args.cat, dump=True)
+        return
+
+    try:
+        statuses = expand_status_filter(args.status)
+    except ValueError as exc:
+        print(f"--status: {exc}", flush=True)
+        sys.exit(2)
+    queues = _expand_queue_filter(getattr(args, "queue", None))
+    since = _parse_time_arg(args.since, "--since") if args.since else None
+    # A bare date as an upper bound means "through that day", not "up to its 00:00".
+    until = _parse_time_arg(args.until, "--until", end_of_day=True) if args.until else None
+
+    if not args.no_refresh and records:
+        states, warnings = refresh_tracked_jobs(
+            records,
+            override_host=args.queue_host,
+            default_queue_host=effective_queue_host(None),
+        )
+        # Ahead of the table: below a long one they scroll away, and they're
+        # the reason a status might look stale.
+        for warning in warnings:
+            print(f"[WARN] {warning}", file=sys.stderr, flush=True)
+        if states and ledger.apply_states(states):
+            records = ledger.load_ledger()
+
+    selected = ledger.filter_records(records, statuses=statuses, queues=queues,
+                                     since=since, until=until, limit=args.limit)
+
+    if getattr(args, "fetch_logs", False) and selected:
+        # Scoped to what's on screen, not the whole ledger.
+        _, warnings = fetch_tracked_logs(selected)
+        for warning in warnings:
+            print(f"[WARN] {warning}", file=sys.stderr, flush=True)
+        by_id = {r["job_id"]: r for r in ledger.load_ledger()}
+        selected = [by_id.get(r["job_id"], r) for r in selected]
+
+    _render_tracked_jobs(selected, total=len(records))
 
 
 def cmd_qdel_remote(args):
@@ -550,6 +967,11 @@ def cmd_qdel_remote(args):
             flush=True,
         )
     print(f"Removed {len(removed)} job(s).", flush=True)
+    # Record it as deleted rather than letting the next refresh see the job
+    # vanish from host state and report the vaguer `missing`.
+    ledger.mark_status(
+        [(entry.get("item") or {}).get("job_id") for entry in removed], DELETED,
+    )
 
 
 def cmd_requeue_deferred_remote(args):
@@ -710,6 +1132,11 @@ def build_parser():
 
     p_info = sub.add_parser("info", help="Refresh local run.info from queue host state")
     p_info.add_argument("--payload", "-p", default=None)
+    p_info.add_argument(
+        "--job-id", default=None,
+        help="Look up this tracked job (id or unique prefix) instead of reading "
+             "run.info from a payload directory.",
+    )
     p_info.add_argument("--queue-host", default=None)
 
     p_list = sub.add_parser("list", help="Show queued jobs on the queue host")
@@ -726,6 +1153,65 @@ def build_parser():
     p_failed.add_argument("--job-id", default=None, help="Only show failures for this job id")
     p_failed.add_argument("--log", action="store_true", help="Also print the captured tail of each job log")
     p_failed.add_argument("--queue-host", default=None)
+
+    p_jobs = sub.add_parser(
+        "jobs", help="List jobs this client submitted, refreshed from the queue host",
+    )
+    p_jobs.add_argument(
+        "--status", action="append", default=None, metavar="STATUS",
+        help="Filter by status; repeatable and comma-separated. "
+             f"Statuses: {', '.join(ALL_STATUSES)}. Aliases: active, done, all.",
+    )
+    p_jobs.add_argument(
+        "--queue", action="append", default=None, metavar="QUEUE",
+        help="Filter by queue name; repeatable and comma-separated.",
+    )
+    p_jobs.add_argument(
+        "--since", default=None, metavar="WHEN",
+        help="Only jobs submitted at/after WHEN: YYYY-MM-DD, 'YYYY-MM-DD HH:MM', "
+             "or a relative span like 30m/24h/7d/2w.",
+    )
+    p_jobs.add_argument(
+        "--until", default=None, metavar="WHEN",
+        help="Only jobs submitted before WHEN (same formats; a bare date means "
+             "the end of that day).",
+    )
+    p_jobs.add_argument(
+        "--limit", "-n", type=int, default=50,
+        help="How many rows, newest first (default 50; 0 shows all)",
+    )
+    p_jobs.add_argument(
+        "--no-refresh", action="store_true",
+        help="Show recorded state without querying the queue host",
+    )
+    p_jobs.add_argument(
+        "--fetch-logs", action="store_true",
+        help="Copy each displayed job's log off its worker (skipping any already "
+             "cached) and show the local path.",
+    )
+    # Both name a single job and differ only in what they emit, so asking for
+    # both at once is a mistake worth catching rather than silently ordering.
+    p_jobs_log = p_jobs.add_mutually_exclusive_group()
+    p_jobs_log.add_argument(
+        "--log", default=None, metavar="JOB_ID",
+        help="Print the local path to one job's log, fetching it first if needed.",
+    )
+    p_jobs_log.add_argument(
+        "--cat", default=None, metavar="JOB_ID",
+        help="Print one job's log to the screen, fetching it first if needed.",
+    )
+    p_jobs.add_argument(
+        "--forget", action="append", default=None, metavar="JOB_ID",
+        help="Stop tracking these job id(s) and exit. Does NOT cancel them — use qdel.",
+    )
+    p_jobs.add_argument(
+        "--forget-before", default=None, metavar="WHEN",
+        help="Stop tracking jobs submitted before WHEN and exit.",
+    )
+    p_jobs.add_argument(
+        "--queue-host", default=None,
+        help="Refresh against this host instead of each job's recorded one",
+    )
 
     p_qdel = sub.add_parser("qdel", help=QDEL_HELP)
     add_qdel_arguments(p_qdel)
@@ -799,6 +1285,11 @@ def dispatch(args, parser=None):
     elif cmd == "failed":
         _resolve_queue_host(args, "failed")
         cmd_failed_remote(args)
+    elif cmd == "jobs":
+        # Deliberately no _resolve_queue_host: `jobs` reads a local file and
+        # must work with no config and no reachable host. Each record carries
+        # the host it was submitted to, resolved inside the refresh.
+        cmd_jobs(args)
     elif cmd == "qdel":
         _resolve_queue_host(args, "qdel")
         cmd_qdel_remote(args)
