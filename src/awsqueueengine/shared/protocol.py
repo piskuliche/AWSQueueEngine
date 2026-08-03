@@ -58,14 +58,44 @@ class RpcTransportError(Exception):
 
 
 def make_request(method: str, params: dict | None = None) -> dict:
+    """Build a request envelope for ``method``.
+
+    Args:
+        method: Registered method name on the host.
+        params: Method params; ``None`` becomes ``{}`` so the host always sees an
+            object rather than a missing key.
+
+    Returns:
+        The envelope to write to ``awsqe-host rpc`` on stdin.
+    """
     return {"version": PROTOCOL_VERSION, "method": method, "params": params or {}}
 
 
 def make_ok(result: dict | None = None) -> dict:
+    """Build a success response envelope.
+
+    Args:
+        result: Method result; ``None`` becomes ``{}``.
+
+    Returns:
+        An envelope with ``ok: true``.
+    """
     return {"version": PROTOCOL_VERSION, "ok": True, "result": result or {}}
 
 
 def make_error(code: str, message: str) -> dict:
+    """Build a failure response envelope.
+
+    This is an *application-level* failure, which still exits 0 — see the
+    exit-code contract in the module docstring above.
+
+    Args:
+        code: One of the error codes listed in the module docstring.
+        message: Human-readable detail, surfaced to the user by the client.
+
+    Returns:
+        An envelope with ``ok: false``.
+    """
     return {
         "version": PROTOCOL_VERSION,
         "ok": False,

@@ -1,1 +1,8 @@
-sphinx>=7,<9
+# The package itself is deliberately not listed: docs/conf.py puts src/ on
+# sys.path and every module imports with only Sphinx present. See
+# contributing.rst for why that is a feature and not an oversight.
+#
+# Building on Python 3.10 additionally needs `tomli`, which client/config.py
+# imports at module level below 3.11. CI builds on 3.12.
+sphinx>=8,<9
+furo>=2024.8,<2026
