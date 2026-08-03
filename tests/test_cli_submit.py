@@ -909,6 +909,94 @@ class CliSubmitTests(unittest.TestCase):
         self.assertEqual(cm.exception.code, 1)
         self.assertIn("older awsqe-host", buf.getvalue())
 
+    def test_remote_qdel_forwards_array_selector(self):
+        class Args:
+            queue_host = "queuebox"
+            job_ids = []
+            indices = []
+            queue = None
+            array_id = "ffpopt-IDC"
+
+        captured = {}
+
+        def fake_rpc_call(host, method, params, **kwargs):
+            captured["params"] = params
+            return {"removed": []}
+
+        from awsqueueengine.client import cli as client_cli
+        with patch("awsqueueengine.client.cli.rpc_call", side_effect=fake_rpc_call):
+            client_cli.cmd_qdel_remote(Args())
+
+        self.assertEqual(captured["params"], {"array_id": "ffpopt-IDC"})
+
+    def test_remote_qdel_array_hint_does_not_tell_the_user_to_use_index(self):
+        """A current-generation host answers `--array` with a message that also
+        contains the word `indices`. Matching on the response alone would advise
+        `--index`, which cannot select a batch at all."""
+        class Args:
+            queue_host = "queuebox"
+            job_ids = []
+            indices = []
+            queue = None
+            array_id = "ffpopt-IDC"
+
+        from awsqueueengine.client import cli as client_cli
+        from awsqueueengine.shared.protocol import RpcError
+
+        err = RpcError("invalid_params", "provide job id(s), indices, or a queue name")
+        buf = io.StringIO()
+        with patch("awsqueueengine.client.cli.rpc_call", side_effect=err):
+            with contextlib.redirect_stderr(buf):
+                with self.assertRaises(SystemExit):
+                    client_cli.cmd_qdel_remote(Args())
+        message = buf.getvalue()
+        self.assertNotIn("--index", message)
+        self.assertIn("predates batch tags", message)
+        self.assertIn("--array ffpopt-IDC", message)
+
+    def test_remote_qdel_reports_running_members_it_could_not_cancel(self):
+        class Args:
+            queue_host = "queuebox"
+            job_ids = []
+            indices = []
+            queue = None
+            array_id = "ffpopt-IDC"
+
+        from awsqueueengine.client import cli as client_cli
+        result = {
+            "removed": [{"index": 1, "item": {"job_id": "A", "cmd": "x"}, "selector": "--array"}],
+            "running": [{"host": "eci5", "job_id": "R1"}],
+        }
+        buf = io.StringIO()
+        with patch("awsqueueengine.client.cli.rpc_call", return_value=result), \
+             patch("awsqueueengine.client.cli.ledger.mark_status"):
+            with contextlib.redirect_stdout(buf):
+                client_cli.cmd_qdel_remote(Args())
+        out = buf.getvalue()
+        self.assertIn("Removed 1 job(s).", out)
+        self.assertIn("already running", out)
+        self.assertIn("R1 on eci5", out)
+
+    def test_remote_qdel_says_nothing_extra_when_no_members_are_running(self):
+        class Args:
+            queue_host = "queuebox"
+            job_ids = []
+            indices = []
+            queue = None
+            array_id = "ffpopt-IDC"
+
+        from awsqueueengine.client import cli as client_cli
+        result = {
+            "removed": [{"index": 1, "item": {"job_id": "A", "cmd": "x"}, "selector": "--array"}],
+            "running": [],
+        }
+        buf = io.StringIO()
+        with patch("awsqueueengine.client.cli.rpc_call", return_value=result), \
+             patch("awsqueueengine.client.cli.ledger.mark_status"):
+            with contextlib.redirect_stdout(buf):
+                client_cli.cmd_qdel_remote(Args())
+        self.assertNotIn("already running", buf.getvalue())
+
     def test_status_fetches_host_pool_from_queue_host_beyond_20(self):
         # Regression: a client with no local queues.json must not fall back to
         # the built-in eci1..eci20 default for `status`. It asks the queue host

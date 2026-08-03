@@ -21,6 +21,7 @@ from ..shared.job_lookup import (
     enrich_selection_message,
     lookup_job_state,
     lookup_job_states,
+    running_members_of_array,
 )
 from ..shared.protocol import (
     PROTOCOL_VERSION,
@@ -135,6 +136,7 @@ def handle_enqueue(params: dict) -> dict:
     payload_s3_uri = _optional_str(params, "payload_s3_uri")
     payload_size_bytes = _optional_int(params, "payload_size_bytes")
     job_id = _optional_str(params, "job_id") or new_job_tag()
+    array_id = _optional_str(params, "array_id")
 
     queue_host_map = _load_queue_host_map()
     if queue_name not in queue_host_map:
@@ -162,9 +164,10 @@ def handle_enqueue(params: dict) -> dict:
         "payload_s3_uri": payload_s3_uri,
         "payload_size_bytes": payload_size_bytes,
         "job_id": job_id,
+        "array_id": array_id,
     }
     enqueue_item(item)
-    return {"job_id": job_id, "queue": queue_name, "hosts": hosts}
+    return {"job_id": job_id, "queue": queue_name, "hosts": hosts, "array_id": array_id}
 
 
 def handle_list(params: dict) -> dict:
@@ -185,7 +188,7 @@ def handle_qstat(params: dict) -> dict:
 
 
 def handle_qdel(params: dict) -> dict:
-    """Delete queued jobs selected by job id, queue name, or (legacy) position.
+    """Delete queued jobs selected by job id, queue name, array name, or position.
 
     ``indices`` keeps its original meaning so an older client still works
     against this handler unchanged.
@@ -194,19 +197,25 @@ def handle_qdel(params: dict) -> dict:
     job_ids = _optional_string_list(params, "job_ids") or []
     indices = _optional_int_list(params, "indices")
     queue = _optional_str(params, "queue")
+    array_id = _optional_str(params, "array_id")
 
     q = load_queue()
     try:
-        selection = resolve_queue_selection(q, job_ids=job_ids, indices=indices, queue=queue)
+        selection = resolve_queue_selection(
+            q, job_ids=job_ids, indices=indices, queue=queue, array_id=array_id,
+        )
     except QueueSelectionError as exc:
         raise RpcError(exc.code, enrich_selection_message(exc.message, exc.tokens)) from exc
 
     removed = remove_queue_positions(q, selection)
-    return {
+    result = {
         "removed": [
             {"index": idx, "item": item, "selector": token} for idx, item, token in removed
         ]
     }
+    if array_id:
+        result["running"] = running_members_of_array(array_id)
+    return result
 
 
 def handle_deferred_list(params: dict) -> dict:

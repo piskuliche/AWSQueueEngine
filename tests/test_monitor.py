@@ -174,7 +174,8 @@ class MonitorRunningStatePruneTests(unittest.TestCase):
     def test_build_failed_job_record_keeps_job_metadata_and_log_tail(self):
         record = _build_failed_job_record(
             "eci8",
-            {"cmd": "pmemd.cuda", "job_id": "tag-9", "queue": "gpu", "started_at": 10.0},
+            {"cmd": "pmemd.cuda", "job_id": "tag-9", "queue": "gpu", "started_at": 10.0,
+             "array_id": "ffpopt-IDC"},
             finished_at=25.0,
             outcome=_outcome(137, "slurmstepd: Killed\nout of memory"),
         )
@@ -185,6 +186,8 @@ class MonitorRunningStatePruneTests(unittest.TestCase):
         self.assertEqual(record["dur"], "00:00:15")
         self.assertEqual(record["failed_at"], 25.0)
         self.assertIn("out of memory", record["log_tail"])
+        # Without this, `failed` can never answer "how many of that batch failed".
+        self.assertEqual(record["array_id"], "ffpopt-IDC")
 
     def test_build_completed_job_record_uses_qstat_payload_selection(self):
         record = _build_completed_job_record(
@@ -282,6 +285,37 @@ class MonitorLaunchTrackingTests(unittest.TestCase):
         # Without this flag the prune step can't tell a killed job from one that
         # predates exit-status tracking.
         self.assertTrue(running_jobs["eci5"]["exit_status_tracked"])
+
+    def test_launch_carries_the_array_id_onto_the_running_record(self):
+        """The running record is rebuilt field-by-field rather than spread from
+        the queued item, so a field missing from that literal is dropped at
+        launch — silently, and only visibly once the job leaves the queue."""
+        running_jobs = {}
+        with patch(
+            "awsqueueengine.host.monitor.submit_to_host",
+            return_value={"ok": True, "tag": "tag-1", "pid": "123", "payload": "/scratch/p"},
+        ), patch("awsqueueengine.host.monitor.save_running_jobs"), patch(
+            "awsqueueengine.host.monitor.write_run_info"
+        ):
+            _launch_job_on_host(
+                "eci5",
+                {"cmd": "run.sh", "job_id": "tag-1", "array_id": "ffpopt-IDC"},
+                running_jobs,
+            )
+
+        self.assertEqual(running_jobs["eci5"]["array_id"], "ffpopt-IDC")
+
+    def test_launch_of_an_untagged_job_records_no_array_id(self):
+        running_jobs = {}
+        with patch(
+            "awsqueueengine.host.monitor.submit_to_host",
+            return_value={"ok": True, "tag": "tag-1", "pid": "123", "payload": "/scratch/p"},
+        ), patch("awsqueueengine.host.monitor.save_running_jobs"), patch(
+            "awsqueueengine.host.monitor.write_run_info"
+        ):
+            _launch_job_on_host("eci5", {"cmd": "run.sh", "job_id": "tag-1"}, running_jobs)
+
+        self.assertIsNone(running_jobs["eci5"]["array_id"])
 
 
 class MonitorPreemptTargetTests(unittest.TestCase):

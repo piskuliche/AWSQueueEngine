@@ -187,6 +187,7 @@ def _build_finished_job_record(host, running_item, finished_at):
         "payload_s3_uri": payload_s3_uri,
         "payload_size_bytes": payload_size_bytes,
         "job_id": item.get("job_id"),
+        "array_id": item.get("array_id"),
         "cmd": str(item.get("cmd") or ""),
         "started_at": started_at,
         "finished_at": float(finished_at),
@@ -507,6 +508,7 @@ def _launch_job_on_host(host, job_item, running_jobs):
     preempt = item.get("preempt", False)
     mps = item.get("mps", False)
     job_id = item.get("job_id")
+    array_id = item.get("array_id")
     hosts_text = ",".join(target_hosts) if target_hosts else f"queue:{queue_name}"
     launch_started_at = time.time()
     print(
@@ -624,6 +626,10 @@ def _launch_job_on_host(host, job_item, running_jobs):
         "payload_s3_uri": payload_s3_uri,
         "payload_size_bytes": payload_size_bytes,
         "job_id": res.get("tag") or job_id,
+        # Rebuilt by name rather than spread from `item`, so every field a
+        # queued job carries has to be listed here or it is dropped at launch —
+        # silently, and only visibly once the job leaves the queue.
+        "array_id": array_id,
         "started_at": time.time(),
         # This monitor wrapped the job to record its exit status, so a missing
         # status file later is real evidence the job was killed — not just an

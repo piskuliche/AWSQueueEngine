@@ -155,6 +155,66 @@ class SingleLookupTests(_StateFixture):
         failed.assert_not_called()
 
 
+class ArrayIdPassthroughTests(_StateFixture):
+    """`array_id` has to survive every state a job passes through, or the tag
+    appears only while the job is queued and vanishes the moment it runs."""
+
+    def test_queued_state_carries_the_array_id(self):
+        queue_mod.save_queue([{"cmd": "a", "job_id": "A", "array_id": "ffpopt-IDC"}])
+        self.assertEqual(job_lookup.lookup_job_state("A")["array_id"], "ffpopt-IDC")
+
+    def test_running_state_carries_the_array_id(self):
+        running_state_mod.save_running_jobs({
+            "eci5": {"cmd": "a", "job_id": "A", "array_id": "ffpopt-IDC",
+                     "started_at": 1715537422.5},
+        })
+        self.assertEqual(job_lookup.lookup_job_state("A")["array_id"], "ffpopt-IDC")
+
+    def test_finished_state_carries_the_array_id(self):
+        completion_state_mod.save_completed_jobs([
+            {"job_id": "A", "host": "eci5", "status": "completed", "exit_code": 0,
+             "finished_at": 100.0, "array_id": "ffpopt-IDC"},
+        ])
+        self.assertEqual(job_lookup.lookup_job_state("A")["array_id"], "ffpopt-IDC")
+
+    def test_failed_state_carries_the_array_id(self):
+        failure_state_mod.save_failed_jobs([
+            {"job_id": "A", "host": "eci5", "status": "failed", "exit_code": 137,
+             "finished_at": 100.0, "array_id": "ffpopt-IDC"},
+        ])
+        self.assertEqual(job_lookup.lookup_job_state("A")["array_id"], "ffpopt-IDC")
+
+    def test_an_untagged_job_reports_an_empty_tag_rather_than_omitting_it(self):
+        queue_mod.save_queue([{"cmd": "a", "job_id": "A"}])
+        self.assertEqual(job_lookup.lookup_job_state("A")["array_id"], "")
+
+
+class RunningMembersOfArrayTests(_StateFixture):
+    def test_finds_only_that_batch_in_host_order(self):
+        running_state_mod.save_running_jobs({
+            "eci7": {"cmd": "a", "job_id": "R2", "array_id": "ffpopt-IDC"},
+            "eci5": {"cmd": "a", "job_id": "R1", "array_id": "ffpopt-IDC"},
+            "eci6": {"cmd": "b", "job_id": "R3", "array_id": "other"},
+            "eci8": {"cmd": "c", "job_id": "R4"},
+        })
+        self.assertEqual(
+            job_lookup.running_members_of_array("ffpopt-IDC"),
+            [{"host": "eci5", "job_id": "R1"}, {"host": "eci7", "job_id": "R2"}],
+        )
+
+    def test_matching_is_case_insensitive(self):
+        running_state_mod.save_running_jobs({
+            "eci5": {"cmd": "a", "job_id": "R1", "array_id": "ffpopt-IDC"},
+        })
+        self.assertEqual(len(job_lookup.running_members_of_array("FFPOPT-idc")), 1)
+
+    def test_empty_or_missing_name_matches_nothing(self):
+        running_state_mod.save_running_jobs({"eci5": {"cmd": "a", "job_id": "R1"}})
+        self.assertEqual(job_lookup.running_members_of_array(""), [])
+        self.assertEqual(job_lookup.running_members_of_array(None), [])
+        self.assertEqual(job_lookup.running_members_of_array("nope"), [])
+
+
 class BatchAgreementTests(_StateFixture):
     """`lookup_job_states` must be indistinguishable from N `lookup_job_state`s."""
 

@@ -14,6 +14,11 @@ from datetime import datetime
 from pathlib import Path
 
 from ..shared.array_id import normalize_array_id, validate_array_id
+from ..shared.batch_view import (
+    render_grouped_queue,
+    render_grouped_running,
+    shared_or_marker,
+)
 from ..shared.cli_utils import (
     QDEL_HELP,
     add_qdel_arguments,
@@ -180,11 +185,19 @@ def _rpc(args, method, params=None):
 
 # ---------- rendering helpers (match legacy `awsqueueengine` text format) ----------
 
-def _render_queue_jobs(jobs):
+def _render_queue_jobs(jobs, positions=None):
+    """The queued-job listing.
+
+    `positions` overrides the leading number. It must be supplied whenever the
+    caller renders a *subset* of the queue: that number is the 1-based queue
+    position `qdel --index` selects on, so re-deriving it with `enumerate` over
+    a filtered list would print positions that delete the wrong jobs.
+    """
     if not jobs:
         print("(queue empty)", flush=True)
         return
-    for i, item in enumerate(jobs, 1):
+    numbers = positions if positions is not None else range(1, len(jobs) + 1)
+    for i, item in zip(numbers, jobs):
         hosts_text = ",".join(item.get("hosts") or []) if item.get("hosts") else "-"
         payload_text = _payload_display_text(item)
         job_id_text = item.get("job_id") or "-"
@@ -325,18 +338,6 @@ def _render_tracked_jobs(records, total=None):
         print(f"{len(records)} of {total} tracked job(s).", flush=True)
 
 
-def _shared_or_marker(values):
-    """One column, one value: the shared name, ``-`` for none, ``*`` for several.
-
-    A batch usually goes to one queue and one host, and saying so is worth a
-    column. When it doesn't, the row must not pick a member's value and imply
-    the rest agree.
-    """
-    if not values:
-        return "-"
-    return values[0] if len(values) == 1 else "*"
-
-
 def _group_jobs_text(group, *, filtered=False):
     """The JOBS cell: how many are shown, over how many the batch was submitted with.
 
@@ -375,7 +376,7 @@ def _render_grouped_jobs(groups, ungrouped, total=None, *, filtered=False):
         print(
             f"{(format_epoch(group['submitted_at']) or '-'):20}  "
             f"{group['array_id'][:24]:24}  {_group_jobs_text(group, filtered=filtered):>6}  "
-            f"{_shared_or_marker(group['queues'])[:12]:12}  {summary}",
+            f"{shared_or_marker(group['queues'])[:12]:12}  {summary}",
             flush=True,
         )
     if ungrouped:
@@ -762,12 +763,22 @@ def cmd_info(args):
 
 def cmd_list_remote(args):
     result = _rpc(args, "list", {})
-    _render_queue_jobs(result.get("jobs") or [])
+    jobs = result.get("jobs") or []
+    # Opt-in here, unlike `jobs`: this is a global view of everyone's queue, and
+    # the leading number is the queue position `qdel --index` selects on.
+    if getattr(args, "group", False):
+        render_grouped_queue(jobs, _render_queue_jobs)
+    else:
+        _render_queue_jobs(jobs)
 
 
 def cmd_qstat_remote(args):
     result = _rpc(args, "qstat", {})
-    _render_running_jobs(result.get("running") or {})
+    running = result.get("running") or {}
+    if getattr(args, "group", False):
+        render_grouped_running(running, _render_running_jobs)
+    else:
+        _render_running_jobs(running)
 
 
 def cmd_deferred_remote(args):
@@ -1065,7 +1076,7 @@ def cmd_qdel_remote(args):
         print(selector_error, flush=True)
         sys.exit(1)
 
-    job_ids, indices, queue = qdel_selectors(args)
+    job_ids, indices, queue, array_id = qdel_selectors(args)
     params = {}
     if job_ids:
         params["job_ids"] = job_ids
@@ -1073,6 +1084,8 @@ def cmd_qdel_remote(args):
         params["indices"] = indices
     if queue:
         params["queue"] = queue
+    if array_id:
+        params["array_id"] = array_id
 
     try:
         result = rpc_call(args.queue_host, "qdel", params)
@@ -1081,9 +1094,21 @@ def cmd_qdel_remote(args):
         sys.exit(1)
     except RpcError as exc:
         print(f"RPC error from {args.queue_host}: {exc.code}: {exc.message}", flush=True, file=sys.stderr)
-        # A host predating job-id selectors rejects any qdel without `indices`,
-        # and its message doesn't say why. Name the likely cause.
-        if not indices and exc.code == "invalid_params" and "indices" in (exc.message or ""):
+        # A host predating a selector rejects it without saying why. Both older
+        # generations answer with a message naming `indices`, so the hint has to
+        # branch on what was *asked for* rather than on what came back —
+        # otherwise `--array` gets told to use `--index`, which cannot select a
+        # batch at all.
+        stale = exc.code == "invalid_params" and "indices" in (exc.message or "")
+        if stale and array_id:
+            print(
+                f"{args.queue_host} may be running an awsqe-host that predates batch "
+                f"tags. Upgrade it, or delete the batch's jobs by id "
+                f"(`awsqe-client jobs --array {array_id}` lists them).",
+                flush=True,
+                file=sys.stderr,
+            )
+        elif stale and not indices:
             print(
                 f"{args.queue_host} may be running an older awsqe-host that only accepts "
                 "queue positions. Upgrade it, or select with --index.",
@@ -1109,6 +1134,16 @@ def cmd_qdel_remote(args):
             flush=True,
         )
     print(f"Removed {len(removed)} job(s).", flush=True)
+    # qdel only ever touched the queue. Saying so beats letting "Removed 97
+    # job(s)" be read as "the batch is cancelled".
+    running = result.get("running") or []
+    if running:
+        hosts_text = ", ".join(f"{m.get('job_id') or '?'} on {m.get('host')}" for m in running)
+        print(
+            f"  {len(running)} member(s) of {array_id} are already running and were not "
+            f"touched: {hosts_text}. Use `awsqe-client stop <host>` to kill them.",
+            flush=True,
+        )
     # Record it as deleted rather than letting the next refresh see the job
     # vanish from host state and report the vaguer `missing`.
     ledger.mark_status(
@@ -1288,9 +1323,18 @@ def build_parser():
 
     p_list = sub.add_parser("list", help="Show queued jobs on the queue host")
     p_list.add_argument("--queue-host", default=None)
+    p_list.add_argument(
+        "--group", action="store_true",
+        help="Collapse each batch (see `submit --array`) to one row. Untagged jobs "
+             "keep their real queue positions.",
+    )
 
     p_qstat = sub.add_parser("qstat", help="Show running jobs on the queue host")
     p_qstat.add_argument("--queue-host", default=None)
+    p_qstat.add_argument(
+        "--group", action="store_true",
+        help="Collapse each batch (see `submit --array`) to one row.",
+    )
 
     p_deferred = sub.add_parser("deferred", help="Show deferred jobs on the queue host")
     p_deferred.add_argument("--queue-host", default=None)
