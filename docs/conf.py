@@ -54,5 +54,10 @@ autodoc_default_options = {
     "no-value": True,
 }
 autodoc_member_order = "bysource"
+# Render a default argument as the source text that produced it, not its repr.
+# Without this, `def f(path=MONITOR_STATE_FILE)` publishes
+# PosixPath('/home/<builder>/.awsqe/...') — the build machine's home directory
+# baked into the signature. Reads better, too.
+autodoc_preserve_defaults = True
 napoleon_google_docstring = True
 napoleon_numpy_docstring = True

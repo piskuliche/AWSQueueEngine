@@ -3,10 +3,11 @@ SPHINXOPTS  ?=
 SOURCEDIR    = .
 BUILDDIR     = _build
 
-.PHONY: help html linkcheck clean
+.PHONY: help html coverage linkcheck clean
 
 help:
 	@echo "html       build the HTML docs into $(BUILDDIR)/html"
+	@echo "coverage   assert every module is in the API reference exactly once"
 	@echo "linkcheck  check external links (advisory; not part of the CI gate)"
 	@echo "clean      remove $(BUILDDIR)"
 	@echo
@@ -16,6 +17,9 @@ help:
 
 html:
 	$(SPHINXBUILD) -b html $(SPHINXOPTS) $(SOURCEDIR) $(BUILDDIR)/html
+
+coverage:
+	python3 $(SOURCEDIR)/check_module_coverage.py
 
 linkcheck:
 	$(SPHINXBUILD) -b linkcheck $(SOURCEDIR) $(BUILDDIR)/linkcheck

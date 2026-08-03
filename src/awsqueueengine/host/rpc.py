@@ -297,9 +297,10 @@ def handle_requeue_deferred(params: dict) -> dict:
             * ``drop`` (bool) — discard instead of requeueing.
 
     Returns:
-        ``{"moved": [{"index": int, "item": dict}], "action": "requeued" |
-        "dropped"}``. Requeued items get ``submit_failures`` reset to ``0``, so a
-        job that hit the failure ceiling gets a full set of fresh attempts. An
+        ``{"moved": [...], "action": ...}``, where each moved entry is
+        ``{"index": int, "item": dict}`` and ``action`` is ``"requeued"`` or
+        ``"dropped"``. Requeued items get ``submit_failures`` reset to ``0``, so
+        a job that hit the failure ceiling gets a full set of fresh attempts. An
         empty deferred list is not an error — it returns ``moved: []``.
 
     Raises:

@@ -11,4 +11,4 @@ tracks, preempts, and requeues managed jobs.
 
    overview
    usage
-   api
+   api/index
