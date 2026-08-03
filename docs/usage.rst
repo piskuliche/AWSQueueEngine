@@ -126,11 +126,27 @@ position therefore removes the wrong ones.
    awsqueueengine qdel 20260730-1415                               # unique prefix
    awsqueueengine qdel --queue fast-gpus                           # a whole queue
    awsqueueengine qdel --index 2                                   # by position
+   awsqueueengine qdel --array ffpopt-IDC                          # a whole batch
 
-The three selectors cannot be combined in a single command. Nothing is removed
+The four selectors cannot be combined in a single command. Nothing is removed
 unless every selector resolves, so an unknown or ambiguous job id leaves the
 queue untouched. ``qdel`` only removes *queued* jobs; use ``stop`` for one that
 has already started.
+
+``--array NAME`` deletes every queued job tagged into that batch (see
+``submit --array``). Unlike a job id, the name is matched **exactly** — a prefix
+would silently widen a destructive operation from one batch to every batch whose
+name starts the same way. Because qdel reaches only the queue, members already
+running are reported rather than killed::
+
+   Removed 97 job(s).
+     8 member(s) of ffpopt-IDC are already running and were not touched:
+     20260802-091500-a1b2c3 on eci5, ... Use `awsqe-client stop <host>` to kill them.
+
+``list --group`` and ``qstat --group`` collapse each batch to one row in the
+same way, opt-in rather than default because those are global views of
+everyone's jobs and because the number in ``list``'s left column is the queue
+position ``--index`` selects on — untagged jobs keep their real positions there.
 
 Tracking Your Own Jobs
 ----------------------

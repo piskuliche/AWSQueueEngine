@@ -84,6 +84,26 @@ def describe_missing_job(job_id):
     return f"{job_id} already finished ({status})"
 
 
+def running_members_of_array(array_id):
+    """``[{"host", "job_id"}, ...]`` for a batch's members that are already running.
+
+    The batch-sized counterpart to :func:`describe_missing_job`. `qdel` has only
+    ever touched the queue, and `--array` does not change that — but "Removed 97
+    job(s)" reads as "the batch is cancelled", so callers report what qdel could
+    not reach rather than leaving it to be inferred.
+    """
+    wanted = str(array_id or "").strip().casefold()
+    if not wanted:
+        return []
+    running = load_running_jobs()
+    members = []
+    for host in sorted(running):
+        item = normalize_job_item(running[host])
+        if (item.get("array_id") or "").casefold() == wanted:
+            members.append({"host": host, "job_id": item.get("job_id") or ""})
+    return members
+
+
 def enrich_selection_message(message, tokens):
     """Append per-token context to a qdel "not found" message, when we have any."""
     notes = [note for note in (describe_missing_job(t) for t in tokens or []) if note]
@@ -101,6 +121,7 @@ def _queued_state(job_id, item, position):
         "job_id": job_id,
         "queue_position": position,
         "queue": item.get("queue"),
+        "array_id": item.get("array_id") or "",
         "hosts_filter": ",".join(hosts) if hosts else "",
         "cmd": str(item.get("cmd") or ""),
     }
@@ -115,6 +136,7 @@ def _running_state(job_id, item, host, raw_item):
         "remote_payload_path": item.get("payload_remote_path") or "",
         "started_at": format_epoch(started_at),
         "queue": item.get("queue"),
+        "array_id": item.get("array_id") or "",
         "cmd": str(item.get("cmd") or ""),
     }
 
@@ -159,6 +181,7 @@ def _finished_state(job_id, completed_index, failed_index):
         "finished_at": format_epoch(record.get("finished_at")),
         "duration": record.get("dur") or "",
         "queue": record.get("queue") or "",
+        "array_id": record.get("array_id") or "",
         "cmd": str(record.get("cmd") or ""),
     }
     if status == FAILED:

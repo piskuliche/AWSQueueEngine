@@ -924,7 +924,7 @@ class QdelLedgerIntegrationTests(_LedgerFixture):
             queue = None
 
         with patch("awsqueueengine.client.cli.validate_qdel_selectors", return_value=None), \
-             patch("awsqueueengine.client.cli.qdel_selectors", return_value=(["A"], [], None)), \
+             patch("awsqueueengine.client.cli.qdel_selectors", return_value=(["A"], [], None, None)), \
              patch("awsqueueengine.client.cli.rpc_call",
                    return_value={"removed": [{"index": 1, "item": {"job_id": "A", "cmd": "x"}}]}):
             with redirect_stdout(io.StringIO()):

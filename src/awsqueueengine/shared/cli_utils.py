@@ -13,6 +13,8 @@ would persist the cmd as ``'-- echo hi'`` and the worker would try to run
 """
 from __future__ import annotations
 
+from typing import NamedTuple
+
 
 def join_command_argv(argv: list[str] | None) -> str:
     """Join the REMAINDER argv into a single command string, stripping a
@@ -55,19 +57,46 @@ def add_qdel_arguments(parser) -> None:
         metavar="NAME",
         help="Delete every queued job in NAME",
     )
+    parser.add_argument(
+        "--array",
+        dest="array_id",
+        default=None,
+        metavar="NAME",
+        help=(
+            "Delete every queued job tagged into batch NAME (see "
+            "`awsqe-client submit --array`). Matched exactly — no prefixes, "
+            "since this selector is destructive."
+        ),
+    )
 
 
-def qdel_selectors(args) -> tuple[list[str], list[int], str | None]:
-    """The cleaned ``(job_ids, indices, queue)`` triple off a parsed namespace."""
-    job_ids = [str(t).strip() for t in (getattr(args, "job_ids", None) or []) if str(t).strip()]
-    indices = list(getattr(args, "indices", None) or [])
-    queue = (getattr(args, "queue", None) or "").strip() or None
-    return job_ids, indices, queue
+class QdelSelectors(NamedTuple):
+    """The cleaned selector set off a parsed namespace.
+
+    A NamedTuple rather than a plain tuple so the next selector added here does
+    not churn every unpack site again; it still compares equal to a 4-tuple, so
+    existing tests and callers that unpack positionally keep working.
+    """
+
+    job_ids: list[str]
+    indices: list[int]
+    queue: "str | None"
+    array_id: "str | None"
+
+
+def qdel_selectors(args) -> QdelSelectors:
+    """The cleaned selectors off a parsed namespace."""
+    return QdelSelectors(
+        job_ids=[str(t).strip() for t in (getattr(args, "job_ids", None) or []) if str(t).strip()],
+        indices=list(getattr(args, "indices", None) or []),
+        queue=(getattr(args, "queue", None) or "").strip() or None,
+        array_id=(getattr(args, "array_id", None) or "").strip() or None,
+    )
 
 
 def validate_qdel_selectors(args) -> str | None:
     """User-facing error text for an unusable selector combination, else ``None``."""
-    job_ids, indices, queue = qdel_selectors(args)
+    job_ids, indices, queue, array_id = qdel_selectors(args)
 
     # A short bare integer is almost certainly the pre-job-id syntax; say so
     # rather than reporting it as an unknown job id. Job ids open with an
@@ -83,11 +112,16 @@ def validate_qdel_selectors(args) -> str | None:
 
     kinds = [
         name
-        for name, present in (("job ids", job_ids), ("--index", indices), ("--queue", queue))
+        for name, present in (
+            ("job ids", job_ids),
+            ("--index", indices),
+            ("--queue", queue),
+            ("--array", array_id),
+        )
         if present
     ]
     if not kinds:
-        return "Provide one or more job ids, --index N, or --queue NAME."
+        return "Provide one or more job ids, --index N, --queue NAME, or --array NAME."
     if len(kinds) > 1:
         return f"Cannot combine {' and '.join(kinds)}; pick one selector."
     return None

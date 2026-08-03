@@ -128,6 +128,11 @@ awsqe-client qdel 20260730-141530-a1b2c3
 awsqe-client qdel 20260730-141530-a1b2c3 20260730-141602-9f0e11   # several at once
 awsqe-client qdel 20260730-1415    # any unique prefix of a job id
 awsqe-client qdel --queue fast-gpus   # every queued job in one queue
+awsqe-client qdel --array ffpopt-IDC  # every queued job in one batch
+
+# Group the host views by batch too (opt-in; these are everyone's jobs):
+awsqe-client list --group
+awsqe-client qstat --group
 
 # Worker-host operations from your laptop (SSHes to the worker directly):
 awsqe-client status                # ps probe of every host's MANAGER_TAG state

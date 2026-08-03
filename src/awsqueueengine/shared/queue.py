@@ -1,5 +1,6 @@
 # Queue management helpers
 import json
+from .array_id import normalize_array_id
 from .paths import QUEUE_FILE
 from .queue_config import DEFAULT_QUEUE, host_is_eligible_for_item, normalize_queue_name
 
@@ -155,6 +156,7 @@ def normalize_job_item(item):
             "resume_first": DEFAULT_RESUME_FIRST,
             "resume_host": None,
             "job_id": None,
+            "array_id": None,
         }
 
     if not isinstance(item, dict):
@@ -172,6 +174,7 @@ def normalize_job_item(item):
             "resume_first": DEFAULT_RESUME_FIRST,
             "resume_host": None,
             "job_id": None,
+            "array_id": None,
         }
 
     submit_failures = item.get("submit_failures", 0)
@@ -191,6 +194,7 @@ def normalize_job_item(item):
         "resume_first": _normalize_resume_first(item.get("resume_first", DEFAULT_RESUME_FIRST)),
         "resume_host": _normalize_resume_host(item.get("resume_host")),
         "job_id": _normalize_job_id(item.get("job_id")),
+        "array_id": normalize_array_id(item.get("array_id")),
         "submit_failures": submit_failures,
     }
 
@@ -234,8 +238,13 @@ class QueueSelectionError(Exception):
         self.tokens = list(tokens or [])
 
 
-def _selector_kinds(job_ids, indices, queue):
-    present = (("job ids", job_ids), ("indices", indices), ("queue", queue))
+def _selector_kinds(job_ids, indices, queue, array_id=None):
+    present = (
+        ("job ids", job_ids),
+        ("indices", indices),
+        ("queue", queue),
+        ("array", array_id),
+    )
     return [name for name, value in present if value]
 
 
@@ -304,7 +313,29 @@ def _resolve_job_ids(q, job_ids):
     return sorted(selection.items())
 
 
-def resolve_queue_selection(q, job_ids=None, indices=None, queue=None):
+def _resolve_array_id(q, array_id):
+    """Match every queued job carrying the batch tag `array_id`.
+
+    Exact and case-insensitive, with **no prefix matching** — unlike
+    :func:`_resolve_job_ids`, where a prefix is a convenience for typing one
+    long id. Here a prefix would silently widen a destructive operation from
+    one batch to every batch whose name starts the same way.
+    """
+    wanted = str(array_id).strip().casefold()
+    selection = [
+        (pos, f"--array {array_id}")
+        for pos, raw_item in enumerate(q)
+        if (normalize_job_item(raw_item)["array_id"] or "").casefold() == wanted
+    ]
+    if not selection:
+        raise QueueSelectionError(
+            "not_found",
+            f"no queued jobs in array {str(array_id).strip()!r}",
+        )
+    return selection
+
+
+def resolve_queue_selection(q, job_ids=None, indices=None, queue=None, array_id=None):
     """Resolve qdel selectors to ``[(position, token), ...]`` sorted by position.
 
     Exactly one selector kind may be supplied — mixing job ids with positions
@@ -312,9 +343,11 @@ def resolve_queue_selection(q, job_ids=None, indices=None, queue=None):
     Resolution happens before anything is popped, so a bad selector leaves the
     queue untouched.
     """
-    kinds = _selector_kinds(job_ids, indices, queue)
+    kinds = _selector_kinds(job_ids, indices, queue, array_id)
     if not kinds:
-        raise QueueSelectionError("invalid_params", "provide job id(s), indices, or a queue name")
+        raise QueueSelectionError(
+            "invalid_params", "provide job id(s), indices, a queue name, or an array name"
+        )
     if len(kinds) > 1:
         raise QueueSelectionError(
             "invalid_params",
@@ -327,6 +360,8 @@ def resolve_queue_selection(q, job_ids=None, indices=None, queue=None):
         return _resolve_indices(q, indices)
     if queue:
         return _resolve_queue_name(q, queue)
+    if array_id:
+        return _resolve_array_id(q, array_id)
     return _resolve_job_ids(q, job_ids)
 
 

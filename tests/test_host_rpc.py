@@ -134,6 +134,66 @@ class QdelTests(_StateFixture):
         self.assertFalse(resp["ok"])
         self.assertEqual(resp["error"]["code"], "invalid_params")
 
+    def _batched_queue(self):
+        queue_mod.save_queue([
+            {"cmd": "a", "job_id": "A", "array_id": "ffpopt-IDC"},
+            {"cmd": "loose", "job_id": "B"},
+            {"cmd": "c", "job_id": "C", "array_id": "ffpopt-IDC"},
+        ])
+
+    def test_qdel_by_array_removes_every_member_and_nothing_else(self):
+        self._batched_queue()
+        resp = rpc.dispatch({
+            "version": 1, "method": "qdel", "params": {"array_id": "ffpopt-IDC"},
+        })
+        self.assertTrue(resp["ok"], resp)
+        self.assertEqual([r["index"] for r in resp["result"]["removed"]], [1, 3])
+        remaining = queue_mod.load_queue()
+        self.assertEqual([item["job_id"] for item in remaining], ["B"])
+
+    def test_qdel_by_unknown_array_is_not_found_and_removes_nothing(self):
+        self._batched_queue()
+        resp = rpc.dispatch({
+            "version": 1, "method": "qdel", "params": {"array_id": "nope"},
+        })
+        self.assertFalse(resp["ok"])
+        self.assertEqual(resp["error"]["code"], "not_found")
+        self.assertEqual(len(queue_mod.load_queue()), 3)
+
+    def test_qdel_by_array_reports_members_it_could_not_reach(self):
+        """qdel only ever touched the queue. "Removed 1 job(s)" would otherwise
+        read as "the batch is cancelled"."""
+        self._batched_queue()
+        running_state_mod.save_running_jobs({
+            "eci5": {"cmd": "a", "job_id": "R1", "array_id": "ffpopt-IDC"},
+            "eci6": {"cmd": "other", "job_id": "R2"},
+        })
+        resp = rpc.dispatch({
+            "version": 1, "method": "qdel", "params": {"array_id": "ffpopt-IDC"},
+        })
+        self.assertTrue(resp["ok"], resp)
+        self.assertEqual(
+            resp["result"]["running"], [{"host": "eci5", "job_id": "R1"}],
+        )
+
+    def test_qdel_by_other_selectors_reports_no_running_key(self):
+        # Only the batch selector invites the "did this cancel everything?"
+        # question, so only it pays for the extra state read.
+        self._batched_queue()
+        resp = rpc.dispatch({"version": 1, "method": "qdel", "params": {"job_ids": ["A"]}})
+        self.assertTrue(resp["ok"])
+        self.assertNotIn("running", resp["result"])
+
+    def test_qdel_rejects_array_combined_with_job_ids(self):
+        self._batched_queue()
+        resp = rpc.dispatch({
+            "version": 1, "method": "qdel",
+            "params": {"array_id": "ffpopt-IDC", "job_ids": ["A"]},
+        })
+        self.assertFalse(resp["ok"])
+        self.assertEqual(resp["error"]["code"], "invalid_params")
+        self.assertEqual(len(queue_mod.load_queue()), 3)
+
     def _three_jobs(self):
         queue_mod.save_queue([
             {"cmd": "first", "job_id": "aaa111"},
@@ -537,6 +597,31 @@ class EnqueueTests(_StateFixture):
         self.assertEqual(len(queue_items), 1)
         self.assertEqual(queue_items[0]["cmd"], "echo hi")
         self.assertEqual(queue_items[0]["job_id"], "CUSTOM-ID")
+
+    def test_enqueue_persists_the_array_id(self):
+        resp = rpc.dispatch({
+            "version": 1, "method": "enqueue",
+            "params": {"cmd": "echo hi", "queue": "default", "array_id": "ffpopt-IDC"},
+        })
+        self.assertTrue(resp["ok"], resp)
+        self.assertEqual(resp["result"]["array_id"], "ffpopt-IDC")
+        self.assertEqual(queue_mod.load_queue()[0]["array_id"], "ffpopt-IDC")
+
+    def test_enqueue_without_an_array_id_stores_none(self):
+        resp = rpc.dispatch({
+            "version": 1, "method": "enqueue",
+            "params": {"cmd": "echo hi", "queue": "default"},
+        })
+        self.assertTrue(resp["ok"], resp)
+        self.assertIsNone(queue_mod.load_queue()[0]["array_id"])
+
+    def test_enqueue_rejects_a_non_string_array_id(self):
+        resp = rpc.dispatch({
+            "version": 1, "method": "enqueue",
+            "params": {"cmd": "echo hi", "queue": "default", "array_id": 7},
+        })
+        self.assertFalse(resp["ok"])
+        self.assertEqual(resp["error"]["code"], "invalid_params")
 
     def test_enqueue_rejects_unknown_queue(self):
         resp = rpc.dispatch({
