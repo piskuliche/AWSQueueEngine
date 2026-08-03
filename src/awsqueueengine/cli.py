@@ -3,8 +3,9 @@
 Phase 1 keeps full backward compatibility: every subcommand the original
 CLI accepted still works. Internally this just builds the union argparser
 and dispatches to the per-side handlers in :mod:`awsqueueengine.client.cli`
-and :mod:`awsqueueengine.host.cli`. Phase 6 adds a DeprecationWarning and
-points users at ``awsqe-client`` / ``awsqe-host``.
+and :mod:`awsqueueengine.host.cli`. No DeprecationWarning is emitted yet; a
+future release will add one and point users at ``awsqe-client`` /
+``awsqe-host``, which are the supported entry points today.
 
 This is the one module allowed to import from both the client and host
 subpackages. Code inside ``client/*`` and ``host/*`` must not cross.

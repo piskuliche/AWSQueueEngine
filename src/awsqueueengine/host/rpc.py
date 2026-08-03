@@ -122,6 +122,38 @@ def _load_queue_host_map() -> dict[str, list[str]]:
 # ---------- handlers ----------
 
 def handle_enqueue(params: dict) -> dict:
+    """Add one job to the queue.
+
+    Args:
+        params: RPC params.
+
+            * ``cmd`` (str, required) — the shell command to run on the worker.
+            * ``queue`` (str) — target queue; defaults to ``default``. Must be a
+              configured queue.
+            * ``hosts`` (list[str]) — restrict dispatch to these hosts. Every
+              entry must belong to ``queue``.
+            * ``priority`` (int) — explicit priority. When omitted, falls back to
+              ``100`` if ``high_priority`` is set, else ``0``.
+            * ``high_priority`` (bool) — shorthand for ``priority=100``; ignored
+              when ``priority`` is given explicitly.
+            * ``preempt`` (bool) — allow this job to preempt lower-priority work.
+            * ``mps`` (bool) — run the command under an MPS wrapper.
+            * ``payload`` (str) — local payload path, staged by the monitor.
+              **Ignored when ``payload_s3_uri`` is set.**
+            * ``payload_s3_uri`` (str) — S3 URI the worker pulls the payload from.
+            * ``payload_size_bytes`` (int) — advisory size, used to pick scratch.
+            * ``job_id`` (str) — caller-supplied id; a fresh tag is minted when
+              absent, so callers that want to track the job should pass one.
+
+    Returns:
+        ``{"job_id": str, "queue": str, "hosts": list[str] | None}`` — the id the
+        job was queued under, which is the caller's ``job_id`` when supplied.
+
+    Raises:
+        RpcError: ``invalid_params`` when ``cmd`` is blank, ``queue`` is not a
+            configured queue, or a host does not belong to that queue;
+            ``internal`` when the host's queue configuration is unreadable.
+    """
     params = _require_dict(params)
     command = _require_str(params, "cmd")
     queue_name = normalize_queue_name(_optional_str(params, "queue") or DEFAULT_QUEUE)
@@ -167,12 +199,34 @@ def handle_enqueue(params: dict) -> dict:
 
 
 def handle_list(params: dict) -> dict:
+    """Every queued (not yet dispatched) job, in queue order.
+
+    Args:
+        params: RPC params. Takes none.
+
+    Returns:
+        ``{"jobs": list[dict]}`` — queue order, so a job's 1-based position in
+        this list is the ``indices`` selector the legacy ``qdel`` path accepts.
+        Each entry is normalized by
+        :func:`~awsqueueengine.shared.queue.normalize_job_item`.
+    """
     _require_dict(params)
     jobs = [normalize_job_item(item) for item in load_queue()]
     return {"jobs": jobs}
 
 
 def handle_qstat(params: dict) -> dict:
+    """Jobs currently running, keyed by the worker host they occupy.
+
+    Args:
+        params: RPC params. Takes none.
+
+    Returns:
+        ``{"running": {host: job}}`` — one entry per busy host, so the key set is
+        also the set of hosts unavailable for dispatch. Each job carries an extra
+        ``started_at`` (epoch seconds, or ``None`` for jobs recorded before that
+        field existed) alongside the normalized item fields.
+    """
     _require_dict(params)
     running = {}
     for host, raw_item in load_running_jobs().items():
@@ -207,6 +261,17 @@ def handle_qdel(params: dict) -> dict:
 
 
 def handle_deferred_list(params: dict) -> dict:
+    """Jobs the monitor parked after repeated submit failures.
+
+    Args:
+        params: RPC params. Takes none.
+
+    Returns:
+        ``{"jobs": list[dict]}`` — normalized items, each with ``deferred_at``
+        (epoch seconds), ``last_error`` and ``last_host`` describing the attempt
+        that gave up. A job's 1-based position here is the ``indices`` selector
+        :func:`handle_requeue_deferred` expects.
+    """
     _require_dict(params)
     jobs = []
     for raw in load_deferred_jobs():
@@ -220,6 +285,27 @@ def handle_deferred_list(params: dict) -> dict:
 
 
 def handle_requeue_deferred(params: dict) -> dict:
+    """Move deferred jobs back onto the queue, or discard them.
+
+    Args:
+        params: RPC params.
+
+            * ``indices`` (list[int]) — 1-based positions in
+              :func:`handle_deferred_list`'s output. Mutually exclusive with
+              ``all``; exactly one of the two is required.
+            * ``all`` (bool) — act on every deferred job.
+            * ``drop`` (bool) — discard instead of requeueing.
+
+    Returns:
+        ``{"moved": [{"index": int, "item": dict}], "action": "requeued" |
+        "dropped"}``. Requeued items get ``submit_failures`` reset to ``0``, so a
+        job that hit the failure ceiling gets a full set of fresh attempts. An
+        empty deferred list is not an error — it returns ``moved: []``.
+
+    Raises:
+        RpcError: ``invalid_params`` when ``all`` and ``indices`` are combined or
+            both omitted; ``conflict`` when an index is outside the list.
+    """
     params = _require_dict(params)
     indices = _optional_int_list(params, "indices")
     all_flag = _optional_bool(params, "all")
@@ -291,12 +377,43 @@ def handle_failed_list(params: dict) -> dict:
 
 
 def handle_list_cooldowns(params: dict) -> dict:
+    """Hosts the monitor has temporarily benched, and until when.
+
+    A host lands here after a storage or transport failure and is skipped for
+    dispatch until its cooldown expires. :func:`handle_enable_host` clears one
+    early.
+
+    Args:
+        params: RPC params. Takes none.
+
+    Returns:
+        ``{"cooldowns": {host: float}}`` — the value is the epoch second the
+        cooldown expires, so a timestamp in the past means it has lapsed.
+        Hosts not on cooldown are absent rather than present with a null.
+    """
     _require_dict(params)
     cooldowns = get_host_cooldowns()
     return {"cooldowns": {host: float(ts) for host, ts in cooldowns.items()}}
 
 
 def handle_enable_host(params: dict) -> dict:
+    """Clear host cooldowns so the monitor will dispatch to them again.
+
+    Args:
+        params: RPC params.
+
+            * ``hosts`` (list[str]) — hosts to re-enable. Mutually exclusive with
+              ``all``; exactly one of the two is required.
+            * ``all`` (bool) — clear every cooldown.
+
+    Returns:
+        ``{"cleared": list[str]}`` — only the hosts that actually held a
+        cooldown, so naming a healthy host is a no-op rather than an error.
+
+    Raises:
+        RpcError: ``invalid_params`` when ``all`` and ``hosts`` are combined or
+            both omitted.
+    """
     params = _require_dict(params)
     hosts = _optional_string_list(params, "hosts")
     all_flag = _optional_bool(params, "all")
@@ -309,6 +426,24 @@ def handle_enable_host(params: dict) -> dict:
 
 
 def handle_job_info(params: dict) -> dict:
+    """Resolve one job id to its current state across queued, running and done.
+
+    Use :func:`handle_job_info_batch` for more than a handful of ids — it is one
+    round trip instead of one SSH invocation each.
+
+    Args:
+        params: RPC params.
+
+            * ``job_id`` (str, required) — the id to look up.
+
+    Returns:
+        ``{"state": dict | None}`` — ``None`` when the host has no record of the
+        id, which is a successful response, not an error. Callers cannot
+        distinguish "never submitted" from "aged out of the completed log".
+
+    Raises:
+        RpcError: ``invalid_params`` when ``job_id`` is missing or blank.
+    """
     params = _require_dict(params)
     job_id = _require_str(params, "job_id")
     state = lookup_job_state(job_id)
@@ -338,6 +473,29 @@ def handle_job_info_batch(params: dict) -> dict:
 
 
 def handle_tail(params: dict) -> dict:
+    """Tail the managed job log on one worker host.
+
+    The queue host reaches the worker over SSH on the caller's behalf, so this
+    works from a client that has no direct route to the worker.
+
+    Args:
+        params: RPC params.
+
+            * ``host`` (str, required) — worker host to read from.
+            * ``lines`` (int) — how many trailing lines; defaults to ``200`` and
+              is **clamped to 1..5000** rather than rejected, so an oversized
+              request returns a truncated log instead of an error.
+
+    Returns:
+        The :func:`~awsqueueengine.shared.worker_actions.tail_remote_log` result.
+        An unreachable worker is reported in-band as
+        ``{"host": str, "ok": false, "reason": "unreachable"}`` — the RPC itself
+        still succeeds.
+
+    Raises:
+        RpcError: ``invalid_params`` when ``host`` is missing or ``lines`` is not
+            an integer.
+    """
     params = _require_dict(params)
     host = _require_str(params, "host")
     lines = _optional_int(params, "lines")
@@ -391,6 +549,9 @@ def handle_stats(params: dict) -> dict:
 
 # ---------- registry + dispatcher ----------
 
+#: Authoritative registry of RPC method names. A method exists if and only if it
+#: is a key here. Adding one means adding a row to the table in
+#: ``docs/protocol.rst`` — ``tests/test_protocol_docs.py`` enforces that.
 METHODS: dict[str, Callable[[dict], dict]] = {
     "enqueue": handle_enqueue,
     "list": handle_list,
