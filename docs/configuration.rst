@@ -78,7 +78,8 @@ Queue definitions
      - Inline form, e.g. ``default=eci1,eci2;fast-gpus=eci3``. Static; read
        once at process start.
    * - ``AWSQUEUEENGINE_HOSTS_FILE``
-     - A flat host list, for setups predating queues.
+     - A flat host list, for setups predating queues. The ``--hosts-file``
+       flag overrides it per command.
 
 ``AWSQUEUEENGINE_QUEUES_FILE`` and ``AWSQUEUEENGINE_QUEUES`` are **mutually
 exclusive**. Prefer the file — it is the only form you can edit without

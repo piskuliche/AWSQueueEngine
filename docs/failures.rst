@@ -112,9 +112,12 @@ A job that fails to *start* repeatedly is moved out of the queue into
    awsqe-client deferred                    # what is parked
    awsqe-client requeue-deferred --all      # put it all back
    awsqe-client requeue-deferred --index 2  # or one entry
+   awsqe-client requeue-deferred --all --drop   # discard instead of requeueing
 
 Requeued jobs get their submit-failure count reset, so they get a full set of
-fresh attempts.
+fresh attempts. ``--drop`` removes them from the deferred list without
+requeueing — use it when the jobs are no longer wanted, since there is no
+other way to clear the list.
 
 Host cooldowns
 --------------

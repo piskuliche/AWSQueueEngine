@@ -60,6 +60,14 @@ Other daemon verbs: ``start``, ``stop``, ``restart``, ``status``, ``logs``,
 ``uninstall``. All accept ``--user`` and ``--dry-run``. If systemd is not
 available, ``awsqe-host start`` falls back to a foreground run you can Ctrl-C.
 
+``logs`` additionally takes ``--follow`` / ``-f`` to stream, and ``--lines`` /
+``-n`` to cap how much history is shown:
+
+.. code-block:: bash
+
+   awsqe-host logs --lines 200
+   awsqe-host logs --follow
+
 .. note::
 
    Legacy ``awsqueueengine start-monitor`` still works (foreground plus

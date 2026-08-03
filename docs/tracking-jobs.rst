@@ -95,18 +95,32 @@ Filters
 Batches
 -------
 
-Submitting a folder of work means a shell loop, one ``submit`` per
+Submitting a folder of work used to mean a shell loop, one ``submit`` per
 subdirectory. At a hundred-odd jobs those drown out everything else in
-``jobs``. Tag them at submit and they collapse to one row:
+``jobs``. Batch them and they collapse to one row:
 
 .. code-block:: bash
 
    cd ffpopt
+   awsqe-client submit --payload-glob 'IDC*' --queue production --priority -100 --mps \
+       "source ~/flowrc && cd \$PAYLOAD_DIR && python run_fe.py"
+
+One invocation is one batch, so the tag is derived for you
+(``IDC-20260802-091402``); ``--array NAME`` overrides it. Quote the pattern, or
+the shell expands it before ``awsqe-client`` sees it.
+
+The equivalent shell loop still works, and takes ``--array`` per job:
+
+.. code-block:: bash
+
    for IDC in IDC*; do
        awsqe-client submit --queue production --priority -100 --mps \
            --array ffpopt-IDC --payload "${PWD}/$IDC/" \
            "source ~/flowrc && cd \$PAYLOAD_DIR && python run_fe.py"
    done
+
+See :ref:`payload-glob` for why the single invocation is usually the one you
+want.
 
 .. code-block:: text
 
