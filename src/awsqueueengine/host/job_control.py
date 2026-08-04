@@ -90,6 +90,81 @@ def wrap_with_exit_status(job_command, tag):
     )
 
 
+# The launch has to hand the job off and return, not babysit it. Two details
+# earn their keep:
+#
+#   * every command sits on its own line, so `&` terminates only the `nohup`.
+#     Written as a `&&` chain with a trailing `&`, the ampersand binds looser
+#     than `&&` and backgrounds the *whole* chain; the resulting subshell
+#     inherits ssh's stdout/stderr and holds the channel open until the job
+#     exits. That made every launch block for the job's full runtime, so any
+#     job outliving SSH_TIMEOUT came back as `ssh timeout` (issue #33).
+#   * `setsid` puts the job in its own session, so sshd has nothing left to
+#     wait on once the foreground shell hits `exit 0`.
+#
+# `$!` is now the job's own PID rather than a wrapper subshell's, and `mkdir`
+# is sequenced before the `echo` that writes the pidfile into it.
+LAUNCH_SCRIPT_TEMPLATE = """\
+mkdir -p {log_dir}
+cd "$HOME" || true
+nohup setsid env MANAGER_TAG={tag}{payload_env} bash -lc {job_command} > {log_dir}/{tag}.log 2>&1 < /dev/null &
+__awsqe_pid=$!
+echo "$__awsqe_pid" > {log_dir}/{tag}.pid
+exit 0
+"""
+
+
+def _build_launch_command(tag, job_command, remote_payload_dir=None):
+    """Build the remote script that starts ``job_command`` and returns at once."""
+    payload_env = f" PAYLOAD_DIR={remote_payload_dir}" if remote_payload_dir else ""
+    return LAUNCH_SCRIPT_TEMPLATE.format(
+        log_dir=REMOTE_LOG_DIR,
+        tag=tag,
+        payload_env=payload_env,
+        job_command=shlex.quote(job_command),
+    )
+
+
+def _verify_launched(host, tag, remote_payload_dir=None, err=None):
+    """Decide whether a launch took, without trusting the launch ssh's status.
+
+    The launch ssh can report failure for reasons that have nothing to do with
+    the host — chiefly a timeout on a job that started perfectly well. So ask
+    the host what actually happened: read the pidfile, confirm the process is
+    alive, and fall back to scanning for the MANAGER_TAG marker if the pidfile
+    never landed. A pidfile whose process is gone means the job ran and died —
+    that is ``job``, not the host's fault.
+
+    When nothing is found at all, the verdict turns on whether the host
+    answered us. Both probes end in ``|| true``, so a zero status means the
+    host ran them and genuinely has no such process (``job``); a non-zero one
+    means ssh never got through (``host_transport``). Only that second case
+    costs the host a cooldown, so a host is blamed for being unreachable and
+    nothing else.
+    """
+    result = {"host": host, "tag": tag, "pid": None}
+    if remote_payload_dir:
+        result["payload"] = remote_payload_dir
+    pid_rc, pid_out, _ = ssh_run(host, f"cat {REMOTE_LOG_DIR}/{tag}.pid || true", timeout=5)
+    pid = pid_out.strip() if pid_out else None
+    if pid:
+        result["pid"] = pid
+        _, ps_out, _ = ssh_run(host, f"ps -p {pid} -o pid= || true", timeout=5)
+        if ps_out.strip():
+            return {**result, "ok": True}
+        return {**result, "ok": False, "err": "pidfile present but process not running", "reason": "job"}
+    scan_rc, scan_out, _ = ssh_run(host, "ps -eo pid,cmd | grep -F 'MANAGER_TAG=' | grep -v grep || true", timeout=8)
+    if scan_out:
+        try:
+            pid_guess = scan_out.splitlines()[0].split(None, 1)[0]
+            return {**result, "pid": pid_guess, "ok": True, "note": "started-no-pidfile"}
+        except Exception:
+            pass
+    host_answered = pid_rc == 0 and scan_rc == 0
+    reason = "job" if host_answered else "host_transport"
+    return {**result, "ok": False, "err": err, "reason": reason}
+
+
 def submit_to_host(
     host,
     job_command,
@@ -108,17 +183,9 @@ def submit_to_host(
     if payload_remote_path:
         remote_payload_dir = str(payload_remote_path).strip() or None
     if not payload_local_path and not remote_payload_dir and not payload_s3_uri:
-        remote_cmd = (
-            rf"mkdir -p {REMOTE_LOG_DIR} && cd $HOME || true && "
-            rf"nohup env MANAGER_TAG={tag} bash -lc {shlex.quote(job_command)} > {REMOTE_LOG_DIR}/{tag}.log 2>&1 < /dev/null & echo $! > {REMOTE_LOG_DIR}/{tag}.pid"
-        )
+        remote_cmd = _build_launch_command(tag, job_command)
         rc, out, err = ssh_run(host, remote_cmd, timeout=SSH_TIMEOUT)
-        if rc == 0:
-            rc2, out2, err2 = ssh_run(host, f"cat {REMOTE_LOG_DIR}/{tag}.pid || true")
-            pid = out2.strip() if out2 else None
-            return {"host": host, "tag": tag, "pid": pid, "ok": True}
-        else:
-            return {"host": host, "tag": tag, "pid": None, "ok": False, "err": err or out, "reason": "host_transport"}
+        return _verify_launched(host, tag, err=err or out)
     if payload_s3_uri and not remote_payload_dir:
         try:
             needed_bytes = int(payload_size_bytes or 0)
@@ -166,28 +233,9 @@ def submit_to_host(
         ok, method, sout, serr = rsync_to_host_with_fallback(str(local_path), host, remote_payload_dir)
         if not ok:
             return {"host": host, "ok": False, "err": f"rsync failed: {serr or sout}", "reason": "host_transport"}
-    remote_cmd = (
-        rf"mkdir -p {REMOTE_LOG_DIR} && cd $HOME || true && "
-        rf"nohup env MANAGER_TAG={tag} PAYLOAD_DIR={remote_payload_dir} bash -lc {shlex.quote(job_command)} "
-        rf"> {REMOTE_LOG_DIR}/{tag}.log 2>&1 < /dev/null & echo $! > {REMOTE_LOG_DIR}/{tag}.pid"
-    )
+    remote_cmd = _build_launch_command(tag, job_command, remote_payload_dir)
     rc, out, err = ssh_run(host, remote_cmd, timeout=SSH_TIMEOUT)
-    rc2, pid_out, err2 = ssh_run(host, f"cat {REMOTE_LOG_DIR}/{tag}.pid || true", timeout=5)
-    pid = pid_out.strip() if pid_out else None
-    if pid:
-        rc3, ps_out, err3 = ssh_run(host, f"ps -p {pid} -o pid= || true", timeout=5)
-        if ps_out.strip():
-            return {"host": host, "tag": tag, "pid": pid, "ok": True, "payload": remote_payload_dir}
-        else:
-            return {"host": host, "tag": tag, "pid": pid, "ok": False, "err": "pidfile present but process not running", "payload": remote_payload_dir, "reason": "job"}
-    rc4, out4, _ = ssh_run(host, "ps -eo pid,cmd | grep -F 'MANAGER_TAG=' | grep -v grep || true", timeout=8)
-    if out4:
-        try:
-            pid_guess = out4.splitlines()[0].split(None, 1)[0]
-            return {"host": host, "tag": tag, "pid": pid_guess, "ok": True, "payload": remote_payload_dir, "note": "started-no-pidfile"}
-        except Exception:
-            pass
-    return {"host": host, "tag": tag, "pid": None, "ok": False, "err": err or out, "payload": remote_payload_dir, "reason": "job"}
+    return _verify_launched(host, tag, remote_payload_dir, err=err or out)
 
 
 def write_run_info(local_payload_path, jobid, host, remote_payload_path):

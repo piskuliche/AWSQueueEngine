@@ -1,7 +1,13 @@
+import os
 import unittest
+from pathlib import Path
 from unittest.mock import patch
 
-from awsqueueengine.host.job_control import submit_to_host, wrap_in_mps_script
+from awsqueueengine.host.job_control import (
+    _build_launch_command,
+    submit_to_host,
+    wrap_in_mps_script,
+)
 from awsqueueengine.shared.worker_actions import kill_managed_on_host
 from awsqueueengine.shared.config import REMOTE_LOG_DIR
 
@@ -200,6 +206,180 @@ class ExitStatusCaptureTests(unittest.TestCase):
         launch_cmd = self._submit_and_capture(mps=True)
         self.assertIn("/manager_jobs/20260616-120000-abcdef.rc", launch_cmd)
         self.assertIn("nvidia-cuda-mps-control -d", launch_cmd)
+
+
+class LaunchCommandShapeTests(unittest.TestCase):
+    """The launch must hand the job off and return, not wait on it (issue #33)."""
+
+    def _launch_cmd(self, **kwargs):
+        commands = []
+
+        def fake_ssh_run(_host, cmd, timeout=60, capture_output=True):
+            commands.append(cmd)
+            if cmd.startswith("cat "):
+                return 0, "1234", ""
+            if "ps -p 1234" in cmd:
+                return 0, "1234", ""
+            return 0, "", ""
+
+        with patch("awsqueueengine.host.job_control.choose_scratch_on_host", return_value=("/scratch", 1000)), patch(
+            "awsqueueengine.host.job_control.ssh_run", side_effect=fake_ssh_run
+        ):
+            submit_to_host("eci5", "bash run.sh", tag="20260616-120000-abcdef", **kwargs)
+        return commands[0]
+
+    def test_no_and_chain_for_the_ampersand_to_swallow(self):
+        launch_cmd = self._launch_cmd()
+        # The bug: written as `mkdir && cd || true && nohup ... &`, the trailing
+        # `&` binds looser than `&&` and backgrounds the *whole* chain, whose
+        # subshell then holds ssh's stdout open for the job's entire runtime.
+        # With mkdir/cd as their own statements there is no chain left to
+        # swallow, so `&` can only apply to the nohup.
+        self.assertNotIn("&&", launch_cmd)
+        self.assertNotIn("|| true &", launch_cmd)
+        mkdir_line = next(l for l in launch_cmd.splitlines() if l.startswith("mkdir -p "))
+        self.assertFalse(mkdir_line.rstrip().endswith("&"))
+
+    def test_job_is_detached_into_its_own_session(self):
+        self.assertIn("nohup setsid env MANAGER_TAG=", self._launch_cmd())
+
+    def test_shell_exits_immediately_so_ssh_returns(self):
+        self.assertEqual(self._launch_cmd().strip().splitlines()[-1], "exit 0")
+
+    def test_pidfile_is_written_after_the_directory_exists(self):
+        launch_cmd = self._launch_cmd()
+        # `echo $! > .../tag.pid` used to run in the foreground, racing the
+        # backgrounded `mkdir` that creates the directory it writes into.
+        self.assertLess(launch_cmd.index("mkdir -p "), launch_cmd.index("echo \"$__awsqe_pid\""))
+
+    def test_recorded_pid_is_the_job_not_a_wrapper_subshell(self):
+        launch_cmd = self._launch_cmd()
+        nohup_line = next(l for l in launch_cmd.splitlines() if "nohup" in l)
+        pid_capture = next(l for l in launch_cmd.splitlines() if "__awsqe_pid=$!" in l)
+        self.assertLess(launch_cmd.index(nohup_line), launch_cmd.index(pid_capture))
+
+    def test_payload_path_shares_the_same_launch_shape(self):
+        launch_cmd = self._launch_cmd(payload_remote_path="/scratch/payload-1")
+        self.assertIn("PAYLOAD_DIR=/scratch/payload-1", launch_cmd)
+        self.assertIn("nohup setsid env MANAGER_TAG=", launch_cmd)
+        self.assertEqual(launch_cmd.strip().splitlines()[-1], "exit 0")
+
+
+class LaunchReturnsImmediatelyTests(unittest.TestCase):
+    """Run the generated script through a real bash, the way sshd would.
+
+    The unit tests above assert the script's *shape*; this asserts the property
+    that shape exists for. Before the fix this took the job's full runtime
+    instead of returning at once, which is what produced the bogus `ssh
+    timeout` (issue #33).
+    """
+
+    def test_launch_returns_while_the_job_is_still_running(self):
+        import subprocess
+        import tempfile
+        import time
+
+        with tempfile.TemporaryDirectory() as tmp:
+            marker = Path(tmp) / "job-finished"
+            script = _build_launch_command(
+                "20260616-120000-abcdef",
+                f"sleep 5; touch {marker}",
+            ).replace(REMOTE_LOG_DIR, tmp)
+
+            started = time.monotonic()
+            proc = subprocess.run(["bash", "-c", script], capture_output=True, text=True, timeout=30)
+            elapsed = time.monotonic() - started
+
+            self.assertEqual(proc.returncode, 0, proc.stderr)
+            # The job sleeps 5s; the launch must not wait for it.
+            self.assertLess(elapsed, 3.0, f"launch blocked for {elapsed:.1f}s")
+            self.assertFalse(marker.exists(), "launch waited for the job to finish")
+
+            pid = (Path(tmp) / "20260616-120000-abcdef.pid").read_text().strip()
+            self.assertTrue(pid.isdigit())
+            # The recorded pid is the job itself, not a wrapper subshell that
+            # exits immediately -- it is still alive right after the launch.
+            os.kill(int(pid), 0)
+
+
+class LaunchTimeoutVerificationTests(unittest.TestCase):
+    """A launch that timed out but actually started must not blame the host."""
+
+    @staticmethod
+    def _fake_ssh(launch_rc=124, launch_err="ssh timeout", pidfile="1234", process_alive=True, scan=""):
+        def fake_ssh_run(_host, cmd, timeout=60, capture_output=True):
+            if cmd.startswith("cat "):
+                return 0, pidfile, ""
+            if cmd.startswith("ps -p "):
+                return (0, "1234", "") if process_alive else (0, "", "")
+            if "MANAGER_TAG=" in cmd and cmd.startswith("ps -eo"):
+                return 0, scan, ""
+            if "aws s3 cp" in cmd:
+                return 0, "", ""
+            return launch_rc, "", launch_err
+
+        return fake_ssh_run
+
+    def test_no_payload_timeout_on_a_running_job_reports_success(self):
+        # The outage: reruns submitted without a payload outlived SSH_TIMEOUT,
+        # so the launch ssh returned 124 even though the job was running fine.
+        with patch("awsqueueengine.host.job_control.ssh_run", side_effect=self._fake_ssh()):
+            result = submit_to_host("eci20", "bash run.sh", tag="20260803-163409-f4c156")
+
+        self.assertTrue(result["ok"])
+        self.assertEqual(result["pid"], "1234")
+        self.assertNotIn("reason", result)
+
+    def test_payload_timeout_on_a_running_job_reports_success(self):
+        with patch("awsqueueengine.host.job_control.ssh_run", side_effect=self._fake_ssh()):
+            result = submit_to_host("eci20", "bash run.sh", payload_remote_path="/scratch/p-1")
+
+        self.assertTrue(result["ok"])
+        self.assertEqual(result["payload"], "/scratch/p-1")
+
+    def test_unreachable_host_with_nothing_running_is_host_transport(self):
+        def fake_ssh_run(_host, _cmd, timeout=60, capture_output=True):
+            return 255, "", "connection refused"
+
+        with patch("awsqueueengine.host.job_control.ssh_run", side_effect=fake_ssh_run):
+            result = submit_to_host("eci20", "bash run.sh")
+
+        self.assertFalse(result["ok"])
+        self.assertEqual(result["reason"], "host_transport")
+
+    def test_reachable_host_with_nothing_running_is_a_job_failure(self):
+        # The host answered both probes and simply has no such process, so the
+        # job is at fault. Blaming the host here would cost it a cooldown.
+        with patch(
+            "awsqueueengine.host.job_control.ssh_run",
+            side_effect=self._fake_ssh(launch_rc=1, launch_err="boom", pidfile="", scan=""),
+        ):
+            result = submit_to_host("eci20", "bash run.sh")
+
+        self.assertFalse(result["ok"])
+        self.assertEqual(result["reason"], "job")
+
+    def test_dead_process_behind_a_pidfile_is_a_job_failure(self):
+        with patch(
+            "awsqueueengine.host.job_control.ssh_run",
+            side_effect=self._fake_ssh(process_alive=False),
+        ):
+            result = submit_to_host("eci20", "bash run.sh")
+
+        self.assertFalse(result["ok"])
+        self.assertEqual(result["reason"], "job")
+        self.assertIn("process not running", result["err"])
+
+    def test_missing_pidfile_falls_back_to_the_manager_tag_scan(self):
+        with patch(
+            "awsqueueengine.host.job_control.ssh_run",
+            side_effect=self._fake_ssh(pidfile="", scan="4321 bash -lc MANAGER_TAG=x"),
+        ):
+            result = submit_to_host("eci20", "bash run.sh")
+
+        self.assertTrue(result["ok"])
+        self.assertEqual(result["pid"], "4321")
+        self.assertEqual(result["note"], "started-no-pidfile")
 
 
 if __name__ == "__main__":
