@@ -33,6 +33,13 @@ The ``DUR`` column does double duty: elapsed time for finished jobs, queue
 position (``q#3``) for queued ones. Running jobs show ``-``, because the host
 reports start times as preformatted text in its own timezone.
 
+``CMD`` is the last column and is trimmed to the width of your terminal, so a
+long command line ends in ``...`` rather than wrapping the row. The trim applies
+**only when the output is a terminal**: piping or redirecting always gets the
+whole command, so ``jobs | grep`` and ``jobs > file`` see exactly what they
+would have before. On a terminal, ``COLUMNS=200 awsqe-client jobs`` overrides
+the detected width.
+
 Statuses
 --------
 
@@ -55,7 +62,8 @@ Statuses
    * - ``unknown``
      - Finished, but without a provable exit status.
    * - ``deleted``
-     - Removed from the queue by **this client's** ``qdel``.
+     - Removed from the queue by **this client's** ``qdel``. Hidden from the
+       default listing (see below).
    * - ``missing``
      - The queue host has no record of it.
 
@@ -65,6 +73,18 @@ a different queue host than the one being queried. It is *not* treated as
 final — the job keeps getting re-checked, and a whole host's worth of jobs never
 flips to ``missing`` at once (that pattern is read as a bad read of the host's
 state files rather than as mass deletion).
+
+``deleted`` is the opposite kind of certainty, and is **hidden by default**. It
+is written only by this client's own ``qdel``, so by definition you already know;
+left in the listing it was noise that also distorted batch rows. The footer says
+how many were held back::
+
+   3 deleted job(s) hidden; `--status deleted` shows them (`--status all` shows everything).
+
+Naming *any* status turns the suppression off, so ``--status deleted``,
+``--status done`` and ``--status all`` all show them. Note that ``--forget``
+cannot be combined with a filter, so tombstones are dropped from the ledger by
+id or with ``--forget-before``.
 
 Filters
 -------
@@ -91,6 +111,34 @@ Filters
   ``--until 2026-07-30`` includes the 30th.
 * ``--limit`` / ``-n`` caps the rows (default 50; ``0`` for all). A collapsed
   batch is **one row** however many jobs it holds.
+* ``--payloads`` adds each job's payload directories under its row — see
+  `Payload directories`_.
+
+Recipes
+-------
+
+The filters compose, which a list of flags does not make obvious. The same
+examples are in ``awsqe-client jobs --help``:
+
+.. code-block:: bash
+
+   # batches collapsed to one row each; deleted jobs hidden
+   awsqe-client jobs
+
+   # that batch's jobs listed individually
+   awsqe-client jobs --array protrbfe_aug3
+
+   # just the members that finished cleanly
+   awsqe-client jobs --array protrbfe_aug3 --status completed
+
+   # the failures, with each log pulled to this machine
+   awsqe-client jobs --array protrbfe_aug3 --status failed --fetch-logs
+
+   # what is still in flight, and which directories it lives in
+   awsqe-client jobs --status active --payloads
+
+   # the tombstones the default view hides
+   awsqe-client jobs --status deleted --since 7d
 
 Batches
 -------
@@ -140,7 +188,8 @@ want.
   stays at the top.
 * ``--array NAME`` drills into one batch and lists its jobs individually;
   ``--expand`` (or ``--no-group``) turns grouping off entirely. ``--fetch-logs``
-  implies expansion, since a log path has nowhere to go on a batch row.
+  and ``--payloads`` imply expansion, since a per-job path has nowhere to go on
+  a batch row.
 * The other filters compose, and the batch row reflects what survived them:
   ``jobs --array ffpopt-IDC --status failed --fetch-logs`` is the practical way
   to read the tracebacks out of a batch.
@@ -154,7 +203,25 @@ rewritten — unlike a queue name, an array name is something you type back in a
 nothing with nothing on screen to explain why.
 
 Reusing a name is legal and appends to that batch; ``--since`` separates the
-runs.
+runs. Submit warns when the name already has live jobs, because two live runs
+under one tag is a footgun: ``qdel --array NAME`` selects on the tag alone, so
+cancelling one would cancel the other too.
+
+.. code-block:: text
+
+   [WARN] array 'protrbfe_aug3' already has 51 live job(s) in this client's ledger
+          (51 queued; newest submitted 2026-08-03 23:17:04).
+          Reusing the name appends to that batch: `jobs` shows one merged row, and
+          `qdel --array protrbfe_aug3` would cancel both runs.
+          Pass a different --array name if this is a separate run.
+
+The warning never blocks the submit. Once an earlier run has been deleted, its
+jobs no longer shape the batch row at all: the queue, the size and both
+timestamps are computed from the members that are **not** tombstones, so a
+cancelled run cannot make a healthy batch report the wrong queue (the ``*``
+above), the wrong start time, or a count larger than the batch it was submitted
+with. The deleted members still appear in the row's status tally under
+``--status all``.
 
 Job logs
 --------
@@ -196,13 +263,47 @@ being written. When a worker no longer has the log — recycled, or
 The cache is capped at 512 MB, dropping the oldest first, and ``--forget``
 deletes a job's cached log along with its ledger entry.
 
+.. _payload-directories:
+
+Payload directories
+-------------------
+
+A job's payload exists in up to three places: the directory you submitted, the
+directory the worker unpacked it into, and the S3 copy in between. ``--payloads``
+prints them under each row:
+
+.. code-block:: text
+
+   $ awsqe-client jobs --status active --payloads
+   SUBMITTED             JOB                     STATUS      HOST      QUEUE         DUR       CMD
+   2026-08-03 23:17:04   20260803-231704-a9f1c2  running     eci7      zeke-queue    -         python run_fe.py
+                         local:  /mnt/dat1/zeke/runs/protrbfe/aug3/rep0001
+                         remote: /scratch/zeke/awsqe/protrbfe_aug3-0001-a9f
+                         s3:     s3://my-bucket/awsqe/20260803-231704-a9f1c2.tar.gz
+
+``local:`` is what this client archived and is known from the moment you submit.
+``remote:`` is where the job actually ran, and only exists once a worker has
+unpacked the payload — before that it reads ``(not staged yet)``, which is why
+this is most useful for running and completed jobs. ``s3:`` appears when the
+payload was uploaded, and is the only copy that outlives a recycled worker.
+
+The flag implies ``--expand``, since a per-job path has nowhere to go on a batch
+row. It adds up to three lines per job, so the default ``-n 50`` is worth
+keeping in mind before combining it with ``-n 0``.
+
 Ledger housekeeping
 -------------------
 
-The ledger holds 2000 jobs, dropping the oldest *finished* ones past that —
-jobs still in flight are never evicted. ``--forget <job-id-or-prefix>`` and
-``--forget-before <when>`` remove entries by hand; both only stop tracking, they
-never cancel anything (use ``qdel`` for that).
+The ledger holds 10,000 jobs, dropping the oldest *finished* ones past that —
+jobs still in flight are never evicted, even if that leaves it above the cap.
+``--forget <job-id-or-prefix>`` and ``--forget-before <when>`` remove entries by
+hand; both only stop tracking, they never cancel anything (use ``qdel`` for
+that).
+
+One refresh resolves up to 32,000 ids per queue host (64 rounds of 500). Because
+in-flight jobs are never evicted, that is a separate ceiling from the ledger cap
+rather than a consequence of it; if it is ever reached, the jobs past it keep
+their last-known status and say so on stderr rather than being skipped silently.
 
 ``awsqe-client info --job-id <id-or-prefix>`` refreshes a single tracked job
 without needing to ``cd`` to its payload directory, and rewrites that payload's

@@ -30,6 +30,7 @@ class _JobsArgs:
         self.limit = 50
         self.no_refresh = False
         self.fetch_logs = False
+        self.payloads = False
         self.log = None
         self.cat = None
         self.forget = None
@@ -82,12 +83,13 @@ class ParserTests(unittest.TestCase):
     def test_full_flag_surface(self):
         args = client_cli.build_parser().parse_args([
             "jobs", "--since", "7d", "--until", "2026-07-30", "-n", "5",
-            "--no-refresh", "--queue-host", "qh",
+            "--no-refresh", "--payloads", "--queue-host", "qh",
         ])
         self.assertEqual(args.since, "7d")
         self.assertEqual(args.until, "2026-07-30")
         self.assertEqual(args.limit, 5)
         self.assertTrue(args.no_refresh)
+        self.assertTrue(args.payloads)
         self.assertEqual(args.queue_host, "qh")
 
     def test_grouping_is_on_by_default(self):
@@ -213,6 +215,34 @@ class RefreshTests(_LedgerFixture):
         self.assertEqual(len(rounds), 2)
         self.assertEqual(len(rounds[1]), 1)
         self.assertEqual({r["status"] for r in ledger_mod.load_ledger()}, {"running"})
+
+    def test_a_host_that_skips_without_resolving_anything_stops_after_one_round(self):
+        """Raising the round cap must not turn a broken host into 64 ssh trips."""
+        for job_id in ("A", "B"):
+            self._submit(job_id)
+        rounds = []
+
+        def fake_rpc(host, method, params, **kwargs):
+            rounds.append(list(params["job_ids"]))
+            return {"states": {}, "skipped": list(params["job_ids"])}
+
+        self._run(_JobsArgs(), rpc=fake_rpc)
+        self.assertEqual(len(rounds), 1)
+
+    def test_ids_still_unresolved_at_the_round_cap_are_warned_about_not_dropped(self):
+        """Silent truncation left those jobs stale with nothing saying why."""
+        for job_id in ("A", "B", "C"):
+            self._submit(job_id)
+
+        def fake_rpc(host, method, params, **kwargs):
+            asked = params["job_ids"]
+            return {"states": {asked[0]: {"status": "running"}}, "skipped": asked[1:]}
+
+        with patch.object(client_cli, "_MAX_BATCH_ROUNDS", 2):
+            _, err = self._run(_JobsArgs(), rpc=fake_rpc)
+        self.assertIn("left 1 tracked job(s) unresolved", err)
+        by_id = {r["job_id"]: r for r in ledger_mod.load_ledger()}
+        self.assertEqual(by_id["C"]["status"], "submitted")
 
     def test_queue_host_flag_overrides_each_records_host(self):
         self._submit("A", queue_host="qh1")
@@ -931,10 +961,361 @@ class QdelLedgerIntegrationTests(_LedgerFixture):
         self.assertEqual(by_id["B"]["status"], "submitted")
 
     def test_a_deleted_job_is_terminal_so_refresh_skips_it(self):
+        """`--status deleted` because the default view now hides them.
+
+        Asserting on the default listing would pass for the wrong reason: the
+        hidden-count hint contains the word "deleted" too.
+        """
         self._submit("A")
         ledger_mod.mark_status(["A"], "deleted")
-        out, _ = self._run(_JobsArgs())   # rpc=None raises if called
+        out, _ = self._run(_JobsArgs(status=["deleted"]))   # rpc=None raises if called
         self.assertIn("deleted", out)
+        self.assertIn("A", out)
+
+
+class DeletedSuppressionTests(_LedgerFixture):
+    """`deleted` is written only by this client's own qdel, so it is never news.
+
+    The load-bearing case is the last one: hiding tombstones must not read as
+    "the user filtered", because a filtered batch row is forbidden from showing
+    its submitted-size fraction and an unfiltered one is not.
+    """
+
+    def _deleted(self, job_id, **kwargs):
+        self._submit(job_id, **kwargs)
+        ledger_mod.mark_status([job_id], "deleted")
+
+    def test_deleted_jobs_are_hidden_by_default(self):
+        self._submit("LIVE")
+        self._deleted("DEAD")
+        out, _ = self._run(_JobsArgs(no_refresh=True))
+        self.assertIn("LIVE", out)
+        self.assertNotIn("DEAD", out)
+
+    def test_the_footer_names_the_hidden_count_and_the_escape_hatch(self):
+        self._submit("LIVE")
+        self._deleted("DEAD")
+        out, _ = self._run(_JobsArgs(no_refresh=True))
+        self.assertIn("1 deleted job(s) hidden", out)
+        self.assertIn("--status deleted", out)
+        self.assertIn("--status all", out)
+
+    def test_nothing_is_said_when_there_is_nothing_to_hide(self):
+        self._submit("LIVE")
+        out, _ = self._run(_JobsArgs(no_refresh=True))
+        self.assertNotIn("hidden", out)
+
+    def test_status_deleted_shows_them(self):
+        self._deleted("DEAD")
+        out, _ = self._run(_JobsArgs(no_refresh=True, status=["deleted"]))
+        self.assertIn("DEAD", out)
+        self.assertNotIn("hidden", out)
+
+    def test_status_all_shows_them(self):
+        self._submit("LIVE")
+        self._deleted("DEAD")
+        out, _ = self._run(_JobsArgs(no_refresh=True, status=["all"]))
+        self.assertIn("LIVE", out)
+        self.assertIn("DEAD", out)
+
+    def test_status_deleted_plus_queued_shows_both(self):
+        self._submit("Q")
+        ledger_mod.apply_state("Q", {"status": "queued"})
+        self._deleted("DEAD")
+        out, _ = self._run(_JobsArgs(no_refresh=True, status=["deleted,queued"]))
+        self.assertIn("Q", out)
+        self.assertIn("DEAD", out)
+
+    def test_a_status_filter_that_cannot_match_deleted_prints_no_hint(self):
+        """An explicit --status turns the exclusion off, so nothing was hidden."""
+        self._submit("A")
+        ledger_mod.apply_state("A", {"status": "failed"})
+        self._deleted("DEAD")
+        out, _ = self._run(_JobsArgs(no_refresh=True, status=["failed"]))
+        self.assertNotIn("hidden", out)
+
+    def test_the_hidden_count_respects_the_other_filters(self):
+        self._deleted("OLD", submitted_at=100.0)
+        self._deleted("RECENT", submitted_at=9_000_000_000.0)
+        out, _ = self._run(_JobsArgs(no_refresh=True, since="2030-01-01"))
+        self.assertIn("1 deleted job(s) hidden", out)
+
+    def test_hiding_does_not_suppress_the_batch_size_fraction(self):
+        """The regression guard for routing this through `exclude_statuses`.
+
+        Folding it into `statuses` instead would make `filtered` permanently
+        true, and a filtered row may never show `3/142`.
+        """
+        for i in range(3):
+            self._submit(f"b-{i}", submitted_at=1000.0 + i, array_id="b", array_size=142)
+        self._deleted("b-dead", submitted_at=900.0, array_id="b", array_size=142)
+        out, _ = self._run(_JobsArgs(no_refresh=True))
+        self.assertIn("3/142", out)
+
+    def test_a_batch_of_only_deleted_jobs_vanishes_by_default_and_returns(self):
+        self._deleted("b-0", array_id="b")
+        self._deleted("b-1", array_id="b")
+        hidden, _ = self._run(_JobsArgs(no_refresh=True))
+        self.assertNotIn("ARRAY", hidden)
+        shown, _ = self._run(_JobsArgs(no_refresh=True, status=["deleted"]))
+        self.assertIn("b", shown)
+
+    def test_an_all_deleted_ledger_still_explains_its_empty_listing(self):
+        self._deleted("DEAD")
+        out, _ = self._run(_JobsArgs(no_refresh=True))
+        self.assertIn("1 deleted job(s) hidden", out)
+
+
+class CmdTruncationTests(_LedgerFixture):
+    """CMD is the last column, so only it can overflow — and only on a screen."""
+
+    LONG = "bash run.sh " + "--flag-with-a-long-value " * 20
+
+    def test_a_long_command_is_untouched_when_stdout_is_not_a_tty(self):
+        """Pipes, redirects and this suite must all see the whole command."""
+        self._submit("A", cmd=self.LONG)
+        out, _ = self._run(_JobsArgs(no_refresh=True))
+        self.assertIn(self.LONG.rstrip(), out)
+
+    def test_terminal_width_is_none_for_a_non_tty_stream(self):
+        with redirect_stdout(io.StringIO()):
+            self.assertIsNone(client_cli._terminal_width())
+
+    def test_a_long_command_is_cut_to_the_terminal_width(self):
+        self._submit("A", cmd=self.LONG)
+        with patch("awsqueueengine.client.cli._terminal_width", return_value=120):
+            out, _ = self._run(_JobsArgs(no_refresh=True))
+        for line in out.splitlines():
+            self.assertLessEqual(len(line), 120, line)
+        self.assertIn("...", out)
+
+    def test_the_cut_command_keeps_its_head_not_its_tail(self):
+        self._submit("A", cmd=self.LONG)
+        with patch("awsqueueengine.client.cli._terminal_width", return_value=120):
+            out, _ = self._run(_JobsArgs(no_refresh=True))
+        self.assertIn("bash run.sh", out)
+
+    def test_a_narrow_terminal_leaves_the_command_whole(self):
+        """The 92-column prefix already fills the row; the command is not what
+        overflowed it, and trimming it would not win the line back."""
+        self._submit("A", cmd=self.LONG)
+        with patch("awsqueueengine.client.cli._terminal_width", return_value=40):
+            out, _ = self._run(_JobsArgs(no_refresh=True))
+        self.assertIn(self.LONG.rstrip(), out)
+
+    def test_a_short_command_is_not_padded_or_marked(self):
+        self._submit("A", cmd="echo hi")
+        with patch("awsqueueengine.client.cli._terminal_width", return_value=120):
+            out, _ = self._run(_JobsArgs(no_refresh=True))
+        self.assertIn("echo hi", out)
+        self.assertNotIn("...", out)
+
+    def test_a_job_id_wider_than_its_cell_shifts_the_cut_rather_than_the_row(self):
+        self._submit("J" * 40, cmd=self.LONG)
+        with patch("awsqueueengine.client.cli._terminal_width", return_value=120):
+            out, _ = self._run(_JobsArgs(no_refresh=True))
+        for line in out.splitlines():
+            self.assertLessEqual(len(line), 120, line)
+
+    def test_continuation_lines_are_never_cut(self):
+        """Half a path is worse than a wrapped one."""
+        long_path = "/scratch/" + "deep/" * 40 + "run.log"
+        self._submit("A")
+        ledger_mod.apply_state("A", {"status": "completed"})
+        ledger_mod.record_log_result("A", log_path=long_path)
+        with patch("awsqueueengine.client.cli._terminal_width", return_value=120):
+            out, _ = self._run(_JobsArgs(no_refresh=True))
+        self.assertIn(long_path, out)
+
+
+class PayloadLineTests(_LedgerFixture):
+    """`--payloads`: both directories already live in the record."""
+
+    LOCAL = "/mnt/dat1/zeke/runs/rep0001"
+    REMOTE = "/scratch/zeke/awsqe/JOB-a9f"
+
+    def test_payloads_prints_local_and_remote_under_the_row(self):
+        self._submit("A", payload=self.LOCAL)
+        ledger_mod.apply_state("A", {"status": "running", "remote_payload_path": self.REMOTE})
+        out, _ = self._run(_JobsArgs(no_refresh=True, payloads=True))
+        self.assertIn(f"local:  {self.LOCAL}", out)
+        self.assertIn(f"remote: {self.REMOTE}", out)
+
+    def test_nothing_is_printed_without_the_flag(self):
+        self._submit("A", payload=self.LOCAL)
+        out, _ = self._run(_JobsArgs(no_refresh=True))
+        self.assertNotIn("local:", out)
+
+    def test_payloads_implies_expand(self):
+        for i in range(3):
+            self._submit(f"b-{i}", array_id="b", payload=self.LOCAL)
+        out, _ = self._run(_JobsArgs(no_refresh=True, payloads=True))
+        self.assertNotIn("ARRAY", out)
+        self.assertIn("b-0", out)
+
+    def test_a_queued_job_says_its_remote_dir_is_not_staged_yet(self):
+        """The worker only unpacks at dispatch; say so rather than leave a gap."""
+        self._submit("A", payload=self.LOCAL)
+        ledger_mod.apply_state("A", {"status": "queued"})
+        out, _ = self._run(_JobsArgs(no_refresh=True, payloads=True))
+        self.assertIn("remote: (not staged yet)", out)
+
+    def test_a_finished_job_shows_the_remote_dir_merged_in_from_the_host(self):
+        self._submit("A", payload=self.LOCAL)
+        ledger_mod.apply_state("A", {"status": "completed", "remote_payload_path": self.REMOTE})
+        out, _ = self._run(_JobsArgs(no_refresh=True, payloads=True))
+        self.assertIn(self.REMOTE, out)
+        self.assertNotIn("(not staged yet)", out)
+
+    def test_the_s3_copy_is_shown_when_there_is_one(self):
+        self._submit("A", payload=self.LOCAL, payload_s3_uri="s3://bucket/a.tar.gz")
+        out, _ = self._run(_JobsArgs(no_refresh=True, payloads=True))
+        self.assertIn("s3:     s3://bucket/a.tar.gz", out)
+
+    def test_a_payload_less_job_gets_no_continuation_lines(self):
+        self._submit("A")
+        out, _ = self._run(_JobsArgs(no_refresh=True, payloads=True))
+        self.assertNotIn("local:", out)
+        self.assertNotIn("remote:", out)
+
+    def test_the_log_line_still_comes_last(self):
+        self._submit("A", payload=self.LOCAL)
+        ledger_mod.apply_state("A", {"status": "completed", "remote_payload_path": self.REMOTE})
+        ledger_mod.record_log_result("A", log_path="/tmp/a.log")
+        out, _ = self._run(_JobsArgs(no_refresh=True, payloads=True))
+        lines = out.splitlines()
+        remote_at = next(i for i, line in enumerate(lines) if "remote:" in line)
+        log_at = next(i for i, line in enumerate(lines) if "log:" in line)
+        self.assertLess(remote_at, log_at)
+
+    def test_the_labels_align_with_the_existing_log_line(self):
+        self._submit("A", payload=self.LOCAL)
+        ledger_mod.apply_state("A", {"status": "completed", "remote_payload_path": self.REMOTE})
+        ledger_mod.record_log_result("A", log_path="/tmp/a.log")
+        out, _ = self._run(_JobsArgs(no_refresh=True, payloads=True))
+        starts = {line.index(label)
+                  for line in out.splitlines()
+                  for label in ("local:", "remote:", "log:") if label in line}
+        self.assertEqual(len(starts), 1, f"labels do not stack: {starts}")
+
+
+class ArrayReuseWarningTests(_LedgerFixture):
+    """Two live runs under one tag is a footgun nothing else warns about."""
+
+    class _SubmitArgs:
+        payload = None
+        hosts_file = None
+        hosts = None
+        host_set = None
+        queue = None
+        priority = None
+        high_priority = False
+        preempt = False
+        mps = False
+        array = None
+        queue_host = "queuebox"
+
+    def _submit_remote(self, **overrides):
+        args = self._SubmitArgs()
+        for key, value in overrides.items():
+            setattr(args, key, value)
+        out, err = io.StringIO(), io.StringIO()
+        with patch("awsqueueengine.client.cli.rpc_call", return_value={"job_id": "NEW-1"}), \
+             patch("awsqueueengine.client.cli.prepare_payload",
+                   return_value={"s3_uri": "s3://b/k.tar.gz", "size_bytes": 10}):
+            with redirect_stdout(out), redirect_stderr(err):
+                client_cli.cmd_submit_remote(args, "python train.py")
+        return out.getvalue(), err.getvalue()
+
+    def test_reusing_a_tag_with_live_members_warns_and_still_submits(self):
+        self._submit("OLD-1", array_id="wave")
+        out, err = self._submit_remote(array="wave")
+        self.assertIn("already has 1 live job(s)", err)
+        self.assertIn("NEW-1", out)
+        self.assertIn("NEW-1", {r["job_id"] for r in ledger_mod.load_ledger()})
+
+    def test_the_warning_names_the_qdel_array_footgun(self):
+        self._submit("OLD-1", array_id="wave")
+        _, err = self._submit_remote(array="wave")
+        self.assertIn("qdel --array wave", err)
+
+    def test_the_warning_counts_only_live_members(self):
+        self._submit("DONE", array_id="wave")
+        ledger_mod.apply_state("DONE", {"status": "completed"})
+        self._submit("LIVE", array_id="wave")
+        _, err = self._submit_remote(array="wave")
+        self.assertIn("already has 1 live job(s)", err)
+
+    def test_an_all_terminal_batch_does_not_warn(self):
+        self._submit("DONE", array_id="wave")
+        ledger_mod.apply_state("DONE", {"status": "completed"})
+        _, err = self._submit_remote(array="wave")
+        self.assertEqual("", err)
+
+    def test_a_fresh_tag_submits_silently(self):
+        self._submit("OLD-1", array_id="other")
+        _, err = self._submit_remote(array="wave")
+        self.assertEqual("", err)
+
+    def test_an_untagged_submit_never_reads_the_ledger(self):
+        with patch.object(ledger_mod, "load_ledger", wraps=ledger_mod.load_ledger) as spy:
+            self._submit_remote(array=None)
+        spy.assert_not_called()
+
+    def test_the_warning_lands_before_the_payload_upload(self):
+        """There is still time to Ctrl-C before the tar-and-push to S3."""
+        self._submit("OLD-1", array_id="wave")
+        order = []
+        args = self._SubmitArgs()
+        args.array = "wave"
+        args.payload = "/tmp/does-not-matter"
+
+        def _record_upload(*a, **kw):
+            order.append("upload")
+            return {"s3_uri": "s3://b/k.tar.gz", "size_bytes": 10}
+
+        class _Tracking(io.StringIO):
+            def write(self, text):
+                if "already has" in text:
+                    order.append("warn")
+                return super().write(text)
+
+        with patch("awsqueueengine.client.cli.rpc_call", return_value={"job_id": "NEW-1"}), \
+             patch("awsqueueengine.client.cli.prepare_payload", side_effect=_record_upload):
+            with redirect_stdout(io.StringIO()), redirect_stderr(_Tracking()):
+                client_cli.cmd_submit_remote(args, "python train.py")
+        self.assertEqual(order, ["warn", "upload"])
+
+
+class RefreshCeilingTests(unittest.TestCase):
+    def test_the_ledger_cap_cannot_exceed_what_one_refresh_resolves(self):
+        """The only thing that notices if the cap is raised without the rounds.
+
+        `prune_records` never evicts a live record, so a ledger that outgrows
+        what one refresh can ask about leaves its tail permanently stale.
+        """
+        from awsqueueengine.host.rpc import MAX_JOB_INFO_BATCH
+        self.assertLessEqual(
+            ledger_mod.MAX_TRACKED_RECORDS,
+            client_cli._MAX_BATCH_ROUNDS * MAX_JOB_INFO_BATCH,
+        )
+
+
+class HelpSurfaceTests(unittest.TestCase):
+    """The filters compose; a bare list of flags never says so."""
+
+    def _jobs_help(self):
+        for action in client_cli.build_parser()._actions:
+            if getattr(action, "_name_parser_map", None):
+                return action._name_parser_map["jobs"].format_help()
+        raise AssertionError("no subparsers found")
+
+    def test_the_jobs_epilog_keeps_its_line_breaks(self):
+        """Guards the formatter_class: the default one reflows this to a blob."""
+        self.assertIn("--array protrbfe_aug3 --status completed", self._jobs_help())
+
+    def test_the_status_help_points_at_the_array_recipe(self):
+        self.assertIn("--array NAME --status completed", self._jobs_help())
 
 
 if __name__ == "__main__":

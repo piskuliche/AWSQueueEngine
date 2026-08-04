@@ -35,6 +35,7 @@ from ..shared.job_status import (
     DELETED,
     FAILED,
     QUEUED,
+    SUBMITTED,
     expand_status_filter,
     is_terminal,
 )
@@ -293,6 +294,81 @@ def _render_failed_jobs(jobs, show_log=False):
                 print(f"{'':20}  |  {line}", flush=True)
 
 
+_ELLIPSIS = "..."
+
+
+def _terminal_width():
+    """Screen width for trimming a column, or ``None`` when there is no screen.
+
+    ``None`` whenever stdout is not a terminal, and that is the whole safety
+    story: ``jobs | grep``, ``jobs > file`` and the test suite all get the
+    listing untrimmed, so nothing that reads this output can be changed by the
+    size of the window it happened to run in. On a real terminal ``$COLUMNS``
+    still wins — :func:`shutil.get_terminal_size` consults it first — which is
+    the escape hatch for anyone who wants a different cut.
+    """
+    try:
+        if not sys.stdout.isatty():
+            return None
+    except (AttributeError, ValueError):  # a closed or exotic stream
+        return None
+    # Never raises: falls back to (80, 24) when it can't ask the terminal.
+    return shutil.get_terminal_size().columns or None
+
+
+def _fit_cmd(cmd, prefix_len, width):
+    """`cmd` cut to what is left of the row, or unchanged when it fits.
+
+    Measured against the *rendered* prefix rather than an assumed column, so a
+    job id wider than its 22-character cell shifts the cut instead of silently
+    pushing the row over.
+
+    The one case that gives up is a prefix that already fills the row on its
+    own — a very narrow terminal. The command is not what overflowed it there,
+    and trimming it to nothing would not win the line back.
+    """
+    if width is None:
+        return cmd
+    room = width - prefix_len
+    if room <= 0 or len(cmd) <= room:
+        return cmd
+    if room <= len(_ELLIPSIS):
+        return _ELLIPSIS[:room]
+    return cmd[:room - len(_ELLIPSIS)] + _ELLIPSIS
+
+
+def _payload_lines(record):
+    """`--payloads` continuation lines for one row, in the ``log:`` style.
+
+    Both directories already live in the record and the listing simply never
+    showed them: ``payload`` is the local directory this client archived
+    (client-owned, absolute) and ``remote_payload_path`` is where the worker
+    unpacked it, merged in from host state by :func:`ledger.merge_host_fields`.
+
+    Nothing here is trimmed to the terminal, unlike the command: a path exists
+    to be pasted somewhere else, and half a path is worse than a wrapped one.
+    """
+    local = str(record.get("payload") or "")
+    remote = str(record.get("remote_payload_path") or "")
+    s3_uri = str(record.get("payload_s3_uri") or "")
+    if not (local or remote or s3_uri):
+        return []  # a payload-less submit has nothing to say here
+    lines = []
+    if local:
+        lines.append(f"local:  {local}")
+    if remote:
+        lines.append(f"remote: {remote}")
+    elif record.get("status") in (SUBMITTED, QUEUED):
+        # The worker only unpacks at dispatch. Say which it is, rather than
+        # leaving a gap that reads like a rendering bug.
+        lines.append("remote: (not staged yet)")
+    if s3_uri:
+        # The only durable copy once a worker's scratch is recycled, which is
+        # most of why anyone asks where a payload went.
+        lines.append(f"s3:     {s3_uri}")
+    return lines
+
+
 def _tracked_dur_text(record):
     """One column doing double duty: elapsed for finished jobs, position for queued.
 
@@ -305,7 +381,7 @@ def _tracked_dur_text(record):
     return record.get("duration") or "-"
 
 
-def _render_tracked_jobs(records, total=None):
+def _render_tracked_jobs(records, total=None, *, show_payloads=False):
     if not records:
         # "did my filter match nothing" and "have I submitted anything" are
         # different questions; answer whichever one was asked.
@@ -315,13 +391,20 @@ def _render_tracked_jobs(records, total=None):
         f"{'SUBMITTED':20}  {'JOB':22}  {'STATUS':10}  {'HOST':8}  {'QUEUE':12}  {'DUR':8}  CMD",
         flush=True,
     )
+    # Resolved once per listing, not once per row: it cannot change mid-table,
+    # and `None` here is what keeps piped output byte-identical to before.
+    width = _terminal_width()
     for record in records:
         job_id = record.get("job_id") or "-"
-        print(
+        # Built as one string so the command can be measured against what the
+        # row actually spent, rather than against the columns' nominal widths.
+        prefix = (
             f"{(format_epoch(record.get('submitted_at')) or '-'):20}  {job_id:22}  "
             f"{(record.get('status') or '-')[:10]:10}  {(record.get('host') or '-')[:8]:8}  "
             f"{(record.get('queue') or '-')[:12]:12}  {_tracked_dur_text(record)[:8]:8}  "
-            f"{str(record.get('cmd') or '')}",
+        )
+        print(
+            f"{prefix}{_fit_cmd(str(record.get('cmd') or ''), len(prefix), width)}",
             flush=True,
         )
         if record.get("status") == FAILED:
@@ -331,6 +414,11 @@ def _render_tracked_jobs(records, total=None):
                 f"(see `awsqe-client failed --job-id {job_id} --log`)",
                 flush=True,
             )
+        # Ordered failure -> where it lives -> what it produced, and `log:`
+        # stays last so --fetch-logs users find it where they already look.
+        if show_payloads:
+            for line in _payload_lines(record):
+                print(f"{'':20}  {line}", flush=True)
         # Only present once the log has actually been fetched, so this stays
         # quiet for anyone not using --fetch-logs.
         if record.get("log_path"):
@@ -392,11 +480,35 @@ def _render_grouped_jobs(groups, ungrouped, total=None, *, filtered=False):
         )
 
 
+def _render_hidden_deleted_note(count):
+    """Say that tombstones were left out of the listing, and how to see them.
+
+    Printed by :func:`cmd_jobs` rather than by either renderer: the exclusion is
+    a `jobs` policy, not a property of a list of records, and the grouped
+    renderer delegates to the flat one — inside them this would print twice.
+    Unconditional, including when the listing came out empty, because a ledger
+    holding nothing but deleted jobs otherwise says "no tracked jobs match the
+    filter" to someone who typed no filter.
+    """
+    if count:
+        print(
+            f"{count} deleted job(s) hidden; `--status deleted` shows them "
+            f"(`--status all` shows everything).",
+            flush=True,
+        )
+
+
 # ---------- tracked-job refresh ----------
 
 #: A host with a smaller batch cap than ours answers with the remainder in
 #: `skipped`; re-ask until it stops, but never spin.
-_MAX_BATCH_ROUNDS = 20
+#:
+#: Deliberately above ``ledger.MAX_TRACKED_RECORDS`` divided by the host's batch
+#: cap: the ledger cap bounds only the *terminal* tail (`prune_records` never
+#: evicts a live record), so the number of ids one refresh must resolve is not
+#: bounded by it at all. 64 x 500 = 32 000 covers any plausible live set, and
+#: the loop below stops early on a host that stops making progress.
+_MAX_BATCH_ROUNDS = 64
 
 
 def _job_info_one_by_one(host, job_ids):
@@ -434,8 +546,23 @@ def _job_info_batch(host, job_ids):
             )
             states.update(_job_info_one_by_one(host, pending))
             return states
+        resolved_before = len(states)
         states.update(result.get("states") or {})
         pending = [job_id for job_id in (result.get("skipped") or []) if job_id not in states]
+        if len(states) == resolved_before:
+            # A host that skips without resolving anything will keep doing so;
+            # another 63 ssh round trips buy nothing. Report what's left below.
+            break
+    if pending:
+        # Truncating here used to be silent, which left those jobs showing a
+        # last-known status with nothing saying why it never moved.
+        print(
+            f"[WARN] {host} left {len(pending)} tracked job(s) unresolved after "
+            f"{_MAX_BATCH_ROUNDS} batch round(s); they keep their last-known status. "
+            f"Narrow the list (--status active, -n) or run `jobs` again.",
+            file=sys.stderr,
+            flush=True,
+        )
     return states
 
 
@@ -554,6 +681,9 @@ def cmd_submit_remote(args, command):
     except ValueError as exc:
         print(f"--array: {exc}", flush=True)
         sys.exit(2)
+    # Same reasoning one step further: surface a *reused* name while there is
+    # still time to Ctrl-C, rather than after the payload is in S3.
+    _warn_on_array_id_reuse(array_id)
 
     payload_s3_uri = None
     payload_size_bytes = None
@@ -727,6 +857,12 @@ def cmd_submit_batch(args, command):
     except ValueError as exc:
         print(f"--array: {exc}", flush=True)
         sys.exit(2)
+    # Only for a name the user typed. The derived tag is timestamped to the
+    # second, so it cannot collide, and the ledger read would be pure cost on a
+    # path that is about to do N uploads. Above the --dry-run branch on purpose:
+    # a dry run is exactly when you want to hear about the collision.
+    if getattr(args, "array", None):
+        _warn_on_array_id_reuse(array_id)
 
     queue_name = getattr(args, "queue", None) or getattr(args, "host_set", None) or DEFAULT_QUEUE
     hosts_param = _parse_cli_host_values(getattr(args, "hosts", None)) or None
@@ -986,8 +1122,8 @@ def fetch_tracked_logs(records):
     """Pull worker logs for the given records. Returns ``(fetched, [warning, ...])``.
 
     One scp per job, so callers pass the *displayed* slice rather than the whole
-    ledger — fetching 2000 logs because you listed 50 rows would be a nasty
-    surprise. Never raises: a log you can't get is a warning, not a failure of
+    ledger — fetching your whole history because you listed 50 rows would be a
+    nasty surprise. Never raises: a log you can't get is a warning, not a failure of
     the listing.
     """
     wanted = [r for r in records if job_logs.should_fetch(r)]
@@ -1108,6 +1244,47 @@ def _expand_array_filter(tokens):
     return {name for name in wanted if name} or None
 
 
+def _warn_on_array_id_reuse(array_id):
+    """Say so when `array_id` already has live jobs in this client's ledger.
+
+    Never blocks — reuse is legal and sometimes deliberate, a second wave into
+    an existing batch. But two *live* runs under one name is a footgun nothing
+    else warns about: `qdel --array NAME` selects on the tag alone, so
+    cancelling the new run cancels the old one too, and the grouped `jobs` view
+    renders both as a single row.
+
+    "Live" is ``not is_terminal``, which includes `missing` — deliberately, a
+    job the host has lost track of might still be running somewhere.
+
+    Reads the ledger and nothing else, and stays quiet if it can't: an
+    unreadable ledger is not a reason to interfere with a submit.
+    """
+    if not array_id:
+        return
+    try:
+        records = ledger.load_ledger()
+    except OSError:  # load_ledger already swallows parse errors itself
+        return
+    wanted = str(array_id).casefold()
+    live = [r for r in records
+            if str(r.get("array_id") or "").casefold() == wanted
+            and not is_terminal(r.get("status"))]
+    if not live:
+        return
+    newest = format_epoch(max(r["submitted_at"] for r in live)) or "?"
+    breakdown = ", ".join(f"{count} {status}"
+                          for status, count in ledger.summarize_statuses(live))
+    print(
+        f"[WARN] array {array_id!r} already has {len(live)} live job(s) in this "
+        f"client's ledger ({breakdown}; newest submitted {newest}).\n"
+        f"       Reusing the name appends to that batch: `jobs` shows one merged "
+        f"row, and `qdel --array {array_id}` would cancel both runs.\n"
+        f"       Pass a different --array name if this is a separate run.",
+        file=sys.stderr,
+        flush=True,
+    )
+
+
 def _limit_grouped_rows(groups, ungrouped, limit):
     """Apply ``--limit`` to *rendered rows*, batches counting as one row each.
 
@@ -1207,6 +1384,21 @@ def cmd_jobs(args):
     # A bare date as an upper bound means "through that day", not "up to its 00:00".
     until = _parse_time_arg(args.until, "--until", end_of_day=True) if args.until else None
 
+    # A tombstone is not news: `deleted` is written only by this client's own
+    # qdel, so by definition the user already knows. Leaving them in the default
+    # view is also what let a cancelled run go on shaping a live batch's row.
+    # Any explicit --status turns this off — naming a status is the user
+    # speaking, and `--status all` has to mean all.
+    hidden_statuses = None if statuses else frozenset({DELETED})
+    hidden_deleted = 0
+    if hidden_statuses:
+        # Counted through the *other* filters, so `--since 1h` never claims
+        # tombstones from last week. One extra linear pass over the ledger.
+        hidden_deleted = len(ledger.filter_records(
+            records, statuses=hidden_statuses, queues=queues, arrays=arrays,
+            since=since, until=until,
+        ))
+
     if not args.no_refresh and records:
         states, warnings = refresh_tracked_jobs(
             records,
@@ -1220,14 +1412,17 @@ def cmd_jobs(args):
         if states and ledger.apply_states(states):
             records = ledger.load_ledger()
 
-    # Three ways to end up with the flat listing. `--array` and `--fetch-logs`
-    # imply it rather than erroring: naming one batch means you want to see
-    # inside it, and a per-job log path has nowhere to go on a batch row.
+    # Four ways to end up with the flat listing. `--array`, `--fetch-logs` and
+    # `--payloads` imply it rather than erroring: naming one batch means you
+    # want to see inside it, and a per-job path has nowhere to go on a batch row.
     fetch_logs = bool(getattr(args, "fetch_logs", False))
-    expand = bool(getattr(args, "expand", False)) or bool(arrays) or fetch_logs
+    show_payloads = bool(getattr(args, "payloads", False))
+    expand = (bool(getattr(args, "expand", False)) or bool(arrays)
+              or fetch_logs or show_payloads)
 
     selected = ledger.filter_records(
-        records, statuses=statuses, queues=queues, arrays=arrays,
+        records, statuses=statuses, exclude_statuses=hidden_statuses,
+        queues=queues, arrays=arrays,
         since=since, until=until,
         # Grouped, the limit counts rows and is applied after grouping instead.
         limit=args.limit if expand else None,
@@ -1250,12 +1445,13 @@ def cmd_jobs(args):
         displayed = [by_id.get(r["job_id"], r) for r in displayed]
 
     if groups is None:
-        _render_tracked_jobs(displayed, total=len(records))
+        _render_tracked_jobs(displayed, total=len(records), show_payloads=show_payloads)
     else:
         _render_grouped_jobs(
             groups, ungrouped, total=len(records),
             filtered=bool(statuses or queues or since is not None or until is not None),
         )
+    _render_hidden_deleted_note(hidden_deleted)
 
 
 def cmd_qdel_remote(args):
@@ -1465,6 +1661,30 @@ def cmd_enable_host_remote(args):
 
 # ---------- argparse wiring ----------
 
+#: The filters compose, and nothing about a list of flags says so. Kept in step
+#: with the Recipes section of ``docs/tracking-jobs.rst``.
+_JOBS_EPILOG = """\
+examples:
+  awsqe-client jobs
+      batches collapsed to one row each; deleted jobs hidden
+
+  awsqe-client jobs --array protrbfe_aug3
+      that batch's jobs listed individually
+
+  awsqe-client jobs --array protrbfe_aug3 --status completed
+      just the members that finished cleanly
+
+  awsqe-client jobs --array protrbfe_aug3 --status failed --fetch-logs
+      the failures, with each log pulled to this machine
+
+  awsqe-client jobs --status active --payloads
+      what is still in flight, and which directories it lives in
+
+  awsqe-client jobs --status deleted --since 7d
+      the tombstones the default view hides
+"""
+
+
 def build_parser():
     parser = argparse.ArgumentParser(prog="awsqe-client", description="AWSQueueEngine client (submitter) CLI")
     sub = parser.add_subparsers(dest="cmd")
@@ -1549,11 +1769,21 @@ def build_parser():
 
     p_jobs = sub.add_parser(
         "jobs", help="List jobs this client submitted, refreshed from the queue host",
+        epilog=_JOBS_EPILOG,
+        # The default formatter re-wraps the epilog into one paragraph. Raw
+        # *Description* rather than RawText: this preserves the epilog while
+        # still wrapping each --flag's help to the terminal, which RawText
+        # would stop doing.
+        formatter_class=argparse.RawDescriptionHelpFormatter,
     )
     p_jobs.add_argument(
         "--status", action="append", default=None, metavar="STATUS",
-        help="Filter by status; repeatable and comma-separated. "
-             f"Statuses: {', '.join(ALL_STATUSES)}. Aliases: active, done, all.",
+        help="Filter by status; repeatable and comma-separated. Composes with "
+             "--array to look inside one batch: "
+             "`--array NAME --status completed`. "
+             f"Statuses: {', '.join(ALL_STATUSES)}. Aliases: active "
+             "(submitted/queued/running), done, all. Deleted jobs are hidden "
+             "unless you name a status yourself.",
     )
     p_jobs.add_argument(
         "--queue", action="append", default=None, metavar="QUEUE",
@@ -1561,13 +1791,15 @@ def build_parser():
     )
     p_jobs.add_argument(
         "--array", action="append", default=None, metavar="NAME",
-        help="Only jobs tagged with batch NAME, listed individually; repeatable "
-             "and comma-separated.",
+        help="Only jobs tagged with batch NAME, listed individually (implies "
+             "--expand); repeatable and comma-separated. Combines with every "
+             "other filter — `--array NAME --status failed --fetch-logs` is how "
+             "you read a batch's tracebacks.",
     )
     p_jobs.add_argument(
         "--expand", "--no-group", dest="expand", action="store_true",
         help="List every job separately instead of collapsing each batch to one "
-             "row. Implied by --array and --fetch-logs.",
+             "row. Implied by --array, --fetch-logs and --payloads.",
     )
     p_jobs.add_argument(
         "--since", default=None, metavar="WHEN",
@@ -1592,6 +1824,13 @@ def build_parser():
         "--fetch-logs", action="store_true",
         help="Copy each displayed job's log off its worker (skipping any already "
              "cached) and show the local path.",
+    )
+    p_jobs.add_argument(
+        "--payloads", action="store_true",
+        help="Also print each job's payload directories under its row: the local "
+             "directory this client archived, the directory the worker unpacked "
+             "it into (known once the job has started), and the S3 copy. "
+             "Implies --expand.",
     )
     # Both name a single job and differ only in what they emit, so asking for
     # both at once is a mistake worth catching rather than silently ordering.

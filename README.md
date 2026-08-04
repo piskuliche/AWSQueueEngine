@@ -294,6 +294,11 @@ The `DUR` column does double duty: elapsed time for finished jobs, queue
 position (`q#3`) for queued ones. Running jobs show `-`, because the host
 reports start times as preformatted text in its own timezone.
 
+`CMD` is trimmed to your terminal's width so a long command ends in `...`
+instead of wrapping the row — but **only** when the output is a terminal, so
+`jobs | grep` and `jobs > file` still see the whole thing. `COLUMNS=200` on a
+terminal overrides the detected width.
+
 | Status | Meaning |
 | --- | --- |
 | `submitted` | enqueued; not yet refreshed from the queue host |
@@ -302,7 +307,7 @@ reports start times as preformatted text in its own timezone.
 | `completed` | finished with exit `0` |
 | `failed` | finished badly; see `awsqe-client failed` |
 | `unknown` | finished, but without a provable exit status (see above) |
-| `deleted` | removed from the queue by **this client's** `qdel` |
+| `deleted` | removed from the queue by **this client's** `qdel`; hidden from the default listing |
 | `missing` | the queue host has no record of it |
 
 `missing` is the ambiguous one. It means someone else deleted the job, or the
@@ -314,6 +319,14 @@ host's state files rather than as mass deletion). That last rule is now a
 backstop rather than the primary defense: the queue host writes its state files
 atomically, so a reader can no longer catch one mid-write. It still covers a
 queue host running an older version.
+
+`deleted` is the opposite kind of certainty, and is **hidden by default** — it's
+written only by this client's own `qdel`, so you already know. The footer says
+how many were held back, and naming any status turns the suppression off:
+
+```
+3 deleted job(s) hidden; `--status deleted` shows them (`--status all` shows everything).
+```
 
 Filters:
 
@@ -398,6 +411,16 @@ host carries the tag) `qdel --array`, and a silent rewrite at submit would leave
 those matching nothing with nothing on screen to explain why.
 
 Reusing a name is legal and appends to that batch; `--since` separates the runs.
+Submit warns when the name already has live jobs, because `qdel --array NAME`
+selects on the tag alone — two live runs sharing a name means cancelling one
+cancels both. The warning never blocks the submit.
+
+Once an earlier run has been deleted, its jobs no longer shape the batch row:
+the queue, the size and both timestamps come from the members that are **not**
+tombstones, so a cancelled run can't make a healthy batch report the wrong queue
+(`*`), the wrong start time, or a count bigger than the batch it was submitted
+with. The deleted members still show in the row's status tally under
+`--status all`.
 
 #### Job logs
 
@@ -438,7 +461,21 @@ being written. When a worker no longer has the log — recycled, or
 The cache is capped at 512 MB, dropping the oldest first, and `--forget` deletes
 a job's cached log along with its ledger entry.
 
-The ledger holds 2000 jobs, dropping the oldest *finished* ones past that —
+`--payloads` prints each job's payload directories under its row — the local
+directory you submitted, the directory the worker unpacked it into (once one
+has, otherwise `(not staged yet)`), and the S3 copy:
+
+```
+2026-08-03 23:17:04   20260803-231704-a9f1c2  running     eci7      zeke-queue    -         python run_fe.py
+                      local:  /mnt/dat1/zeke/runs/protrbfe/aug3/rep0001
+                      remote: /scratch/zeke/awsqe/protrbfe_aug3-0001-a9f
+                      s3:     s3://my-bucket/awsqe/20260803-231704-a9f1c2.tar.gz
+```
+
+Like `--fetch-logs`, it implies `--expand`: a per-job path has nowhere to go on
+a batch row.
+
+The ledger holds 10,000 jobs, dropping the oldest *finished* ones past that —
 jobs still in flight are never evicted. `--forget <job-id-or-prefix>` and
 `--forget-before <when>` remove entries by hand; both only stop tracking, they
 never cancel anything (use `qdel` for that).

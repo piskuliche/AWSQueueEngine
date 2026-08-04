@@ -28,6 +28,7 @@ from pathlib import Path
 
 from ..shared.job_status import (
     ALL_STATUSES,
+    DELETED,
     FAILED,
     MISSING,
     SUBMITTED,
@@ -45,9 +46,19 @@ except ImportError:  # pragma: no cover — Windows has no flock
 LEDGER_PATH = CONFIG_DIR / "jobs.json"
 LEDGER_VERSION = 1
 
-#: Ceiling on tracked jobs, mirroring ``failure_state.MAX_FAILED_RECORDS``.
-#: Only *terminal* records are ever evicted — see :func:`prune_records`.
-MAX_TRACKED_RECORDS = 2000
+#: Ceiling on tracked jobs. Only *terminal* records are ever evicted — see
+#: :func:`prune_records`.
+#:
+#: Note this does *not* bound how many jobs one refresh has to resolve: because
+#: non-terminal records are never evicted, that set is bounded by nothing here.
+#: The round cap in ``client.cli._MAX_BATCH_ROUNDS`` carries that, and is kept
+#: comfortably above this number.
+#:
+#: 10 000 rather than more: the ledger is re-read on every `jobs` invocation and
+#: rewritten inside the flock a concurrent submit blocks on, and JSON cost is
+#: linear (~5 MB and ~20 ms per parse here, double that at 20 000). At the batch
+#: sizes this is used with that is still ~100 full batches of history.
+MAX_TRACKED_RECORDS = 10000
 
 #: Fields the client owns. A refresh from the queue host never overwrites these
 #: (the host has no opinion about them, and for `queue_host` it can't).
@@ -227,7 +238,7 @@ def build_submission_record(*, job_id, queue_host, queue=None, cmd="", payload="
     `array_size` is how many jobs the batch was submitted with, recorded only
     when the submitter knows — a one-invocation batch submit does, a shell loop
     calling submit N times does not. It exists so the grouped view can say
-    ``130/142`` when the 2000-record cap has evicted part of a finished batch,
+    ``130/142`` when the ledger cap has evicted part of a finished batch,
     rather than quietly reporting a smaller batch than was actually run.
     """
     if not job_id:
@@ -466,8 +477,8 @@ def merge_state(record, state, *, now=None):
     return merged
 
 
-def filter_records(records, *, statuses=None, queues=None, arrays=None,
-                   since=None, until=None, limit=None):
+def filter_records(records, *, statuses=None, exclude_statuses=None, queues=None,
+                   arrays=None, since=None, until=None, limit=None):
     """Filter and sort tracked jobs for display: newest submission first.
 
     `since` is inclusive and `until` exclusive, both against ``submitted_at``
@@ -475,10 +486,19 @@ def filter_records(records, *, statuses=None, queues=None, arrays=None,
     zone and are never compared here). `queues` and `arrays` are matched
     case-insensitively; callers should normalize the names first. `limit` is
     applied last; ``0``, ``None`` or a negative value means no limit.
+
+    `exclude_statuses` is deliberately separate from `statuses` rather than
+    something a caller folds into it. `jobs` hides `deleted` by default, and
+    expressing that as ``statuses = ALL - {deleted}`` would make "the user
+    filtered" indistinguishable from "we hid tombstones" — which the caller
+    reads to decide whether a batch row may show its ``130/142`` size fraction.
+    Subtracting here keeps ``statuses is None`` true on the default path.
     """
     selected = list(records)
     if statuses:
         selected = [r for r in selected if r.get("status") in statuses]
+    if exclude_statuses:
+        selected = [r for r in selected if r.get("status") not in exclude_statuses]
     if queues:
         wanted = {str(q).casefold() for q in queues}
         selected = [r for r in selected if str(r.get("queue") or "").casefold() in wanted]
@@ -497,6 +517,15 @@ def filter_records(records, *, statuses=None, queues=None, arrays=None,
 
 
 # ---------- batch grouping ----------
+
+#: Statuses that must not *shape* a batch row, only appear in its tally.
+#:
+#: An `array_id` is a tag, so nothing stops a second run reusing one. When it
+#: does, the dead run and the live one land in the same group, and aggregating
+#: over both describes neither: the row reports the cancelled run's queue and
+#: start time for a batch that is running fine (issue #36).
+_TOMBSTONE_STATUSES = frozenset({DELETED})
+
 
 def summarize_statuses(records):
     """``[(status, count), ...]`` for a batch, in a fixed order.
@@ -537,6 +566,13 @@ def group_by_array(records):
     submitted stays at the top, matching :func:`filter_records`' newest-first
     contract; ``submitted_at`` on the group is the *earliest*, which is when the
     user fired the batch off. Ungrouped records keep the order they arrived in.
+
+    The fields that *describe* the batch — its queues, its size, both timestamps
+    — are computed over the members that are not in :data:`_TOMBSTONE_STATUSES`,
+    so a cancelled run cannot shape a live one's row when the two share a tag.
+    ``count``, ``status_counts`` and ``records`` still cover every member: the
+    row has to stay internally consistent, and callers render `count` against a
+    total that includes the tombstones.
     """
     order = []
     by_array = {}
@@ -554,11 +590,15 @@ def group_by_array(records):
     groups = []
     for array_id in order:
         members = by_array[array_id]
-        stamps = [r["submitted_at"] for r in members]
+        # Falls back to every member when they are *all* tombstones: a batch the
+        # user deleted in full still has to render when they ask to see it.
+        shaping = [r for r in members
+                   if r.get("status") not in _TOMBSTONE_STATUSES] or members
+        stamps = [r["submitted_at"] for r in shaping]
         # The largest recorded size wins: every member of a batch submitted in
         # one invocation carries the same value, but a record whose batch was
         # partly evicted is still worth believing over a missing value.
-        sizes = [r.get("array_size") for r in members if isinstance(r.get("array_size"), int)]
+        sizes = [r.get("array_size") for r in shaping if isinstance(r.get("array_size"), int)]
         groups.append({
             "array_id": array_id,
             "count": len(members),
@@ -566,8 +606,8 @@ def group_by_array(records):
             "submitted_at": min(stamps),
             "last_submitted_at": max(stamps),
             "status_counts": summarize_statuses(members),
-            "queues": _distinct(members, "queue"),
-            "queue_hosts": _distinct(members, "queue_host"),
+            "queues": _distinct(shaping, "queue"),
+            "queue_hosts": _distinct(shaping, "queue_host"),
             "records": members,
         })
     groups.sort(key=lambda g: g["last_submitted_at"], reverse=True)

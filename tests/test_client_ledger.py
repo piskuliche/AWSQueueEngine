@@ -399,6 +399,23 @@ class FilterRecordsTests(unittest.TestCase):
             record["array_id"] = "batch"
         self.assertEqual(self._ids(arrays={"batch"}, statuses={"failed"}), ["C"])
 
+    def test_exclude_statuses_drops_them(self):
+        self.assertEqual(self._ids(exclude_statuses={"running"}), ["C", "A"])
+
+    def test_exclude_statuses_composes_with_statuses(self):
+        self.assertEqual(
+            self._ids(statuses={"running", "failed"}, exclude_statuses={"failed"}),
+            ["B"],
+        )
+
+    def test_an_empty_exclude_statuses_is_a_no_op(self):
+        self.assertEqual(self._ids(exclude_statuses=None), ["C", "B", "A"])
+        self.assertEqual(self._ids(exclude_statuses=frozenset()), ["C", "B", "A"])
+
+    def test_exclude_statuses_is_applied_before_the_limit(self):
+        """Otherwise `-n 2` would spend a row on something it then removed."""
+        self.assertEqual(self._ids(exclude_statuses={"failed"}, limit=2), ["B", "A"])
+
 
 class GroupByArrayTests(unittest.TestCase):
     def _record(self, job_id, submitted_at, **kwargs):
@@ -484,6 +501,63 @@ class GroupByArrayTests(unittest.TestCase):
         groups, ungrouped = ledger_mod.group_by_array(records)
         self.assertEqual(groups[0]["count"], 2)
         self.assertEqual([r["job_id"] for r in ungrouped], ["B"])
+
+
+class GroupByArrayTombstoneTests(unittest.TestCase):
+    """Issue #36: a reused `array_id` put a dead run and a live one in one group,
+    and aggregating over both described neither."""
+
+    def _reused_tag(self):
+        """The reported scenario, scaled down: a cancelled run then a live one."""
+        dead = [{"job_id": f"D{i}", "submitted_at": 100.0 + i, "status": "deleted",
+                 "queue": "production", "queue_host": "qh", "array_id": "b",
+                 "array_size": 3}
+                for i in range(3)]
+        live = [{"job_id": f"L{i}", "submitted_at": 900.0 + i, "status": "queued",
+                 "queue": "zeke-queue", "queue_host": "qh", "array_id": "b",
+                 "array_size": 3}
+                for i in range(3)]
+        return dead + live
+
+    def test_a_deleted_run_does_not_supply_the_batch_queue(self):
+        """The `*` marker fired only because the dead half went elsewhere."""
+        groups, _ = ledger_mod.group_by_array(self._reused_tag())
+        self.assertEqual(groups[0]["queues"], ["zeke-queue"])
+
+    def test_a_deleted_run_does_not_supply_the_batch_timestamps(self):
+        """The row used to sort by the live run and display the dead one's time."""
+        groups, _ = ledger_mod.group_by_array(self._reused_tag())
+        self.assertEqual(groups[0]["submitted_at"], 900.0)
+        self.assertEqual(groups[0]["last_submitted_at"], 902.0)
+
+    def test_a_deleted_runs_array_size_does_not_shape_the_live_one(self):
+        records = self._reused_tag()
+        for record in records[:3]:
+            record["array_size"] = 999
+        groups, _ = ledger_mod.group_by_array(records)
+        self.assertEqual(groups[0]["array_size"], 3)
+
+    def test_deleted_members_stay_in_records_so_expand_can_reach_them(self):
+        groups, _ = ledger_mod.group_by_array(self._reused_tag())
+        self.assertEqual(len(groups[0]["records"]), 6)
+
+    def test_deleted_members_are_still_summarized_in_status_counts(self):
+        groups, _ = ledger_mod.group_by_array(self._reused_tag())
+        self.assertEqual(dict(groups[0]["status_counts"]), {"queued": 3, "deleted": 3})
+
+    def test_count_still_covers_every_member_so_the_footer_closes(self):
+        """`count` is rendered against a total that includes the tombstones."""
+        groups, _ = ledger_mod.group_by_array(self._reused_tag())
+        self.assertEqual(groups[0]["count"], 6)
+
+    def test_a_group_of_only_deleted_members_still_reports_itself(self):
+        """Nothing live to describe, so it falls back rather than vanishing."""
+        records = [r for r in self._reused_tag() if r["status"] == "deleted"]
+        groups, _ = ledger_mod.group_by_array(records)
+        self.assertEqual(len(groups), 1)
+        self.assertEqual(groups[0]["queues"], ["production"])
+        self.assertEqual(groups[0]["submitted_at"], 100.0)
+        self.assertEqual(dict(groups[0]["status_counts"]), {"deleted": 3})
 
 
 class SummarizeStatusesTests(unittest.TestCase):
