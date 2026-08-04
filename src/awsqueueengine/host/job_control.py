@@ -104,14 +104,26 @@ def wrap_with_exit_status(job_command, tag):
 #
 # `$!` is now the job's own PID rather than a wrapper subshell's, and `mkdir`
 # is sequenced before the `echo` that writes the pidfile into it.
+#
+# The `rm -f` mirrors the one in EXIT_STATUS_WRAPPER_TEMPLATE and matters for
+# the same reason: requeued jobs reuse their tag, so a pidfile left by a
+# previous attempt must not be readable as this attempt's result. Without it a
+# launch that never got as far as writing a pidfile would have the old PID read
+# back as proof it started.
 LAUNCH_SCRIPT_TEMPLATE = """\
 mkdir -p {log_dir}
+rm -f {log_dir}/{tag}.pid
 cd "$HOME" || true
 nohup setsid env MANAGER_TAG={tag}{payload_env} bash -lc {job_command} > {log_dir}/{tag}.log 2>&1 < /dev/null &
 __awsqe_pid=$!
 echo "$__awsqe_pid" > {log_dir}/{tag}.pid
 exit 0
 """
+
+
+# Verification probes are cheap (one round trip each, once per submission) and
+# run when the host is already suspect, so they get room to answer.
+PROBE_TIMEOUT = 20
 
 
 def _build_launch_command(tag, job_command, remote_payload_dir=None):
@@ -141,19 +153,36 @@ def _verify_launched(host, tag, remote_payload_dir=None, err=None):
     means ssh never got through (``host_transport``). Only that second case
     costs the host a cooldown, so a host is blamed for being unreachable and
     nothing else.
+
+    The probes get a generous timeout on purpose. This is the recovery path for
+    a launch that already timed out, so the host is likely slow or loaded; a
+    stingy budget here would let it blow the probe too, and a probe that times
+    out reads as "unreachable" — recreating the misattribution this exists to
+    prevent.
     """
     result = {"host": host, "tag": tag, "pid": None}
     if remote_payload_dir:
         result["payload"] = remote_payload_dir
-    pid_rc, pid_out, _ = ssh_run(host, f"cat {REMOTE_LOG_DIR}/{tag}.pid || true", timeout=5)
+    pid_rc, pid_out, _ = ssh_run(host, f"cat {REMOTE_LOG_DIR}/{tag}.pid || true", timeout=PROBE_TIMEOUT)
     pid = pid_out.strip() if pid_out else None
+    # A torn or truncated pidfile is not a pid. Treat it as no pidfile and fall
+    # through to the scan rather than interpolating it into a remote command.
+    if pid and not pid.isdigit():
+        pid = None
     if pid:
         result["pid"] = pid
-        _, ps_out, _ = ssh_run(host, f"ps -p {pid} -o pid= || true", timeout=5)
+        _, ps_out, _ = ssh_run(host, f"ps -p {pid} -o pid= || true", timeout=PROBE_TIMEOUT)
         if ps_out.strip():
             return {**result, "ok": True}
         return {**result, "ok": False, "err": "pidfile present but process not running", "reason": "job"}
-    scan_rc, scan_out, _ = ssh_run(host, "ps -eo pid,cmd | grep -F 'MANAGER_TAG=' | grep -v grep || true", timeout=8)
+    # Scoped to this tag: an unscoped scan picks up any other managed job on the
+    # host and reports its pid as ours, so a launch that genuinely failed looks
+    # like a success and the monitor tracks a pid belonging to a different job.
+    # `[M]ANAGER_TAG` keeps the probe's own command line from matching itself,
+    # the same idiom `kill_managed_on_host` uses.
+    scan_rc, scan_out, _ = ssh_run(
+        host, f"ps -eo pid,cmd | grep '[M]ANAGER_TAG={tag}' || true", timeout=PROBE_TIMEOUT
+    )
     if scan_out:
         try:
             pid_guess = scan_out.splitlines()[0].split(None, 1)[0]

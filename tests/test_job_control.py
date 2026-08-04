@@ -4,6 +4,7 @@ from pathlib import Path
 from unittest.mock import patch
 
 from awsqueueengine.host.job_control import (
+    LAUNCH_SCRIPT_TEMPLATE,
     _build_launch_command,
     submit_to_host,
     wrap_in_mps_script,
@@ -211,7 +212,7 @@ class ExitStatusCaptureTests(unittest.TestCase):
 class LaunchCommandShapeTests(unittest.TestCase):
     """The launch must hand the job off and return, not wait on it (issue #33)."""
 
-    def _launch_cmd(self, **kwargs):
+    def _launch_cmd_for(self, job_command, **kwargs):
         commands = []
 
         def fake_ssh_run(_host, cmd, timeout=60, capture_output=True):
@@ -225,20 +226,42 @@ class LaunchCommandShapeTests(unittest.TestCase):
         with patch("awsqueueengine.host.job_control.choose_scratch_on_host", return_value=("/scratch", 1000)), patch(
             "awsqueueengine.host.job_control.ssh_run", side_effect=fake_ssh_run
         ):
-            submit_to_host("eci5", "bash run.sh", tag="20260616-120000-abcdef", **kwargs)
+            submit_to_host("eci5", job_command, tag="20260616-120000-abcdef", **kwargs)
         return commands[0]
 
+    def _launch_cmd(self, **kwargs):
+        return self._launch_cmd_for("bash run.sh", **kwargs)
+
     def test_no_and_chain_for_the_ampersand_to_swallow(self):
-        launch_cmd = self._launch_cmd()
         # The bug: written as `mkdir && cd || true && nohup ... &`, the trailing
         # `&` binds looser than `&&` and backgrounds the *whole* chain, whose
         # subshell then holds ssh's stdout open for the job's entire runtime.
         # With mkdir/cd as their own statements there is no chain left to
         # swallow, so `&` can only apply to the nohup.
-        self.assertNotIn("&&", launch_cmd)
-        self.assertNotIn("|| true &", launch_cmd)
-        mkdir_line = next(l for l in launch_cmd.splitlines() if l.startswith("mkdir -p "))
-        self.assertFalse(mkdir_line.rstrip().endswith("&"))
+        #
+        # Asserted against the template, whose only variable is the job command
+        # placeholder. The rendered script embeds the caller's command verbatim,
+        # and that command is free to contain `&&` with no bearing on this.
+        scaffold = LAUNCH_SCRIPT_TEMPLATE.replace("{job_command}", "JOB")
+        self.assertNotIn("&&", scaffold)
+        nohup_line = next(l for l in scaffold.splitlines() if l.startswith("nohup "))
+        self.assertTrue(nohup_line.rstrip().endswith("&"))
+        mkdir_line = next(l for l in scaffold.splitlines() if l.startswith("mkdir -p "))
+        self.assertNotIn("&", mkdir_line)
+
+    def test_a_job_command_containing_and_chains_is_left_alone(self):
+        # A job command with its own `&&` must survive untouched -- and must not
+        # be mistaken for the launch scaffolding's control flow.
+        launch_cmd = self._launch_cmd_for("make && make test")
+        self.assertIn("make && make test", launch_cmd)
+        self.assertEqual(launch_cmd.strip().splitlines()[-1], "exit 0")
+
+    def test_stale_pidfile_from_a_previous_attempt_is_cleared(self):
+        # Requeued jobs reuse their tag, so a pidfile left behind by an earlier
+        # attempt must not be readable as this attempt's result.
+        launch_cmd = self._launch_cmd()
+        self.assertIn("rm -f /home/ubuntu/manager_jobs/20260616-120000-abcdef.pid", launch_cmd)
+        self.assertLess(launch_cmd.index("rm -f "), launch_cmd.index("nohup "))
 
     def test_job_is_detached_into_its_own_session(self):
         self.assertIn("nohup setsid env MANAGER_TAG=", self._launch_cmd())
@@ -281,9 +304,12 @@ class LaunchReturnsImmediatelyTests(unittest.TestCase):
 
         with tempfile.TemporaryDirectory() as tmp:
             marker = Path(tmp) / "job-finished"
+            # Kept short: the job outlives this block by design, so a long sleep
+            # would leave a detached process writing its log into a directory
+            # that has already been torn down.
             script = _build_launch_command(
                 "20260616-120000-abcdef",
-                f"sleep 5; touch {marker}",
+                f"sleep 2; touch {marker}",
             ).replace(REMOTE_LOG_DIR, tmp)
 
             started = time.monotonic()
@@ -291,8 +317,10 @@ class LaunchReturnsImmediatelyTests(unittest.TestCase):
             elapsed = time.monotonic() - started
 
             self.assertEqual(proc.returncode, 0, proc.stderr)
-            # The job sleeps 5s; the launch must not wait for it.
-            self.assertLess(elapsed, 3.0, f"launch blocked for {elapsed:.1f}s")
+            # The job sleeps 2s; the launch must not wait for it. capture_output
+            # reads stdout to EOF, which is what ssh does with its channel --
+            # the old shape blocked here for the job's full runtime.
+            self.assertLess(elapsed, 1.5, f"launch blocked for {elapsed:.1f}s")
             self.assertFalse(marker.exists(), "launch waited for the job to finish")
 
             pid = (Path(tmp) / "20260616-120000-abcdef.pid").read_text().strip()
@@ -312,7 +340,7 @@ class LaunchTimeoutVerificationTests(unittest.TestCase):
                 return 0, pidfile, ""
             if cmd.startswith("ps -p "):
                 return (0, "1234", "") if process_alive else (0, "", "")
-            if "MANAGER_TAG=" in cmd and cmd.startswith("ps -eo"):
+            if cmd.startswith("ps -eo"):
                 return 0, scan, ""
             if "aws s3 cp" in cmd:
                 return 0, "", ""
@@ -369,6 +397,59 @@ class LaunchTimeoutVerificationTests(unittest.TestCase):
         self.assertFalse(result["ok"])
         self.assertEqual(result["reason"], "job")
         self.assertIn("process not running", result["err"])
+
+    def test_fallback_scan_is_scoped_to_this_tag(self):
+        seen = []
+
+        def fake_ssh_run(_host, cmd, timeout=60, capture_output=True):
+            seen.append(cmd)
+            if cmd.startswith("cat "):
+                return 0, "", ""
+            return 0, "", ""
+
+        with patch("awsqueueengine.host.job_control.ssh_run", side_effect=fake_ssh_run):
+            submit_to_host("eci20", "bash run.sh", tag="20260803-163409-f4c156")
+
+        scan = next(c for c in seen if c.startswith("ps -eo"))
+        # Unscoped, the scan reports another job's pid as ours. The bracket
+        # keeps the probe from matching its own command line, so the tag is
+        # scoped as `[M]ANAGER_TAG=<tag>`.
+        self.assertIn("[M]ANAGER_TAG=20260803-163409-f4c156", scan)
+
+    def test_a_torn_pidfile_is_not_interpolated_into_a_remote_command(self):
+        seen = []
+
+        def fake_ssh_run(_host, cmd, timeout=60, capture_output=True):
+            seen.append(cmd)
+            if cmd.startswith("cat "):
+                return 0, "not-a-pid; rm -rf /", ""
+            return 0, "", ""
+
+        with patch("awsqueueengine.host.job_control.ssh_run", side_effect=fake_ssh_run):
+            result = submit_to_host("eci20", "bash run.sh")
+
+        self.assertFalse(any(c.startswith("ps -p ") for c in seen))
+        self.assertIsNone(result["pid"])
+
+    def test_probes_get_room_to_answer_on_a_slow_host(self):
+        timeouts = {}
+
+        def fake_ssh_run(_host, cmd, timeout=60, capture_output=True):
+            if cmd.startswith("cat "):
+                timeouts["cat"] = timeout
+                return 0, "1234", ""
+            if cmd.startswith("ps -p "):
+                timeouts["ps"] = timeout
+                return 0, "1234", ""
+            return 124, "", "ssh timeout"
+
+        with patch("awsqueueengine.host.job_control.ssh_run", side_effect=fake_ssh_run):
+            submit_to_host("eci20", "bash run.sh")
+
+        # This path exists for hosts too slow to answer within SSH_TIMEOUT, so a
+        # tight probe budget would recreate the misattribution being fixed.
+        self.assertGreaterEqual(timeouts["cat"], 15)
+        self.assertGreaterEqual(timeouts["ps"], 15)
 
     def test_missing_pidfile_falls_back_to_the_manager_tag_scan(self):
         with patch(
